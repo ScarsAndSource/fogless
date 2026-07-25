@@ -1,0 +1,14 @@
+name: Daily Supabase keepalive + backup
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # every day at 03:00 UTC
+  workflow_dispatch: {}     # lets you also trigger it manually from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hit the backup/keepalive endpoint
+        run: |
+          curl -sf "https://${{ secrets.VERCEL_DOMAIN }}/cron/backup?token=${{ secrets.CRON_SECRET }}"
