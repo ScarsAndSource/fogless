@@ -1,50 +1,389 @@
 """
-Personal expense-tracker bot — serverless webhook version.
-Runs as a Vercel Python function. No persistent process, no polling loop —
-Telegram POSTs each update straight to /webhook, and the function replies
-and exits.
-
-Ways to log:
-  1. Type it: "400rs creatine cash", "60 milk upi", "got 5000 freelance"
-     - even several at once: "400 creatine cash, 60 milk upi, 1200 rent upi"
-  2. Send a voice note — it gets transcribed and parsed the same way.
-  3. Commands, always available as an exact fallback (see /help).
-
-After logging a single transaction, tap the buttons under the confirmation
-to fix category/payment method, or undo it — no retyping needed. Corrections
-teach the bot: next time you mention the same item, it's instant and free.
+Fogless — personal expense-tracker bot, serverless webhook version.
+Everything lives in one file on purpose: Vercel's Python builder has
+inconsistent behavior bundling sibling modules for some function
+configurations, so there is nothing here to fail to import.
 """
 import os
 import io
 import csv
+import re
 import json
 import requests
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 
-import supa
-import nlp
-
+# --------------------------------------------------------------------- config
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
 TELEGRAM_SECRET_TOKEN = os.environ["TELEGRAM_SECRET_TOKEN"]
 CRON_SECRET = os.environ["CRON_SECRET"]
 
+SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+GROQ_CHAT_API = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_AUDIO_API = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+SB_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+}
+SB_TIMEOUT = 8
+
+EXPENSE_CATEGORIES = [
+    "food", "groceries", "transport", "bills", "shopping", "entertainment",
+    "health", "subscriptions", "rent", "education", "travel", "fitness", "other",
+]
+INCOME_CATEGORIES = ["salary", "freelance", "gift", "refund", "other"]
+PAYMENT_METHODS = ["cash", "upi", "card", "netbanking", "other"]
+
+_CURRENCY_WORDS = {"rs", "rs.", "inr", "rupees", "rupee", "bucks"}
+
+MULTI_SYSTEM_PROMPT = f"""You are a strict JSON-extraction engine for a personal expense tracker.
+A message may describe ONE or SEVERAL transactions (separated by commas, "and", semicolons, or line breaks).
+Extract every transaction you find.
+
+Expense categories (pick exactly one per transaction): {", ".join(EXPENSE_CATEGORIES)}
+Income categories (pick exactly one per transaction): {", ".join(INCOME_CATEGORIES)}
+Payment methods (pick exactly one if mentioned or clearly implied, else null): {", ".join(PAYMENT_METHODS)}
+
+Rules per transaction:
+- "type" is "expense" or "income". Assume "expense" unless words like salary, got paid, received, refund, credited clearly signal income.
+- "amount" is a plain number (no currency symbols, no commas). "1.5k" or "2k" means 1500 / 2000.
+- "category" is exactly one value from the matching list above — pick the closest fit, never invent new categories.
+- "payment_method" is exactly one of the listed methods, or null if not mentioned.
+- "note" is the short specific detail (e.g. the item/person/service), or null if there isn't one.
+
+If NOTHING in the message describes money changing hands, respond with {{"transactions": []}}.
+
+Respond with ONLY a raw JSON object matching this exact shape, nothing else — no markdown fences, no commentary:
+{{"transactions": [{{"type": "expense", "amount": 0, "category": "other", "payment_method": null, "note": null}}]}}
+"""
+
+_MULTI_HINT_RE = re.compile(r",|;|\band\b|\n", re.IGNORECASE)
 
 app = Flask(__name__)
 
+
+# ---------------------------------------------------------------- data layer
+
+def _sb_url(path: str) -> str:
+    return f"{SUPABASE_URL}/rest/v1/{path}"
+
+
+def add_transaction(tx_type, amount, category, note, payment_method=None) -> int:
+    payload = {"type": tx_type, "amount": amount, "category": category, "note": note, "payment_method": payment_method}
+    r = requests.post(
+        _sb_url("transactions"),
+        headers={**SB_HEADERS, "Prefer": "return=representation"},
+        json=payload,
+        timeout=SB_TIMEOUT,
+    )
+    r.raise_for_status()
+    return r.json()[0]["id"]
+
+
+def _all_transactions(order="id.desc", limit=None, since=None):
+    params = {"select": "*", "order": order}
+    if limit:
+        params["limit"] = limit
+    if since:
+        params["created_at"] = f"gte.{since}"
+    r = requests.get(_sb_url("transactions"), headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def get_history(limit=10):
+    return _all_transactions(limit=limit)
+
+
+def get_transaction(tx_id):
+    r = requests.get(
+        _sb_url("transactions"),
+        headers=SB_HEADERS,
+        params={"select": "*", "id": f"eq.{tx_id}"},
+        timeout=SB_TIMEOUT,
+    )
+    r.raise_for_status()
+    rows = r.json()
+    return rows[0] if rows else None
+
+
+def update_transaction(tx_id, **fields) -> bool:
+    if not fields:
+        return False
+    r = requests.patch(
+        _sb_url(f"transactions?id=eq.{tx_id}"),
+        headers={**SB_HEADERS, "Prefer": "return=representation"},
+        json=fields,
+        timeout=SB_TIMEOUT,
+    )
+    r.raise_for_status()
+    return len(r.json()) > 0
+
+
+def delete_transaction(tx_id) -> bool:
+    r = requests.delete(
+        _sb_url(f"transactions?id=eq.{tx_id}"),
+        headers={**SB_HEADERS, "Prefer": "return=representation"},
+        timeout=SB_TIMEOUT,
+    )
+    r.raise_for_status()
+    return len(r.json()) > 0
+
+
+def delete_last_transaction():
+    rows = _all_transactions(limit=1)
+    if not rows:
+        return None
+    delete_transaction(rows[0]["id"])
+    return rows[0]
+
+
+def get_starting_balance() -> float:
+    r = requests.get(
+        _sb_url("settings"),
+        headers=SB_HEADERS,
+        params={"select": "value", "key": "eq.starting_balance"},
+        timeout=SB_TIMEOUT,
+    )
+    r.raise_for_status()
+    rows = r.json()
+    return float(rows[0]["value"]) if rows else 0.0
+
+
+def set_starting_balance(amount: float):
+    r = requests.post(
+        _sb_url("settings"),
+        headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
+        json={"key": "starting_balance", "value": str(amount)},
+        timeout=SB_TIMEOUT,
+    )
+    r.raise_for_status()
+
+
+def get_balance() -> float:
+    rows = _all_transactions()
+    income = sum(r["amount"] for r in rows if r["type"] == "income")
+    expense = sum(r["amount"] for r in rows if r["type"] == "expense")
+    return get_starting_balance() + income - expense
+
+
+def _since(period):
+    now = datetime.now(timezone.utc)
+    if period == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "week":
+        start = now - timedelta(days=7)
+    elif period == "month":
+        start = now - timedelta(days=30)
+    else:
+        return None
+    return start.isoformat()
+
+
+def get_stats(period="month"):
+    since = _since(period)
+    rows = _all_transactions(since=since) if since else _all_transactions()
+    total_income = sum(r["amount"] for r in rows if r["type"] == "income")
+    total_expense = sum(r["amount"] for r in rows if r["type"] == "expense")
+
+    by_cat, by_pay = {}, {}
+    for r in rows:
+        if r["type"] == "expense":
+            c = r["category"]
+            by_cat.setdefault(c, {"total": 0.0, "cnt": 0})
+            by_cat[c]["total"] += r["amount"]
+            by_cat[c]["cnt"] += 1
+
+            p = r.get("payment_method") or "unspecified"
+            by_pay.setdefault(p, {"total": 0.0, "cnt": 0})
+            by_pay[p]["total"] += r["amount"]
+            by_pay[p]["cnt"] += 1
+
+    by_category = sorted(({"category": k, **v} for k, v in by_cat.items()), key=lambda x: -x["total"])
+    by_payment = sorted(({"payment_method": k, **v} for k, v in by_pay.items()), key=lambda x: -x["total"])
+    return {
+        "total_income": total_income,
+        "total_expense": total_expense,
+        "net": total_income - total_expense,
+        "by_category": by_category,
+        "by_payment": by_payment,
+    }
+
+
+def all_data_dump():
+    return {"transactions": _all_transactions(order="id.asc"), "starting_balance": get_starting_balance()}
+
+
+def get_all_aliases() -> dict:
+    r = requests.get(_sb_url("aliases"), headers=SB_HEADERS, params={"select": "*"}, timeout=SB_TIMEOUT)
+    r.raise_for_status()
+    return {
+        row["note_key"]: {
+            "type": row["type"], "category": row["category"], "payment_method": row.get("payment_method")
+        }
+        for row in r.json()
+    }
+
+
+def set_alias(note_key, tx_type, category, payment_method=None):
+    r = requests.post(
+        _sb_url("aliases"),
+        headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
+        json={"note_key": note_key, "type": tx_type, "category": category, "payment_method": payment_method},
+        timeout=SB_TIMEOUT,
+    )
+    r.raise_for_status()
+
+
+def mark_update_processed(update_id) -> bool:
+    r = requests.post(
+        _sb_url("processed_updates"),
+        headers={**SB_HEADERS, "Prefer": "return=representation,resolution=ignore-duplicates"},
+        json={"update_id": update_id},
+        timeout=SB_TIMEOUT,
+    )
+    r.raise_for_status()
+    return len(r.json()) > 0
+
+
+def cleanup_old_updates(days=7):
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    requests.delete(_sb_url(f"processed_updates?created_at=lt.{cutoff}"), headers=SB_HEADERS, timeout=SB_TIMEOUT)
+
+
+# ------------------------------------------------------------------ nlp layer
+
+def _validate_item(data):
+    if not data or data.get("type") not in ("expense", "income"):
+        return None
+    try:
+        amount = float(data["amount"])
+    except (TypeError, ValueError, KeyError):
+        return None
+    if amount <= 0:
+        return None
+    valid_categories = EXPENSE_CATEGORIES if data["type"] == "expense" else INCOME_CATEGORIES
+    category = data.get("category") if data.get("category") in valid_categories else "other"
+    payment_method = data.get("payment_method") if data.get("payment_method") in PAYMENT_METHODS else None
+    note = data.get("note") or None
+    return {"type": data["type"], "amount": amount, "category": category, "payment_method": payment_method, "note": note}
+
+
+def _call_groq_chat(text):
+    try:
+        r = requests.post(
+            GROQ_CHAT_API,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": GROQ_MODEL,
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": MULTI_SYSTEM_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        content = r.json()["choices"][0]["message"]["content"]
+        data = json.loads(content)
+    except Exception:
+        return None
+
+    raw_items = data.get("transactions") if isinstance(data, dict) else None
+    if not raw_items:
+        return None
+    results = [item for item in (_validate_item(x) for x in raw_items) if item is not None]
+    return results or None
+
+
+def quick_parse_single(text, aliases):
+    tokens = text.lower().replace("₹", " ").replace(",", " ").split()
+    if not tokens:
+        return None
+
+    amount = None
+    payment_method = None
+    note_tokens = []
+
+    for tok in tokens:
+        clean = tok.strip(".,")
+        if amount is None:
+            m = re.match(r"^(\d+(?:\.\d+)?)(k)?$", clean)
+            if m:
+                val = float(m.group(1))
+                if m.group(2) == "k":
+                    val *= 1000
+                amount = val
+                continue
+            m2 = re.match(r"^(\d+(?:\.\d+)?)rs$", clean)
+            if m2:
+                amount = float(m2.group(1))
+                continue
+        if clean in _CURRENCY_WORDS:
+            continue
+        if clean in PAYMENT_METHODS:
+            payment_method = clean
+            continue
+        note_tokens.append(clean)
+
+    if amount is None or amount <= 0 or not note_tokens:
+        return None
+
+    note_key = " ".join(note_tokens).strip()
+    alias = aliases.get(note_key)
+    if not alias:
+        return None
+
+    return {
+        "type": alias["type"], "amount": amount, "category": alias["category"],
+        "payment_method": payment_method or alias.get("payment_method"), "note": note_key,
+    }
+
+
+def parse_multi(text, aliases):
+    if not _MULTI_HINT_RE.search(text):
+        quick = quick_parse_single(text, aliases)
+        if quick:
+            return [quick]
+    return _call_groq_chat(text)
+
+
+def transcribe_voice(audio_bytes, filename="voice.ogg"):
+    try:
+        r = requests.post(
+            GROQ_AUDIO_API,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            files={"file": (filename, audio_bytes, "audio/ogg")},
+            data={"model": GROQ_WHISPER_MODEL, "response_format": "text"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        text = r.text.strip()
+        return text or None
+    except Exception:
+        return None
+
+
+# -------------------------------------------------------------- telegram i/o
 
 def fmt(amount: float) -> str:
     return f"{amount:,.2f}"
 
 
-# ------------------------------------------------------------- Telegram calls
-
-
-def send_message(chat_id: int, text: str) -> int | None:
+def send_message(chat_id, text):
     r = requests.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=8)
     try:
         return r.json()["result"]["message_id"]
@@ -52,7 +391,7 @@ def send_message(chat_id: int, text: str) -> int | None:
         return None
 
 
-def send_message_with_keyboard(chat_id: int, text: str, keyboard: dict) -> int | None:
+def send_message_with_keyboard(chat_id, text, keyboard):
     r = requests.post(
         f"{TG_API}/sendMessage",
         json={"chat_id": chat_id, "text": text, "reply_markup": keyboard},
@@ -64,14 +403,14 @@ def send_message_with_keyboard(chat_id: int, text: str, keyboard: dict) -> int |
         return None
 
 
-def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup: dict | None = None):
+def edit_message_text(chat_id, message_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     requests.post(f"{TG_API}/editMessageText", json=payload, timeout=8)
 
 
-def edit_message_reply_markup(chat_id: int, message_id: int, reply_markup: dict):
+def edit_message_reply_markup(chat_id, message_id, reply_markup):
     requests.post(
         f"{TG_API}/editMessageReplyMarkup",
         json={"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup},
@@ -79,14 +418,14 @@ def edit_message_reply_markup(chat_id: int, message_id: int, reply_markup: dict)
     )
 
 
-def answer_callback_query(callback_query_id: str, text: str = None):
+def answer_callback_query(callback_query_id, text=None):
     payload = {"callback_query_id": callback_query_id}
     if text:
         payload["text"] = text
     requests.post(f"{TG_API}/answerCallbackQuery", json=payload, timeout=8)
 
 
-def send_document(chat_id: int, filename: str, content_bytes: bytes, caption: str = None):
+def send_document(chat_id, filename, content_bytes, caption=None):
     files = {"document": (filename, content_bytes)}
     data = {"chat_id": chat_id}
     if caption:
@@ -94,7 +433,7 @@ def send_document(chat_id: int, filename: str, content_bytes: bytes, caption: st
     requests.post(f"{TG_API}/sendDocument", data=data, files=files, timeout=15)
 
 
-def download_telegram_file(file_id: str) -> bytes | None:
+def download_telegram_file(file_id):
     try:
         r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=10)
         r.raise_for_status()
@@ -109,7 +448,6 @@ def download_telegram_file(file_id: str) -> bytes | None:
 
 # --------------------------------------------------------------------- extras
 
-
 HELP_TEXT = (
     "Just type it — no command needed:\n"
     "  400rs creatine cash\n"
@@ -121,7 +459,7 @@ HELP_TEXT = (
     "Commands (exact, always available):\n"
     "/add <amount> <category> [note] [cash|upi|card|netbanking] - log an expense\n"
     "/income <amount> <source> [note] [cash|upi|card|netbanking] - log income\n"
-    "/alias <note> <category> [cash|upi|card|netbanking] - teach a shortcut\n"
+    "/alias <note words> <category> [cash|upi|card|netbanking] - teach a shortcut\n"
     "/balance - current balance\n"
     "/stats [today|week|month|all] - totals + category + payment breakdown\n"
     "/history [n] - last n transactions\n"
@@ -134,33 +472,33 @@ HELP_TEXT = (
 )
 
 
-def _split_trailing_payment_method(args: list[str]):
-    if args and args[-1].lower() in nlp.PAYMENT_METHODS:
+def _split_trailing_payment_method(args):
+    if args and args[-1].lower() in PAYMENT_METHODS:
         return args[:-1], args[-1].lower()
     return args, None
 
 
-def _confirmation_text(tx: dict) -> str:
+def _confirmation_text(tx):
     sign = "+" if tx["type"] == "income" else "-"
     bits = [tx["category"]]
     if tx.get("note"):
         bits.append(f"({tx['note']})")
     if tx.get("payment_method"):
         bits.append(f"· {tx['payment_method']}")
-    return f"Logged #{tx['id']}: {sign}{fmt(tx['amount'])} {' '.join(bits)}\nBalance: {fmt(supa.get_balance())}"
+    return f"✅ #{tx['id']} {sign}{fmt(tx['amount'])} {' '.join(bits)}\nBalance: {fmt(get_balance())}"
 
 
-def _main_keyboard(tx_id: int) -> dict:
+def _main_keyboard(tx_id):
     return {
         "inline_keyboard": [[
-            {"text": "Category", "callback_data": f"cc|{tx_id}"},
-            {"text": "Payment", "callback_data": f"cp|{tx_id}"},
-            {"text": "Undo", "callback_data": f"ud|{tx_id}"},
+            {"text": "✏️ Category", "callback_data": f"cc|{tx_id}"},
+            {"text": "💳 Payment", "callback_data": f"cp|{tx_id}"},
+            {"text": "🗑 Undo", "callback_data": f"ud|{tx_id}"},
         ]]
     }
 
 
-def _chunk_buttons(items: list[str], make_callback_data) -> list[list[dict]]:
+def _chunk_buttons(items, make_callback_data):
     rows, row = [], []
     for item in items:
         row.append({"text": item, "callback_data": make_callback_data(item)})
@@ -172,23 +510,22 @@ def _chunk_buttons(items: list[str], make_callback_data) -> list[list[dict]]:
     return rows
 
 
-def _category_keyboard(tx_id: int, tx_type: str) -> dict:
-    cats = nlp.EXPENSE_CATEGORIES if tx_type == "expense" else nlp.INCOME_CATEGORIES
+def _category_keyboard(tx_id, tx_type):
+    cats = EXPENSE_CATEGORIES if tx_type == "expense" else INCOME_CATEGORIES
     rows = _chunk_buttons(cats, lambda c: f"sc|{tx_id}|{c}")
-    rows.append([{"text": "Back", "callback_data": f"bk|{tx_id}"}])
+    rows.append([{"text": "‹ Back", "callback_data": f"bk|{tx_id}"}])
     return {"inline_keyboard": rows}
 
 
-def _payment_keyboard(tx_id: int) -> dict:
-    rows = _chunk_buttons(nlp.PAYMENT_METHODS, lambda p: f"sp|{tx_id}|{p}")
-    rows.append([{"text": "Back", "callback_data": f"bk|{tx_id}"}])
+def _payment_keyboard(tx_id):
+    rows = _chunk_buttons(PAYMENT_METHODS, lambda p: f"sp|{tx_id}|{p}")
+    rows.append([{"text": "‹ Back", "callback_data": f"bk|{tx_id}"}])
     return {"inline_keyboard": rows}
 
 
 # -------------------------------------------------------------------- commands
 
-
-def handle_command(chat_id: int, text: str):
+def handle_command(chat_id, text):
     parts = text.strip().split()
     cmd = parts[0].lower().split("@")[0]
     args = parts[1:]
@@ -206,9 +543,9 @@ def handle_command(chat_id: int, text: str):
         rest, payment_method = _split_trailing_payment_method(args[1:])
         category = rest[0].lower()
         note = " ".join(rest[1:]) if len(rest) > 1 else None
-        tx_id = supa.add_transaction("expense", amount, category, note, payment_method)
+        tx_id = add_transaction("expense", amount, category, note, payment_method)
         tag = f" · {payment_method}" if payment_method else ""
-        send_message(chat_id, f"Logged #{tx_id}: -{fmt(amount)} on {category}{tag}\nBalance: {fmt(supa.get_balance())}")
+        send_message(chat_id, f"Logged #{tx_id}: -{fmt(amount)} on {category}{tag}\nBalance: {fmt(get_balance())}")
 
     elif cmd == "/income":
         if len(args) < 2:
@@ -220,9 +557,9 @@ def handle_command(chat_id: int, text: str):
         rest, payment_method = _split_trailing_payment_method(args[1:])
         source = rest[0].lower()
         note = " ".join(rest[1:]) if len(rest) > 1 else None
-        tx_id = supa.add_transaction("income", amount, source, note, payment_method)
+        tx_id = add_transaction("income", amount, source, note, payment_method)
         tag = f" · {payment_method}" if payment_method else ""
-        send_message(chat_id, f"Logged #{tx_id}: +{fmt(amount)} from {source}{tag}\nBalance: {fmt(supa.get_balance())}")
+        send_message(chat_id, f"Logged #{tx_id}: +{fmt(amount)} from {source}{tag}\nBalance: {fmt(get_balance())}")
 
     elif cmd == "/alias":
         if len(args) < 2:
@@ -232,21 +569,21 @@ def handle_command(chat_id: int, text: str):
             return send_message(chat_id, "Usage: /alias <note words> <category> [cash|upi|card|netbanking]")
         category = rest[-1].lower()
         note_key = " ".join(rest[:-1]).lower()
-        if category not in nlp.EXPENSE_CATEGORIES and category not in nlp.INCOME_CATEGORIES:
-            return send_message(chat_id, f"Unknown category '{category}'. Valid: {', '.join(nlp.EXPENSE_CATEGORIES)}")
-        tx_type = "income" if category in nlp.INCOME_CATEGORIES else "expense"
-        supa.set_alias(note_key, tx_type, category, payment_method)
+        if category not in EXPENSE_CATEGORIES and category not in INCOME_CATEGORIES:
+            return send_message(chat_id, f"Unknown category '{category}'. Valid: {', '.join(EXPENSE_CATEGORIES)}")
+        tx_type = "income" if category in INCOME_CATEGORIES else "expense"
+        set_alias(note_key, tx_type, category, payment_method)
         tag = f" ({payment_method})" if payment_method else ""
-        send_message(chat_id, f"Learned: '{note_key}' -> {category}{tag}")
+        send_message(chat_id, f"Learned: '{note_key}' → {category}{tag}")
 
     elif cmd == "/balance":
-        send_message(chat_id, f"Balance: {fmt(supa.get_balance())}")
+        send_message(chat_id, f"Balance: {fmt(get_balance())}")
 
     elif cmd == "/stats":
         period = args[0].lower() if args else "month"
         if period not in ("today", "week", "month", "all"):
             return send_message(chat_id, "Usage: /stats [today|week|month|all]")
-        s = supa.get_stats(period)
+        s = get_stats(period)
         lines = [f"Stats ({period}):", f"Income:  +{fmt(s['total_income'])}", f"Expense: -{fmt(s['total_expense'])}", f"Net:     {fmt(s['net'])}"]
         if s["by_category"]:
             lines.append("\nBy category:")
@@ -265,7 +602,7 @@ def handle_command(chat_id: int, text: str):
                 limit = max(1, min(50, int(args[0])))
             except ValueError:
                 pass
-        rows = supa.get_history(limit)
+        rows = get_history(limit)
         if not rows:
             return send_message(chat_id, "No transactions yet.")
         lines = []
@@ -278,7 +615,7 @@ def handle_command(chat_id: int, text: str):
         send_message(chat_id, "\n".join(lines))
 
     elif cmd == "/undo":
-        row = supa.delete_last_transaction()
+        row = delete_last_transaction()
         if not row:
             return send_message(chat_id, "Nothing to undo.")
         send_message(chat_id, f"Removed #{row['id']}: {row['type']} {fmt(row['amount'])} {row['category']}")
@@ -290,7 +627,7 @@ def handle_command(chat_id: int, text: str):
             tx_id = int(args[0])
         except ValueError:
             return send_message(chat_id, "ID has to be a number.")
-        ok = supa.delete_transaction(tx_id)
+        ok = delete_transaction(tx_id)
         send_message(chat_id, f"Deleted #{tx_id}." if ok else f"No transaction #{tx_id} found.")
 
     elif cmd == "/setbalance":
@@ -300,11 +637,11 @@ def handle_command(chat_id: int, text: str):
             amount = float(args[0])
         except ValueError:
             return send_message(chat_id, "Amount has to be a number.")
-        supa.set_starting_balance(amount)
-        send_message(chat_id, f"Starting balance set to {fmt(amount)}. Balance: {fmt(supa.get_balance())}")
+        set_starting_balance(amount)
+        send_message(chat_id, f"Starting balance set to {fmt(amount)}. Balance: {fmt(get_balance())}")
 
     elif cmd == "/export":
-        rows = supa.get_history(limit=100000)
+        rows = get_history(limit=100000)
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(["id", "type", "amount", "category", "note", "payment_method", "created_at"])
@@ -313,15 +650,15 @@ def handle_command(chat_id: int, text: str):
         send_document(chat_id, "expenses_export.csv", buf.getvalue().encode(), "Full export")
 
     elif cmd == "/backup":
-        dump = supa.all_data_dump()
+        dump = all_data_dump()
         send_document(chat_id, "expenses_backup.json", json.dumps(dump, indent=2).encode(), "Full backup")
 
     elif cmd == "/reset":
         if not args or args[0] != "confirm":
             return send_message(chat_id, "This wipes ALL data. To confirm, send: /reset confirm")
-        for row in supa._all_transactions():
-            supa.delete_transaction(row["id"])
-        supa.set_starting_balance(0)
+        for row in _all_transactions():
+            delete_transaction(row["id"])
+        set_starting_balance(0)
         send_message(chat_id, "All data wiped.")
 
     else:
@@ -330,10 +667,9 @@ def handle_command(chat_id: int, text: str):
 
 # --------------------------------------------------------------------- freeform
 
-
-def handle_freeform(chat_id: int, text: str):
-    aliases = supa.get_all_aliases()
-    transactions = nlp.parse_multi(text, aliases)
+def handle_freeform(chat_id, text):
+    aliases = get_all_aliases()
+    transactions = parse_multi(text, aliases)
     if not transactions:
         return send_message(
             chat_id,
@@ -343,22 +679,18 @@ def handle_freeform(chat_id: int, text: str):
 
     logged = []
     for parsed in transactions:
-        tx_id = supa.add_transaction(
-            parsed["type"], parsed["amount"], parsed["category"], parsed["note"], parsed["payment_method"]
-        )
+        tx_id = add_transaction(parsed["type"], parsed["amount"], parsed["category"], parsed["note"], parsed["payment_method"])
         note_key = (parsed.get("note") or "").lower().strip()
         if note_key and note_key not in aliases:
-            supa.set_alias(note_key, parsed["type"], parsed["category"], parsed["payment_method"])
-            aliases[note_key] = {
-                "type": parsed["type"], "category": parsed["category"], "payment_method": parsed["payment_method"]
-            }
+            set_alias(note_key, parsed["type"], parsed["category"], parsed["payment_method"])
+            aliases[note_key] = {"type": parsed["type"], "category": parsed["category"], "payment_method": parsed["payment_method"]}
         logged.append({**parsed, "id": tx_id})
 
     if len(logged) == 1:
         tx = logged[0]
         send_message_with_keyboard(chat_id, _confirmation_text(tx), _main_keyboard(tx["id"]))
     else:
-        lines = [f"Logged {len(logged)} transactions:"]
+        lines = [f"✅ Logged {len(logged)} transactions:"]
         for tx in logged:
             sign = "+" if tx["type"] == "income" else "-"
             bits = [tx["category"]]
@@ -367,11 +699,11 @@ def handle_freeform(chat_id: int, text: str):
             if tx["payment_method"]:
                 bits.append(f"· {tx['payment_method']}")
             lines.append(f"#{tx['id']} {sign}{fmt(tx['amount'])} {' '.join(bits)}")
-        lines.append(f"\nBalance: {fmt(supa.get_balance())}")
+        lines.append(f"\nBalance: {fmt(get_balance())}")
         send_message(chat_id, "\n".join(lines))
 
 
-def handle_voice(chat_id: int, message: dict):
+def handle_voice(chat_id, message):
     voice = message.get("voice") or {}
     file_id = voice.get("file_id")
     if not file_id:
@@ -379,7 +711,7 @@ def handle_voice(chat_id: int, message: dict):
     audio_bytes = download_telegram_file(file_id)
     if not audio_bytes:
         return send_message(chat_id, "Couldn't download that voice note.")
-    text = nlp.transcribe_voice(audio_bytes)
+    text = transcribe_voice(audio_bytes)
     if not text:
         return send_message(chat_id, "Couldn't transcribe that voice note. Try typing it instead.")
     handle_freeform(chat_id, text)
@@ -387,8 +719,7 @@ def handle_voice(chat_id: int, message: dict):
 
 # ------------------------------------------------------------------- callbacks
 
-
-def handle_callback_query(cq: dict):
+def handle_callback_query(cq):
     user_id = cq.get("from", {}).get("id")
     if user_id != OWNER_ID:
         return answer_callback_query(cq["id"])
@@ -402,7 +733,7 @@ def handle_callback_query(cq: dict):
 
     if action == "cc" and len(parts) == 2:
         tx_id = int(parts[1])
-        tx = supa.get_transaction(tx_id)
+        tx = get_transaction(tx_id)
         if not tx:
             return answer_callback_query(cq["id"], "Transaction not found.")
         edit_message_reply_markup(chat_id, message_id, _category_keyboard(tx_id, tx["type"]))
@@ -420,37 +751,36 @@ def handle_callback_query(cq: dict):
 
     if action == "ud" and len(parts) == 2:
         tx_id = int(parts[1])
-        tx = supa.get_transaction(tx_id)
-        supa.delete_transaction(tx_id)
+        tx = get_transaction(tx_id)
+        delete_transaction(tx_id)
         suffix = f": {tx['type']} {fmt(tx['amount'])} {tx['category']}" if tx else ""
-        edit_message_text(chat_id, message_id, f"Removed #{tx_id}{suffix}")
+        edit_message_text(chat_id, message_id, f"🗑 Removed #{tx_id}{suffix}")
         return answer_callback_query(cq["id"], "Removed")
 
     if action == "sc" and len(parts) == 3:
         tx_id, category = int(parts[1]), parts[2]
-        supa.update_transaction(tx_id, category=category)
-        tx = supa.get_transaction(tx_id)
+        update_transaction(tx_id, category=category)
+        tx = get_transaction(tx_id)
         if tx and tx.get("note"):
-            supa.set_alias(tx["note"].lower().strip(), tx["type"], category, tx.get("payment_method"))
+            set_alias(tx["note"].lower().strip(), tx["type"], category, tx.get("payment_method"))
         text = _confirmation_text(tx) if tx else f"#{tx_id} updated"
         edit_message_text(chat_id, message_id, text, reply_markup=_main_keyboard(tx_id))
-        return answer_callback_query(cq["id"], f"Category -> {category}")
+        return answer_callback_query(cq["id"], f"Category → {category}")
 
     if action == "sp" and len(parts) == 3:
         tx_id, method = int(parts[1]), parts[2]
-        supa.update_transaction(tx_id, payment_method=method)
-        tx = supa.get_transaction(tx_id)
+        update_transaction(tx_id, payment_method=method)
+        tx = get_transaction(tx_id)
         if tx and tx.get("note"):
-            supa.set_alias(tx["note"].lower().strip(), tx["type"], tx["category"], method)
+            set_alias(tx["note"].lower().strip(), tx["type"], tx["category"], method)
         text = _confirmation_text(tx) if tx else f"#{tx_id} updated"
         edit_message_text(chat_id, message_id, text, reply_markup=_main_keyboard(tx_id))
-        return answer_callback_query(cq["id"], f"Payment -> {method}")
+        return answer_callback_query(cq["id"], f"Payment → {method}")
 
     return answer_callback_query(cq["id"])
 
 
 # ---------------------------------------------------------------------- routes
-
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -460,15 +790,19 @@ def webhook():
     update = request.get_json(silent=True) or {}
 
     update_id = update.get("update_id")
-    if update_id is not None and not supa.mark_update_processed(update_id):
-        return jsonify({"ok": True})  # Telegram retried a delivery we already handled
+    if update_id is not None:
+        try:
+            if not mark_update_processed(update_id):
+                return jsonify({"ok": True})
+        except Exception:
+            pass
 
     if "callback_query" in update:
         cq = update["callback_query"]
         try:
             handle_callback_query(cq)
         except Exception:
-            answer_callback_query(cq.get("id", ""), "Something went wrong -- try again.")
+            answer_callback_query(cq.get("id", ""), "Something went wrong — try again.")
         return jsonify({"ok": True})
 
     message = update.get("message") or update.get("edited_message")
@@ -500,18 +834,11 @@ def webhook():
 
 @app.route("/cron/backup", methods=["GET"])
 def cron_backup():
-    """
-    Hit once a day by a GitHub Actions workflow. Does three jobs at once:
-    1. Touches the Supabase DB so the free project never hits its inactivity pause.
-    2. Sends a fresh JSON backup to your own Telegram chat as a safety net.
-    3. Cleans up old idempotency records so that table doesn't grow forever.
-    """
     if request.args.get("token") != CRON_SECRET:
         return jsonify({"ok": False}), 401
-
-    dump = supa.all_data_dump()
+    dump = all_data_dump()
     send_document(OWNER_ID, "daily_backup.json", json.dumps(dump, indent=2).encode(), "Daily auto-backup")
-    supa.cleanup_old_updates()
+    cleanup_old_updates()
     return jsonify({"ok": True, "transactions": len(dump["transactions"])})
 
 
