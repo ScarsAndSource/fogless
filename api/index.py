@@ -464,10 +464,11 @@ def webhook():
         return jsonify({"ok": True})  # Telegram retried a delivery we already handled
 
     if "callback_query" in update:
+        cq = update["callback_query"]
         try:
-            handle_callback_query(update["callback_query"])
+            handle_callback_query(cq)
         except Exception:
-            pass
+            answer_callback_query(cq.get("id", ""), "Something went wrong -- try again.")
         return jsonify({"ok": True})
 
     message = update.get("message") or update.get("edited_message")
