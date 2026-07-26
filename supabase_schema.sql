@@ -14,6 +14,10 @@ create table if not exists settings (
   value text
 );
 
+-- Migration v2: add payment_method column (2026-07-26)
+-- Run this if your table already exists from v1:
+--   alter table transactions add column if not exists payment_method text;
+
 -- Row Level Security stays enabled with no policies, so only requests using the
 -- service_role key (your bot's server-side key) can read/write. The public/anon
 -- key -- which this bot never uses -- would be blocked entirely.
