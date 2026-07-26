@@ -14,9 +14,23 @@ create table if not exists settings (
   value text
 );
 
--- Migration v2: add payment_method column (2026-07-26)
--- Run this if your table already exists from v1:
---   alter table transactions add column if not exists payment_method text;
+-- Migration: add payment_method column (skip if already applied)
+alter table transactions add column if not exists payment_method text;
+
+create table if not exists aliases (
+  note_key text primary key,
+  type text not null check (type in ('expense', 'income')),
+  category text not null,
+  payment_method text,
+  created_at timestamptz not null default now()
+);
+alter table aliases enable row level security;
+
+create table if not exists processed_updates (
+  update_id bigint primary key,
+  created_at timestamptz not null default now()
+);
+alter table processed_updates enable row level security;
 
 -- Row Level Security stays enabled with no policies, so only requests using the
 -- service_role key (your bot's server-side key) can read/write. The public/anon
