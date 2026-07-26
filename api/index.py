@@ -226,12 +226,14 @@ def handle_command(chat_id: int, text: str):
 
     elif cmd == "/alias":
         if len(args) < 2:
-            return send_message(chat_id, "Usage: /alias <note> <category> [cash|upi|card|netbanking]")
-        rest, payment_method = _split_trailing_payment_method(args[1:])
-        if not rest:
-            return send_message(chat_id, "Usage: /alias <note> <category> [cash|upi|card|netbanking]")
-        note_key = args[0].lower()
-        category = rest[0].lower()
+            return send_message(chat_id, "Usage: /alias <note words> <category> [cash|upi|card|netbanking]")
+        rest, payment_method = _split_trailing_payment_method(args)
+        if len(rest) < 2:
+            return send_message(chat_id, "Usage: /alias <note words> <category> [cash|upi|card|netbanking]")
+        category = rest[-1].lower()
+        note_key = " ".join(rest[:-1]).lower()
+        if category not in nlp.EXPENSE_CATEGORIES and category not in nlp.INCOME_CATEGORIES:
+            return send_message(chat_id, f"Unknown category '{category}'. Valid: {', '.join(nlp.EXPENSE_CATEGORIES)}")
         tx_type = "income" if category in nlp.INCOME_CATEGORIES else "expense"
         supa.set_alias(note_key, tx_type, category, payment_method)
         tag = f" ({payment_method})" if payment_method else ""
@@ -344,7 +346,7 @@ def handle_freeform(chat_id: int, text: str):
         tx_id = supa.add_transaction(
             parsed["type"], parsed["amount"], parsed["category"], parsed["note"], parsed["payment_method"]
         )
-        note_key = (parsed.get("note") or parsed["category"]).lower().strip()
+        note_key = (parsed.get("note") or "").lower().strip()
         if note_key and note_key not in aliases:
             supa.set_alias(note_key, parsed["type"], parsed["category"], parsed["payment_method"])
             aliases[note_key] = {
