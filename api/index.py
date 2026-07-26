@@ -149,33 +149,55 @@ def delete_last_transaction():
     return rows[0]
 
 
-def get_starting_balance() -> float:
+BALANCE_BUCKETS = PAYMENT_METHODS + ["unspecified"]  # cash, upi, card, netbanking, other, unspecified
+
+
+def _settings_key(method: str) -> str:
+    return f"starting_balance:{method}"
+
+
+def get_starting_balances() -> dict:
     r = requests.get(
         _sb_url("settings"),
         headers=SB_HEADERS,
-        params={"select": "value", "key": "eq.starting_balance"},
+        params={"select": "key,value", "key": "like.starting_balance:*"},
         timeout=SB_TIMEOUT,
     )
     r.raise_for_status()
-    rows = r.json()
-    return float(rows[0]["value"]) if rows else 0.0
+    result = {b: 0.0 for b in BALANCE_BUCKETS}
+    for row in r.json():
+        method = row["key"].split(":", 1)[1]
+        if method in result:
+            result[method] = float(row["value"])
+    return result
 
 
-def set_starting_balance(amount: float):
+def set_starting_balance(method: str, amount: float):
     r = requests.post(
         _sb_url("settings"),
         headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
-        json={"key": "starting_balance", "value": str(amount)},
+        json={"key": _settings_key(method), "value": str(amount)},
         timeout=SB_TIMEOUT,
     )
     r.raise_for_status()
 
 
-def get_balance() -> float:
+def get_balances_by_method() -> dict:
     rows = _all_transactions()
-    income = sum(r["amount"] for r in rows if r["type"] == "income")
-    expense = sum(r["amount"] for r in rows if r["type"] == "expense")
-    return get_starting_balance() + income - expense
+    result = get_starting_balances()
+    for r in rows:
+        method = r.get("payment_method") or "unspecified"
+        if method not in result:
+            result[method] = 0.0
+        if r["type"] == "income":
+            result[method] += r["amount"]
+        else:
+            result[method] -= r["amount"]
+    return result
+
+
+def get_balance() -> float:
+    return sum(get_balances_by_method().values())
 
 
 def _since(period):
@@ -222,7 +244,7 @@ def get_stats(period="month"):
 
 
 def all_data_dump():
-    return {"transactions": _all_transactions(order="id.asc"), "starting_balance": get_starting_balance()}
+    return {"transactions": _all_transactions(order="id.asc"), "starting_balances": get_starting_balances()}
 
 
 def get_all_aliases() -> dict:
@@ -460,12 +482,12 @@ HELP_TEXT = (
     "/add <amount> <category> [note] [cash|upi|card|netbanking] - log an expense\n"
     "/income <amount> <source> [note] [cash|upi|card|netbanking] - log income\n"
     "/alias <note words> <category> [cash|upi|card|netbanking] - teach a shortcut\n"
-    "/balance - current balance\n"
+    "/balance [cash|upi|card|netbanking|other] - balance breakdown, or one method\n"
     "/stats [today|week|month|all] - totals + category + payment breakdown\n"
     "/history [n] - last n transactions\n"
     "/undo - remove the most recent transaction\n"
     "/delete <id> - remove a specific transaction\n"
-    "/setbalance <amount> - set your starting balance\n"
+    "/setbalance <cash|upi|card|netbanking|other> <amount> - set a starting balance per method\n"
     "/export - get a CSV of everything\n"
     "/backup - get a full JSON backup\n"
     "/reset confirm - wipe all data\n"
@@ -485,7 +507,12 @@ def _confirmation_text(tx):
         bits.append(f"({tx['note']})")
     if tx.get("payment_method"):
         bits.append(f"· {tx['payment_method']}")
-    return f"✅ #{tx['id']} {sign}{fmt(tx['amount'])} {' '.join(bits)}\nBalance: {fmt(get_balance())}"
+    balances = get_balances_by_method()
+    total_line = f"Total: {fmt(sum(balances.values()))}"
+    if tx.get("payment_method"):
+        method = tx["payment_method"]
+        total_line = f"{method.capitalize()}: {fmt(balances.get(method, 0.0))}  |  Total: {fmt(sum(balances.values()))}"
+    return f"✅ #{tx['id']} {sign}{fmt(tx['amount'])} {' '.join(bits)}\n{total_line}"
 
 
 def _main_keyboard(tx_id):
@@ -545,7 +572,11 @@ def handle_command(chat_id, text):
         note = " ".join(rest[1:]) if len(rest) > 1 else None
         tx_id = add_transaction("expense", amount, category, note, payment_method)
         tag = f" · {payment_method}" if payment_method else ""
-        send_message(chat_id, f"Logged #{tx_id}: -{fmt(amount)} on {category}{tag}\nBalance: {fmt(get_balance())}")
+        balances = get_balances_by_method()
+        bal_line = f"Total: {fmt(sum(balances.values()))}"
+        if payment_method:
+            bal_line = f"{payment_method.capitalize()}: {fmt(balances.get(payment_method, 0.0))}  |  Total: {fmt(sum(balances.values()))}"
+        send_message(chat_id, f"Logged #{tx_id}: -{fmt(amount)} on {category}{tag}\n{bal_line}")
 
     elif cmd == "/income":
         if len(args) < 2:
@@ -559,7 +590,11 @@ def handle_command(chat_id, text):
         note = " ".join(rest[1:]) if len(rest) > 1 else None
         tx_id = add_transaction("income", amount, source, note, payment_method)
         tag = f" · {payment_method}" if payment_method else ""
-        send_message(chat_id, f"Logged #{tx_id}: +{fmt(amount)} from {source}{tag}\nBalance: {fmt(get_balance())}")
+        balances = get_balances_by_method()
+        bal_line = f"Total: {fmt(sum(balances.values()))}"
+        if payment_method:
+            bal_line = f"{payment_method.capitalize()}: {fmt(balances.get(payment_method, 0.0))}  |  Total: {fmt(sum(balances.values()))}"
+        send_message(chat_id, f"Logged #{tx_id}: +{fmt(amount)} from {source}{tag}\n{bal_line}")
 
     elif cmd == "/alias":
         if len(args) < 2:
@@ -577,7 +612,19 @@ def handle_command(chat_id, text):
         send_message(chat_id, f"Learned: '{note_key}' → {category}{tag}")
 
     elif cmd == "/balance":
-        send_message(chat_id, f"Balance: {fmt(get_balance())}")
+        if args:
+            method = args[0].lower()
+            if method not in PAYMENT_METHODS:
+                return send_message(chat_id, f"Unknown payment method '{method}'. Valid: {', '.join(PAYMENT_METHODS)}")
+            balances = get_balances_by_method()
+            return send_message(chat_id, f"{method.capitalize()} balance: {fmt(balances.get(method, 0.0))}")
+        balances = get_balances_by_method()
+        lines = ["Balances:"]
+        for method in PAYMENT_METHODS + ["unspecified"]:
+            if balances.get(method, 0.0) != 0 or method in ("cash", "upi"):
+                lines.append(f"  {method}: {fmt(balances.get(method, 0.0))}")
+        lines.append(f"\nTotal: {fmt(sum(balances.values()))}")
+        send_message(chat_id, "\n".join(lines))
 
     elif cmd == "/stats":
         period = args[0].lower() if args else "month"
@@ -631,14 +678,17 @@ def handle_command(chat_id, text):
         send_message(chat_id, f"Deleted #{tx_id}." if ok else f"No transaction #{tx_id} found.")
 
     elif cmd == "/setbalance":
-        if not args:
-            return send_message(chat_id, "Usage: /setbalance <amount>")
+        if len(args) < 2:
+            return send_message(chat_id, "Usage: /setbalance <cash|upi|card|netbanking|other> <amount>")
+        method = args[0].lower()
+        if method not in PAYMENT_METHODS:
+            return send_message(chat_id, f"Unknown payment method '{method}'. Valid: {', '.join(PAYMENT_METHODS)}")
         try:
-            amount = float(args[0])
+            amount = float(args[1])
         except ValueError:
             return send_message(chat_id, "Amount has to be a number.")
-        set_starting_balance(amount)
-        send_message(chat_id, f"Starting balance set to {fmt(amount)}. Balance: {fmt(get_balance())}")
+        set_starting_balance(method, amount)
+        send_message(chat_id, f"Starting {method} balance set to {fmt(amount)}. Total balance: {fmt(get_balance())}")
 
     elif cmd == "/export":
         rows = get_history(limit=100000)
@@ -658,7 +708,8 @@ def handle_command(chat_id, text):
             return send_message(chat_id, "This wipes ALL data. To confirm, send: /reset confirm")
         for row in _all_transactions():
             delete_transaction(row["id"])
-        set_starting_balance(0)
+        for method in PAYMENT_METHODS:
+            set_starting_balance(method, 0)
         send_message(chat_id, "All data wiped.")
 
     else:
