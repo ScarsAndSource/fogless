@@ -22,8 +22,8 @@ def _url(path: str) -> str:
     return f"{SUPABASE_URL}/rest/v1/{path}"
 
 
-def add_transaction(tx_type: str, amount: float, category: str, note: str | None) -> int:
-    payload = {"type": tx_type, "amount": amount, "category": category, "note": note}
+def add_transaction(tx_type: str, amount: float, category: str, note: str | None, payment_method: str | None = None) -> int:
+    payload = {"type": tx_type, "amount": amount, "category": category, "note": note, "payment_method": payment_method}
     r = requests.post(
         _url("transactions"),
         headers={**HEADERS, "Prefer": "return=representation"},
@@ -114,21 +114,33 @@ def get_stats(period: str = "month"):
     rows = _all_transactions(since=since) if since else _all_transactions()
     total_income = sum(r["amount"] for r in rows if r["type"] == "income")
     total_expense = sum(r["amount"] for r in rows if r["type"] == "expense")
+
     by_cat: dict[str, dict] = {}
+    by_pay: dict[str, dict] = {}
     for r in rows:
         if r["type"] == "expense":
             c = r["category"]
             by_cat.setdefault(c, {"total": 0.0, "cnt": 0})
             by_cat[c]["total"] += r["amount"]
             by_cat[c]["cnt"] += 1
+
+            p = r.get("payment_method") or "unspecified"
+            by_pay.setdefault(p, {"total": 0.0, "cnt": 0})
+            by_pay[p]["total"] += r["amount"]
+            by_pay[p]["cnt"] += 1
+
     by_category = sorted(
         ({"category": k, **v} for k, v in by_cat.items()), key=lambda x: -x["total"]
+    )
+    by_payment = sorted(
+        ({"payment_method": k, **v} for k, v in by_pay.items()), key=lambda x: -x["total"]
     )
     return {
         "total_income": total_income,
         "total_expense": total_expense,
         "net": total_income - total_expense,
         "by_category": by_category,
+        "by_payment": by_payment,
     }
 
 
