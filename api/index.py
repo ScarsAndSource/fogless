@@ -568,6 +568,8 @@ def handle_command(chat_id, text):
         except ValueError:
             return send_message(chat_id, "Amount has to be a number.")
         rest, payment_method = _split_trailing_payment_method(args[1:])
+        if not rest:
+            return send_message(chat_id, "Missing a category. Usage: /add <amount> <category> [note] [cash|upi|card]")
         category = rest[0].lower()
         note = " ".join(rest[1:]) if len(rest) > 1 else None
         tx_id = add_transaction("expense", amount, category, note, payment_method)
@@ -586,6 +588,8 @@ def handle_command(chat_id, text):
         except ValueError:
             return send_message(chat_id, "Amount has to be a number.")
         rest, payment_method = _split_trailing_payment_method(args[1:])
+        if not rest:
+            return send_message(chat_id, "Missing a source. Usage: /income <amount> <source> [note] [cash|upi|card]")
         source = rest[0].lower()
         note = " ".join(rest[1:]) if len(rest) > 1 else None
         tx_id = add_transaction("income", amount, source, note, payment_method)
