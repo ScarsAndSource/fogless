@@ -22,13 +22,13 @@ You are standing in line, and you just paid for milk on UPI. You do not open an 
 
 > `60 milk upi`
 
-It is done. Categorized, tagged with the payment method, balance recalculated, before your thumb even leaves the screen.
+It is done. Categorized, tagged with the payment method, that method's balance recalculated alongside the total, before your thumb even leaves the screen. A row of buttons appears under the confirmation so you can adjust the category, switch the payment method, or undo it in one tap.
 
 You are rushing, three purchases deep before you remember to log the first one. You do not log them one at a time. You say all of it at once, exactly as it happened:
 
 > `400 creatine cash, 60 milk upi, 1200 rent upi`
 
-All three are sorted, filed, and confirmed in the time it takes to read the sentence back.
+All three are sorted, filed with their respective payment methods, and confirmed with per-method and total balances in the time it takes to read the sentence back.
 
 Your hands are full, and typing is not an option. You send a voice note instead, the same way you'd leave one for a friend. Fogless listens, transcribes, understands, and logs it, exactly as if you had typed it yourself.
 
