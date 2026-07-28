@@ -10,18 +10,23 @@ import csv
 import re
 import json
 import requests
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 
+
 # --------------------------------------------------------------------- config
+
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
 TELEGRAM_SECRET_TOKEN = os.environ["TELEGRAM_SECRET_TOKEN"]
 CRON_SECRET = os.environ["CRON_SECRET"]
 
+
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+
 
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 GROQ_CHAT_API = "https://api.groq.com/openai/v1/chat/completions"
@@ -29,7 +34,9 @@ GROQ_AUDIO_API = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 
+
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
 
 SB_HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -37,6 +44,12 @@ SB_HEADERS = {
     "Content-Type": "application/json",
 }
 SB_TIMEOUT = 8
+SB_PAGE_SIZE = 1000  # FIX: PostgREST's typical default row cap per request — used to paginate past it
+
+
+# FIX: local calendar-day boundary for /stats "today", instead of UTC midnight
+IST = timezone(timedelta(hours=5, minutes=30))
+
 
 EXPENSE_CATEGORIES = [
     "food", "groceries", "transport", "bills", "shopping", "entertainment",
@@ -45,7 +58,9 @@ EXPENSE_CATEGORIES = [
 INCOME_CATEGORIES = ["salary", "freelance", "gift", "refund", "other"]
 PAYMENT_METHODS = ["cash", "upi", "card", "netbanking", "other"]
 
+
 _CURRENCY_WORDS = {"rs", "rs.", "inr", "rupees", "rupee", "bucks"}
+
 
 MULTI_SYSTEM_PROMPT = f"""You are a strict JSON-extraction engine for a personal expense tracker.
 A message may describe ONE or SEVERAL transactions (separated by commas, "and", semicolons, or line breaks).
@@ -68,19 +83,49 @@ Respond with ONLY a raw JSON object matching this exact shape, nothing else — 
 {{"transactions": [{{"type": "expense", "amount": 0, "category": "other", "payment_method": null, "note": null}}]}}
 """
 
+
 _MULTI_HINT_RE = re.compile(r",|;|\band\b|\n", re.IGNORECASE)
+
 
 app = Flask(__name__)
 
 
+# ------------------------------------------------------------------ helpers
+
+
+def _to_decimal(value) -> Decimal:
+    """FIX: single funnel for turning any incoming amount (str/int/float/Decimal)
+    into a clean 2-decimal-place Decimal. Raises InvalidOperation/ValueError on
+    junk input — callers decide how to handle that."""
+    d = Decimal(str(value))
+    return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _json_default(obj):
+    """FIX: Decimal isn't natively JSON-serializable — without this, /backup
+    and the daily cron backup would throw the moment amounts became Decimal."""
+    if isinstance(obj, Decimal):
+        return str(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 # ---------------------------------------------------------------- data layer
+
 
 def _sb_url(path: str) -> str:
     return f"{SUPABASE_URL}/rest/v1/{path}"
 
 
 def add_transaction(tx_type, amount, category, note, payment_method=None) -> int:
-    payload = {"type": tx_type, "amount": amount, "category": category, "note": note, "payment_method": payment_method}
+    # FIX: amount sent as a string so Postgres's numeric column receives the
+    # exact decimal value — never round-tripped through a JSON float first.
+    payload = {
+        "type": tx_type,
+        "amount": str(amount),
+        "category": category,
+        "note": note,
+        "payment_method": payment_method,
+    }
     r = requests.post(
         _sb_url("transactions"),
         headers={**SB_HEADERS, "Prefer": "return=representation"},
@@ -92,14 +137,36 @@ def add_transaction(tx_type, amount, category, note, payment_method=None) -> int
 
 
 def _all_transactions(order="id.desc", limit=None, since=None):
-    params = {"select": "*", "order": order}
+    """FIX: When `limit` is given, behaves exactly as before — a single
+    bounded page (used by /history, /undo, etc). When `limit` is omitted,
+    this now transparently paginates through ALL matching rows instead of
+    trusting a single request to return everything. PostgREST caps a single
+    response at SB_PAGE_SIZE rows by default; a naive one-shot fetch silently
+    truncates once the table crosses that cap, which is exactly what was
+    happening to get_balances_by_method/get_stats/all_data_dump before this
+    fix. Loops until a short page proves there's nothing left."""
     if limit:
-        params["limit"] = limit
-    if since:
-        params["created_at"] = f"gte.{since}"
-    r = requests.get(_sb_url("transactions"), headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+        params = {"select": "*", "order": order, "limit": limit}
+        if since:
+            params["created_at"] = f"gte.{since}"
+        r = requests.get(_sb_url("transactions"), headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
+        r.raise_for_status()
+        return r.json(parse_float=Decimal)  # FIX: parse amounts as Decimal, not float
+
+    all_rows = []
+    offset = 0
+    while True:
+        params = {"select": "*", "order": order, "limit": SB_PAGE_SIZE, "offset": offset}
+        if since:
+            params["created_at"] = f"gte.{since}"
+        r = requests.get(_sb_url("transactions"), headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
+        r.raise_for_status()
+        page = r.json(parse_float=Decimal)  # FIX
+        all_rows.extend(page)
+        if len(page) < SB_PAGE_SIZE:
+            break
+        offset += SB_PAGE_SIZE
+    return all_rows
 
 
 def get_history(limit=10):
@@ -114,7 +181,7 @@ def get_transaction(tx_id):
         timeout=SB_TIMEOUT,
     )
     r.raise_for_status()
-    rows = r.json()
+    rows = r.json(parse_float=Decimal)  # FIX
     return rows[0] if rows else None
 
 
@@ -164,15 +231,18 @@ def get_starting_balances() -> dict:
         timeout=SB_TIMEOUT,
     )
     r.raise_for_status()
-    result = {b: 0.0 for b in BALANCE_BUCKETS}
+    result = {b: Decimal("0.00") for b in BALANCE_BUCKETS}  # FIX: Decimal, not float
     for row in r.json():
         method = row["key"].split(":", 1)[1]
         if method in result:
-            result[method] = float(row["value"])
+            try:
+                result[method] = Decimal(row["value"])
+            except InvalidOperation:
+                result[method] = Decimal("0.00")
     return result
 
 
-def set_starting_balance(method: str, amount: float):
+def set_starting_balance(method: str, amount) -> None:
     r = requests.post(
         _sb_url("settings"),
         headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
@@ -188,7 +258,7 @@ def get_balances_by_method() -> dict:
     for r in rows:
         method = r.get("payment_method") or "unspecified"
         if method not in result:
-            result[method] = 0.0
+            result[method] = Decimal("0.00")
         if r["type"] == "income":
             result[method] += r["amount"]
         else:
@@ -196,18 +266,27 @@ def get_balances_by_method() -> dict:
     return result
 
 
-def get_balance() -> float:
-    return sum(get_balances_by_method().values())
+def get_balance() -> Decimal:
+    return sum(get_balances_by_method().values(), Decimal("0.00"))
 
 
 def _since(period):
-    now = datetime.now(timezone.utc)
+    """FIX: "today" now means local (IST) calendar day, not UTC. Anything
+    logged between midnight and 5:30am IST used to get counted as "yesterday"
+    in /stats today — this computes IST midnight, then converts back to UTC
+    for the query since created_at is stored in UTC. "week"/"month" stay as
+    rolling deltas — they don't depend on calendar-day boundaries so UTC vs
+    IST makes no difference there."""
+    now_utc = datetime.now(timezone.utc)
     if period == "today":
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        now_ist = now_utc.astimezone(IST)
+        start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_utc = start_ist.astimezone(timezone.utc)
+        return start_utc.isoformat()
     elif period == "week":
-        start = now - timedelta(days=7)
+        start = now_utc - timedelta(days=7)
     elif period == "month":
-        start = now - timedelta(days=30)
+        start = now_utc - timedelta(days=30)
     else:
         return None
     return start.isoformat()
@@ -216,19 +295,19 @@ def _since(period):
 def get_stats(period="month"):
     since = _since(period)
     rows = _all_transactions(since=since) if since else _all_transactions()
-    total_income = sum(r["amount"] for r in rows if r["type"] == "income")
-    total_expense = sum(r["amount"] for r in rows if r["type"] == "expense")
+    total_income = sum((r["amount"] for r in rows if r["type"] == "income"), Decimal("0.00"))
+    total_expense = sum((r["amount"] for r in rows if r["type"] == "expense"), Decimal("0.00"))
 
     by_cat, by_pay = {}, {}
     for r in rows:
         if r["type"] == "expense":
             c = r["category"]
-            by_cat.setdefault(c, {"total": 0.0, "cnt": 0})
+            by_cat.setdefault(c, {"total": Decimal("0.00"), "cnt": 0})  # FIX: Decimal
             by_cat[c]["total"] += r["amount"]
             by_cat[c]["cnt"] += 1
 
             p = r.get("payment_method") or "unspecified"
-            by_pay.setdefault(p, {"total": 0.0, "cnt": 0})
+            by_pay.setdefault(p, {"total": Decimal("0.00"), "cnt": 0})  # FIX: Decimal
             by_pay[p]["total"] += r["amount"]
             by_pay[p]["cnt"] += 1
 
@@ -286,12 +365,13 @@ def cleanup_old_updates(days=7):
 
 # ------------------------------------------------------------------ nlp layer
 
+
 def _validate_item(data):
     if not data or data.get("type") not in ("expense", "income"):
         return None
     try:
-        amount = float(data["amount"])
-    except (TypeError, ValueError, KeyError):
+        amount = _to_decimal(data["amount"])  # FIX: Decimal, not float
+    except (TypeError, ValueError, KeyError, InvalidOperation):
         return None
     if amount <= 0:
         return None
@@ -320,7 +400,7 @@ def _call_groq_chat(text):
         )
         r.raise_for_status()
         content = r.json()["choices"][0]["message"]["content"]
-        data = json.loads(content)
+        data = json.loads(content, parse_float=Decimal)  # FIX: Decimal, not float
     except Exception:
         return None
 
@@ -345,14 +425,14 @@ def quick_parse_single(text, aliases):
         if amount is None:
             m = re.match(r"^(\d+(?:\.\d+)?)(k)?$", clean)
             if m:
-                val = float(m.group(1))
+                val = Decimal(m.group(1))  # FIX: Decimal, not float
                 if m.group(2) == "k":
-                    val *= 1000
+                    val *= Decimal("1000")
                 amount = val
                 continue
             m2 = re.match(r"^(\d+(?:\.\d+)?)rs$", clean)
             if m2:
-                amount = float(m2.group(1))
+                amount = Decimal(m2.group(1))  # FIX: Decimal, not float
                 continue
         if clean in _CURRENCY_WORDS:
             continue
@@ -364,6 +444,7 @@ def quick_parse_single(text, aliases):
     if amount is None or amount <= 0 or not note_tokens:
         return None
 
+    amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)  # FIX
     note_key = " ".join(note_tokens).strip()
     alias = aliases.get(note_key)
     if not alias:
@@ -401,8 +482,21 @@ def transcribe_voice(audio_bytes, filename="voice.ogg"):
 
 # -------------------------------------------------------------- telegram i/o
 
-def fmt(amount: float) -> str:
+
+def fmt(amount) -> str:
     return f"{amount:,.2f}"
+
+
+def _fmt_ts(iso_str: str) -> str:
+    """FIX: render timestamps in IST instead of raw UTC — same underlying
+    bug as _since(), just showing up in /history instead of /stats."""
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(IST).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return iso_str[:16].replace("T", " ")
 
 
 def send_message(chat_id, text):
@@ -470,6 +564,7 @@ def download_telegram_file(file_id):
 
 # --------------------------------------------------------------------- extras
 
+
 HELP_TEXT = (
     "Just type it — no command needed:\n"
     "  400rs creatine cash\n"
@@ -508,10 +603,10 @@ def _confirmation_text(tx):
     if tx.get("payment_method"):
         bits.append(f"· {tx['payment_method']}")
     balances = get_balances_by_method()
-    total_line = f"Total: {fmt(sum(balances.values()))}"
+    total_line = f"Total: {fmt(sum(balances.values(), Decimal('0.00')))}"
     if tx.get("payment_method"):
         method = tx["payment_method"]
-        total_line = f"{method.capitalize()}: {fmt(balances.get(method, 0.0))}  |  Total: {fmt(sum(balances.values()))}"
+        total_line = f"{method.capitalize()}: {fmt(balances.get(method, Decimal('0.00')))}  |  Total: {fmt(sum(balances.values(), Decimal('0.00')))}"
     return f"✅ #{tx['id']} {sign}{fmt(tx['amount'])} {' '.join(bits)}\n{total_line}"
 
 
@@ -552,6 +647,7 @@ def _payment_keyboard(tx_id):
 
 # -------------------------------------------------------------------- commands
 
+
 def handle_command(chat_id, text):
     parts = text.strip().split()
     cmd = parts[0].lower().split("@")[0]
@@ -564,8 +660,8 @@ def handle_command(chat_id, text):
         if len(args) < 2:
             return send_message(chat_id, "Usage: /add <amount> <category> [note] [cash|upi|card]")
         try:
-            amount = float(args[0])
-        except ValueError:
+            amount = _to_decimal(args[0])  # FIX: Decimal, not float
+        except (InvalidOperation, ValueError):
             return send_message(chat_id, "Amount has to be a number.")
         rest, payment_method = _split_trailing_payment_method(args[1:])
         if not rest:
@@ -575,17 +671,17 @@ def handle_command(chat_id, text):
         tx_id = add_transaction("expense", amount, category, note, payment_method)
         tag = f" · {payment_method}" if payment_method else ""
         balances = get_balances_by_method()
-        bal_line = f"Total: {fmt(sum(balances.values()))}"
+        bal_line = f"Total: {fmt(sum(balances.values(), Decimal('0.00')))}"
         if payment_method:
-            bal_line = f"{payment_method.capitalize()}: {fmt(balances.get(payment_method, 0.0))}  |  Total: {fmt(sum(balances.values()))}"
+            bal_line = f"{payment_method.capitalize()}: {fmt(balances.get(payment_method, Decimal('0.00')))}  |  Total: {fmt(sum(balances.values(), Decimal('0.00')))}"
         send_message(chat_id, f"Logged #{tx_id}: -{fmt(amount)} on {category}{tag}\n{bal_line}")
 
     elif cmd == "/income":
         if len(args) < 2:
             return send_message(chat_id, "Usage: /income <amount> <source> [note] [cash|upi|card]")
         try:
-            amount = float(args[0])
-        except ValueError:
+            amount = _to_decimal(args[0])  # FIX: Decimal, not float
+        except (InvalidOperation, ValueError):
             return send_message(chat_id, "Amount has to be a number.")
         rest, payment_method = _split_trailing_payment_method(args[1:])
         if not rest:
@@ -595,9 +691,9 @@ def handle_command(chat_id, text):
         tx_id = add_transaction("income", amount, source, note, payment_method)
         tag = f" · {payment_method}" if payment_method else ""
         balances = get_balances_by_method()
-        bal_line = f"Total: {fmt(sum(balances.values()))}"
+        bal_line = f"Total: {fmt(sum(balances.values(), Decimal('0.00')))}"
         if payment_method:
-            bal_line = f"{payment_method.capitalize()}: {fmt(balances.get(payment_method, 0.0))}  |  Total: {fmt(sum(balances.values()))}"
+            bal_line = f"{payment_method.capitalize()}: {fmt(balances.get(payment_method, Decimal('0.00')))}  |  Total: {fmt(sum(balances.values(), Decimal('0.00')))}"
         send_message(chat_id, f"Logged #{tx_id}: +{fmt(amount)} from {source}{tag}\n{bal_line}")
 
     elif cmd == "/alias":
@@ -621,13 +717,13 @@ def handle_command(chat_id, text):
             if method not in PAYMENT_METHODS:
                 return send_message(chat_id, f"Unknown payment method '{method}'. Valid: {', '.join(PAYMENT_METHODS)}")
             balances = get_balances_by_method()
-            return send_message(chat_id, f"{method.capitalize()} balance: {fmt(balances.get(method, 0.0))}")
+            return send_message(chat_id, f"{method.capitalize()} balance: {fmt(balances.get(method, Decimal('0.00')))}")
         balances = get_balances_by_method()
         lines = ["Balances:"]
         for method in PAYMENT_METHODS + ["unspecified"]:
-            if balances.get(method, 0.0) != 0 or method in ("cash", "upi"):
-                lines.append(f"  {method}: {fmt(balances.get(method, 0.0))}")
-        lines.append(f"\nTotal: {fmt(sum(balances.values()))}")
+            if balances.get(method, Decimal("0.00")) != 0 or method in ("cash", "upi"):
+                lines.append(f"  {method}: {fmt(balances.get(method, Decimal('0.00')))}")
+        lines.append(f"\nTotal: {fmt(sum(balances.values(), Decimal('0.00')))}")
         send_message(chat_id, "\n".join(lines))
 
     elif cmd == "/stats":
@@ -659,7 +755,7 @@ def handle_command(chat_id, text):
         lines = []
         for r in rows:
             sign = "+" if r["type"] == "income" else "-"
-            ts = r["created_at"][:16].replace("T", " ")
+            ts = _fmt_ts(r["created_at"])  # FIX: IST, not raw UTC
             note = f" ({r['note']})" if r.get("note") else ""
             pay = f" [{r['payment_method']}]" if r.get("payment_method") else ""
             lines.append(f"#{r['id']} {ts} {sign}{fmt(r['amount'])} {r['category']}{note}{pay}")
@@ -688,8 +784,8 @@ def handle_command(chat_id, text):
         if method not in PAYMENT_METHODS:
             return send_message(chat_id, f"Unknown payment method '{method}'. Valid: {', '.join(PAYMENT_METHODS)}")
         try:
-            amount = float(args[1])
-        except ValueError:
+            amount = _to_decimal(args[1])  # FIX: Decimal, not float
+        except (InvalidOperation, ValueError):
             return send_message(chat_id, "Amount has to be a number.")
         set_starting_balance(method, amount)
         send_message(chat_id, f"Starting {method} balance set to {fmt(amount)}. Total balance: {fmt(get_balance())}")
@@ -705,15 +801,15 @@ def handle_command(chat_id, text):
 
     elif cmd == "/backup":
         dump = all_data_dump()
-        send_document(chat_id, "expenses_backup.json", json.dumps(dump, indent=2).encode(), "Full backup")
+        send_document(chat_id, "expenses_backup.json", json.dumps(dump, indent=2, default=_json_default).encode(), "Full backup")  # FIX
 
     elif cmd == "/reset":
         if not args or args[0] != "confirm":
             return send_message(chat_id, "This wipes ALL data. To confirm, send: /reset confirm")
-        for row in _all_transactions():
+        for row in _all_transactions():  # now correctly paginated — no leftover rows past the old cap
             delete_transaction(row["id"])
         for method in PAYMENT_METHODS:
-            set_starting_balance(method, 0)
+            set_starting_balance(method, Decimal("0.00"))
         send_message(chat_id, "All data wiped.")
 
     else:
@@ -721,6 +817,7 @@ def handle_command(chat_id, text):
 
 
 # --------------------------------------------------------------------- freeform
+
 
 def handle_freeform(chat_id, text):
     aliases = get_all_aliases()
@@ -773,6 +870,7 @@ def handle_voice(chat_id, message):
 
 
 # ------------------------------------------------------------------- callbacks
+
 
 def handle_callback_query(cq):
     user_id = cq.get("from", {}).get("id")
@@ -837,6 +935,7 @@ def handle_callback_query(cq):
 
 # ---------------------------------------------------------------------- routes
 
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_SECRET_TOKEN:
@@ -892,7 +991,7 @@ def cron_backup():
     if request.args.get("token") != CRON_SECRET:
         return jsonify({"ok": False}), 401
     dump = all_data_dump()
-    send_document(OWNER_ID, "daily_backup.json", json.dumps(dump, indent=2).encode(), "Daily auto-backup")
+    send_document(OWNER_ID, "daily_backup.json", json.dumps(dump, indent=2, default=_json_default).encode(), "Daily auto-backup")  # FIX
     cleanup_old_updates()
     return jsonify({"ok": True, "transactions": len(dump["transactions"])})
 
