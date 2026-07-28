@@ -44,11 +44,10 @@ SB_HEADERS = {
     "Content-Type": "application/json",
 }
 SB_TIMEOUT = 8
-SB_PAGE_SIZE = 1000  # FIX: PostgREST's typical default row cap per request — used to paginate past it
+SB_PAGE_SIZE = 1000  # PostgREST's typical default row cap per request — used to paginate past it
 
 
-# FIX: local calendar-day boundary for /stats "today", instead of UTC midnight
-IST = timezone(timedelta(hours=5, minutes=30))
+IST = timezone(timedelta(hours=5, minutes=30))  # local calendar-day boundary for /stats "today"
 
 
 EXPENSE_CATEGORIES = [
@@ -94,16 +93,11 @@ app = Flask(__name__)
 
 
 def _to_decimal(value) -> Decimal:
-    """FIX: single funnel for turning any incoming amount (str/int/float/Decimal)
-    into a clean 2-decimal-place Decimal. Raises InvalidOperation/ValueError on
-    junk input — callers decide how to handle that."""
     d = Decimal(str(value))
     return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def _json_default(obj):
-    """FIX: Decimal isn't natively JSON-serializable — without this, /backup
-    and the daily cron backup would throw the moment amounts became Decimal."""
     if isinstance(obj, Decimal):
         return str(obj)
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
@@ -117,8 +111,6 @@ def _sb_url(path: str) -> str:
 
 
 def add_transaction(tx_type, amount, category, note, payment_method=None) -> int:
-    # FIX: amount sent as a string so Postgres's numeric column receives the
-    # exact decimal value — never round-tripped through a JSON float first.
     payload = {
         "type": tx_type,
         "amount": str(amount),
@@ -137,21 +129,13 @@ def add_transaction(tx_type, amount, category, note, payment_method=None) -> int
 
 
 def _all_transactions(order="id.desc", limit=None, since=None):
-    """FIX: When `limit` is given, behaves exactly as before — a single
-    bounded page (used by /history, /undo, etc). When `limit` is omitted,
-    this now transparently paginates through ALL matching rows instead of
-    trusting a single request to return everything. PostgREST caps a single
-    response at SB_PAGE_SIZE rows by default; a naive one-shot fetch silently
-    truncates once the table crosses that cap, which is exactly what was
-    happening to get_balances_by_method/get_stats/all_data_dump before this
-    fix. Loops until a short page proves there's nothing left."""
     if limit:
         params = {"select": "*", "order": order, "limit": limit}
         if since:
             params["created_at"] = f"gte.{since}"
         r = requests.get(_sb_url("transactions"), headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
         r.raise_for_status()
-        return r.json(parse_float=Decimal)  # FIX: parse amounts as Decimal, not float
+        return r.json(parse_float=Decimal)
 
     all_rows = []
     offset = 0
@@ -161,7 +145,7 @@ def _all_transactions(order="id.desc", limit=None, since=None):
             params["created_at"] = f"gte.{since}"
         r = requests.get(_sb_url("transactions"), headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
         r.raise_for_status()
-        page = r.json(parse_float=Decimal)  # FIX
+        page = r.json(parse_float=Decimal)
         all_rows.extend(page)
         if len(page) < SB_PAGE_SIZE:
             break
@@ -181,7 +165,7 @@ def get_transaction(tx_id):
         timeout=SB_TIMEOUT,
     )
     r.raise_for_status()
-    rows = r.json(parse_float=Decimal)  # FIX
+    rows = r.json(parse_float=Decimal)
     return rows[0] if rows else None
 
 
@@ -216,7 +200,7 @@ def delete_last_transaction():
     return rows[0]
 
 
-BALANCE_BUCKETS = PAYMENT_METHODS + ["unspecified"]  # cash, upi, card, netbanking, other, unspecified
+BALANCE_BUCKETS = PAYMENT_METHODS + ["unspecified"]
 
 
 def _settings_key(method: str) -> str:
@@ -231,7 +215,7 @@ def get_starting_balances() -> dict:
         timeout=SB_TIMEOUT,
     )
     r.raise_for_status()
-    result = {b: Decimal("0.00") for b in BALANCE_BUCKETS}  # FIX: Decimal, not float
+    result = {b: Decimal("0.00") for b in BALANCE_BUCKETS}
     for row in r.json():
         method = row["key"].split(":", 1)[1]
         if method in result:
@@ -271,12 +255,6 @@ def get_balance() -> Decimal:
 
 
 def _since(period):
-    """FIX: "today" now means local (IST) calendar day, not UTC. Anything
-    logged between midnight and 5:30am IST used to get counted as "yesterday"
-    in /stats today — this computes IST midnight, then converts back to UTC
-    for the query since created_at is stored in UTC. "week"/"month" stay as
-    rolling deltas — they don't depend on calendar-day boundaries so UTC vs
-    IST makes no difference there."""
     now_utc = datetime.now(timezone.utc)
     if period == "today":
         now_ist = now_utc.astimezone(IST)
@@ -302,12 +280,12 @@ def get_stats(period="month"):
     for r in rows:
         if r["type"] == "expense":
             c = r["category"]
-            by_cat.setdefault(c, {"total": Decimal("0.00"), "cnt": 0})  # FIX: Decimal
+            by_cat.setdefault(c, {"total": Decimal("0.00"), "cnt": 0})
             by_cat[c]["total"] += r["amount"]
             by_cat[c]["cnt"] += 1
 
             p = r.get("payment_method") or "unspecified"
-            by_pay.setdefault(p, {"total": Decimal("0.00"), "cnt": 0})  # FIX: Decimal
+            by_pay.setdefault(p, {"total": Decimal("0.00"), "cnt": 0})
             by_pay[p]["total"] += r["amount"]
             by_pay[p]["cnt"] += 1
 
@@ -326,8 +304,19 @@ def all_data_dump():
     return {"transactions": _all_transactions(order="id.asc"), "starting_balances": get_starting_balances()}
 
 
+# --------------------------------------------------------- aliases (confidence-tracked)
+
+
 def get_all_aliases() -> dict:
-    r = requests.get(_sb_url("aliases"), headers=SB_HEADERS, params={"select": "*"}, timeout=SB_TIMEOUT)
+    """Only returns CONFIRMED aliases — the ones trusted enough to let
+    quick_parse_single skip Groq entirely. Candidates-in-progress are
+    invisible to the fast path until they've earned it."""
+    r = requests.get(
+        _sb_url("aliases"),
+        headers=SB_HEADERS,
+        params={"select": "*", "confirmed": "eq.true"},
+        timeout=SB_TIMEOUT,
+    )
     r.raise_for_status()
     return {
         row["note_key"]: {
@@ -337,14 +326,60 @@ def get_all_aliases() -> dict:
     }
 
 
-def set_alias(note_key, tx_type, category, payment_method=None):
-    r = requests.post(
+def get_alias_raw(note_key):
+    r = requests.get(
         _sb_url("aliases"),
-        headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
-        json={"note_key": note_key, "type": tx_type, "category": category, "payment_method": payment_method},
+        headers=SB_HEADERS,
+        params={"select": "*", "note_key": f"eq.{note_key}"},
         timeout=SB_TIMEOUT,
     )
     r.raise_for_status()
+    rows = r.json()
+    return rows[0] if rows else None
+
+
+def _upsert_alias_row(note_key, tx_type, category, payment_method, confirmed, candidate_count):
+    r = requests.post(
+        _sb_url("aliases"),
+        headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
+        json={
+            "note_key": note_key, "type": tx_type, "category": category,
+            "payment_method": payment_method, "confirmed": confirmed, "candidate_count": candidate_count,
+        },
+        timeout=SB_TIMEOUT,
+    )
+    r.raise_for_status()
+
+
+def learn_alias_manual(note_key, tx_type, category, payment_method=None):
+    """Explicit human input — the /alias command, or tapping a correction
+    button — is trusted immediately. No streak needed; you said it, not Groq."""
+    _upsert_alias_row(note_key, tx_type, category, payment_method, confirmed=True, candidate_count=2)
+
+
+def learn_alias_auto(note_key, tx_type, category, payment_method=None):
+    """A single Groq guess used to become a permanent silent default on the
+    very first occurrence. Now it takes two independent parses that AGREE on
+    the same category before the alias is trusted enough to skip Groq.
+    A single occurrence is remembered as a candidate only — it does not yet
+    affect parsing. Disagreement resets the streak rather than overwriting
+    silently."""
+    if not note_key:
+        return
+    existing = get_alias_raw(note_key)
+    if existing is None:
+        _upsert_alias_row(note_key, tx_type, category, payment_method, confirmed=False, candidate_count=1)
+        return
+    if existing.get("confirmed"):
+        return  # already trusted; only a manual correction should change it now
+    if existing.get("category") == category and existing.get("type") == tx_type:
+        new_count = int(existing.get("candidate_count") or 1) + 1
+        _upsert_alias_row(note_key, tx_type, category, payment_method, confirmed=new_count >= 2, candidate_count=new_count)
+    else:
+        _upsert_alias_row(note_key, tx_type, category, payment_method, confirmed=False, candidate_count=1)
+
+
+# ------------------------------------------------------- idempotency + edit tracking
 
 
 def mark_update_processed(update_id) -> bool:
@@ -363,6 +398,33 @@ def cleanup_old_updates(days=7):
     requests.delete(_sb_url(f"processed_updates?created_at=lt.{cutoff}"), headers=SB_HEADERS, timeout=SB_TIMEOUT)
 
 
+def get_message_log(chat_id, message_id):
+    """Returns the list of transaction IDs a given Telegram message produced,
+    or None if this message never logged anything (or we've never seen it)."""
+    r = requests.get(
+        _sb_url("message_log"),
+        headers=SB_HEADERS,
+        params={"select": "tx_ids", "chat_id": f"eq.{chat_id}", "message_id": f"eq.{message_id}"},
+        timeout=SB_TIMEOUT,
+    )
+    r.raise_for_status()
+    rows = r.json()
+    return rows[0]["tx_ids"] if rows else None
+
+
+def set_message_log(chat_id, message_id, tx_ids):
+    r = requests.post(
+        _sb_url("message_log"),
+        headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
+        json={
+            "chat_id": chat_id, "message_id": message_id, "tx_ids": tx_ids,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        timeout=SB_TIMEOUT,
+    )
+    r.raise_for_status()
+
+
 # ------------------------------------------------------------------ nlp layer
 
 
@@ -370,7 +432,7 @@ def _validate_item(data):
     if not data or data.get("type") not in ("expense", "income"):
         return None
     try:
-        amount = _to_decimal(data["amount"])  # FIX: Decimal, not float
+        amount = _to_decimal(data["amount"])
     except (TypeError, ValueError, KeyError, InvalidOperation):
         return None
     if amount <= 0:
@@ -400,7 +462,7 @@ def _call_groq_chat(text):
         )
         r.raise_for_status()
         content = r.json()["choices"][0]["message"]["content"]
-        data = json.loads(content, parse_float=Decimal)  # FIX: Decimal, not float
+        data = json.loads(content, parse_float=Decimal)
     except Exception:
         return None
 
@@ -425,14 +487,14 @@ def quick_parse_single(text, aliases):
         if amount is None:
             m = re.match(r"^(\d+(?:\.\d+)?)(k)?$", clean)
             if m:
-                val = Decimal(m.group(1))  # FIX: Decimal, not float
+                val = Decimal(m.group(1))
                 if m.group(2) == "k":
                     val *= Decimal("1000")
                 amount = val
                 continue
             m2 = re.match(r"^(\d+(?:\.\d+)?)rs$", clean)
             if m2:
-                amount = Decimal(m2.group(1))  # FIX: Decimal, not float
+                amount = Decimal(m2.group(1))
                 continue
         if clean in _CURRENCY_WORDS:
             continue
@@ -444,7 +506,7 @@ def quick_parse_single(text, aliases):
     if amount is None or amount <= 0 or not note_tokens:
         return None
 
-    amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)  # FIX
+    amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     note_key = " ".join(note_tokens).strip()
     alias = aliases.get(note_key)
     if not alias:
@@ -488,8 +550,6 @@ def fmt(amount) -> str:
 
 
 def _fmt_ts(iso_str: str) -> str:
-    """FIX: render timestamps in IST instead of raw UTC — same underlying
-    bug as _since(), just showing up in /history instead of /stats."""
     try:
         dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
         if dt.tzinfo is None:
@@ -566,17 +626,19 @@ def download_telegram_file(file_id):
 
 
 HELP_TEXT = (
-    "Just type it — no command needed:\n"
+    "Just type it -- no command needed:\n"
     "  400rs creatine cash\n"
     "  60 milk upi\n"
     "  400 creatine cash, 60 milk upi, 1200 rent upi\n"
     "  got 5000 freelance payment\n"
-    "Or send a voice note — same thing, just spoken.\n"
-    "After it logs, tap the buttons to fix category/payment or undo.\n\n"
+    "Or send a voice note -- same thing, just spoken.\n"
+    "After it logs, tap the buttons to fix category/payment or undo.\n"
+    "Editing a message you sent replaces what it logged, instead of duplicating it.\n\n"
     "Commands (exact, always available):\n"
     "/add <amount> <category> [note] [cash|upi|card|netbanking] - log an expense\n"
     "/income <amount> <source> [note] [cash|upi|card|netbanking] - log income\n"
     "/alias <note words> <category> [cash|upi|card|netbanking] - teach a shortcut\n"
+    "/aliases - see what's been learned, confirmed vs still-learning\n"
     "/balance [cash|upi|card|netbanking|other] - balance breakdown, or one method\n"
     "/stats [today|week|month|all] - totals + category + payment breakdown\n"
     "/history [n] - last n transactions\n"
@@ -660,7 +722,7 @@ def handle_command(chat_id, text):
         if len(args) < 2:
             return send_message(chat_id, "Usage: /add <amount> <category> [note] [cash|upi|card]")
         try:
-            amount = _to_decimal(args[0])  # FIX: Decimal, not float
+            amount = _to_decimal(args[0])
         except (InvalidOperation, ValueError):
             return send_message(chat_id, "Amount has to be a number.")
         rest, payment_method = _split_trailing_payment_method(args[1:])
@@ -680,7 +742,7 @@ def handle_command(chat_id, text):
         if len(args) < 2:
             return send_message(chat_id, "Usage: /income <amount> <source> [note] [cash|upi|card]")
         try:
-            amount = _to_decimal(args[0])  # FIX: Decimal, not float
+            amount = _to_decimal(args[0])
         except (InvalidOperation, ValueError):
             return send_message(chat_id, "Amount has to be a number.")
         rest, payment_method = _split_trailing_payment_method(args[1:])
@@ -707,9 +769,29 @@ def handle_command(chat_id, text):
         if category not in EXPENSE_CATEGORIES and category not in INCOME_CATEGORIES:
             return send_message(chat_id, f"Unknown category '{category}'. Valid: {', '.join(EXPENSE_CATEGORIES)}")
         tx_type = "income" if category in INCOME_CATEGORIES else "expense"
-        set_alias(note_key, tx_type, category, payment_method)
+        learn_alias_manual(note_key, tx_type, category, payment_method)
         tag = f" ({payment_method})" if payment_method else ""
         send_message(chat_id, f"Learned: '{note_key}' → {category}{tag}")
+
+    elif cmd == "/aliases":
+        r = requests.get(_sb_url("aliases"), headers=SB_HEADERS, params={"select": "*", "order": "note_key.asc"}, timeout=SB_TIMEOUT)
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            return send_message(chat_id, "No aliases learned yet.")
+        confirmed = [row for row in rows if row.get("confirmed")]
+        pending = [row for row in rows if not row.get("confirmed")]
+        lines = []
+        if confirmed:
+            lines.append("Confirmed (skips Groq):")
+            for row in confirmed:
+                tag = f" · {row['payment_method']}" if row.get("payment_method") else ""
+                lines.append(f"  '{row['note_key']}' → {row['category']}{tag}")
+        if pending:
+            lines.append("\nStill learning (needs one more matching use, or a tap-to-correct):")
+            for row in pending:
+                lines.append(f"  '{row['note_key']}' → {row['category']} ({row.get('candidate_count', 1)}/2)")
+        send_message(chat_id, "\n".join(lines))
 
     elif cmd == "/balance":
         if args:
@@ -755,7 +837,7 @@ def handle_command(chat_id, text):
         lines = []
         for r in rows:
             sign = "+" if r["type"] == "income" else "-"
-            ts = _fmt_ts(r["created_at"])  # FIX: IST, not raw UTC
+            ts = _fmt_ts(r["created_at"])
             note = f" ({r['note']})" if r.get("note") else ""
             pay = f" [{r['payment_method']}]" if r.get("payment_method") else ""
             lines.append(f"#{r['id']} {ts} {sign}{fmt(r['amount'])} {r['category']}{note}{pay}")
@@ -784,7 +866,7 @@ def handle_command(chat_id, text):
         if method not in PAYMENT_METHODS:
             return send_message(chat_id, f"Unknown payment method '{method}'. Valid: {', '.join(PAYMENT_METHODS)}")
         try:
-            amount = _to_decimal(args[1])  # FIX: Decimal, not float
+            amount = _to_decimal(args[1])
         except (InvalidOperation, ValueError):
             return send_message(chat_id, "Amount has to be a number.")
         set_starting_balance(method, amount)
@@ -801,12 +883,12 @@ def handle_command(chat_id, text):
 
     elif cmd == "/backup":
         dump = all_data_dump()
-        send_document(chat_id, "expenses_backup.json", json.dumps(dump, indent=2, default=_json_default).encode(), "Full backup")  # FIX
+        send_document(chat_id, "expenses_backup.json", json.dumps(dump, indent=2, default=_json_default).encode(), "Full backup")
 
     elif cmd == "/reset":
         if not args or args[0] != "confirm":
             return send_message(chat_id, "This wipes ALL data. To confirm, send: /reset confirm")
-        for row in _all_transactions():  # now correctly paginated — no leftover rows past the old cap
+        for row in _all_transactions():
             delete_transaction(row["id"])
         for method in PAYMENT_METHODS:
             set_starting_balance(method, Decimal("0.00"))
@@ -819,7 +901,7 @@ def handle_command(chat_id, text):
 # --------------------------------------------------------------------- freeform
 
 
-def handle_freeform(chat_id, text):
+def handle_freeform(chat_id, text, message_id=None):
     aliases = get_all_aliases()
     transactions = parse_multi(text, aliases)
     if not transactions:
@@ -833,10 +915,15 @@ def handle_freeform(chat_id, text):
     for parsed in transactions:
         tx_id = add_transaction(parsed["type"], parsed["amount"], parsed["category"], parsed["note"], parsed["payment_method"])
         note_key = (parsed.get("note") or "").lower().strip()
-        if note_key and note_key not in aliases:
-            set_alias(note_key, parsed["type"], parsed["category"], parsed["payment_method"])
-            aliases[note_key] = {"type": parsed["type"], "category": parsed["category"], "payment_method": parsed["payment_method"]}
+        learn_alias_auto(note_key, parsed["type"], parsed["category"], parsed["payment_method"])
         logged.append({**parsed, "id": tx_id})
+
+    if message_id is not None:
+        try:
+            set_message_log(chat_id, message_id, [tx["id"] for tx in logged])
+        except Exception:
+            pass  # best-effort: losing this mapping only means a future edit
+                  # to this message won't be reconciled, not that logging failed
 
     if len(logged) == 1:
         tx = logged[0]
@@ -855,6 +942,68 @@ def handle_freeform(chat_id, text):
         send_message(chat_id, "\n".join(lines))
 
 
+def handle_edited_message(chat_id, message):
+    """FIX: edited text messages used to just re-run through handle_freeform,
+    creating a brand-new transaction alongside whatever the original message
+    already logged — the idempotency guard (keyed on update_id) never caught
+    this, because Telegram issues a NEW update_id for edited_message events.
+    This looks up what the original message logged (via message_log, keyed on
+    the stable chat_id + message_id pair) and replaces it instead of adding
+    to it. Edits to /commands are ignored outright."""
+    message_id = message.get("message_id")
+    text = message.get("text", "")
+    if not text or text.startswith("/") or message_id is None:
+        return
+
+    existing_tx_ids = None
+    try:
+        existing_tx_ids = get_message_log(chat_id, message_id)
+    except Exception:
+        pass  # if the lookup fails, fall through and treat this as a fresh log
+
+    if existing_tx_ids:
+        for tx_id in existing_tx_ids:
+            try:
+                delete_transaction(tx_id)
+            except Exception:
+                pass  # already gone (e.g. undone earlier) — nothing to clean up
+        prefix = "✏️ Edited — replaced the previous log:"
+    else:
+        prefix = "✏️ Edited message parsed as a new log:"
+
+    aliases = get_all_aliases()
+    transactions = parse_multi(text, aliases)
+    if not transactions:
+        try:
+            set_message_log(chat_id, message_id, [])
+        except Exception:
+            pass
+        return send_message(chat_id, f"{prefix}\nCouldn't tell what the edited text was — nothing logged.")
+
+    logged_ids = []
+    lines = [prefix]
+    for parsed in transactions:
+        tx_id = add_transaction(parsed["type"], parsed["amount"], parsed["category"], parsed["note"], parsed["payment_method"])
+        logged_ids.append(tx_id)
+        note_key = (parsed.get("note") or "").lower().strip()
+        learn_alias_auto(note_key, parsed["type"], parsed["category"], parsed["payment_method"])
+        sign = "+" if parsed["type"] == "income" else "-"
+        bits = [parsed["category"]]
+        if parsed["note"]:
+            bits.append(f"({parsed['note']})")
+        if parsed["payment_method"]:
+            bits.append(f"· {parsed['payment_method']}")
+        lines.append(f"#{tx_id} {sign}{fmt(parsed['amount'])} {' '.join(bits)}")
+
+    try:
+        set_message_log(chat_id, message_id, logged_ids)
+    except Exception:
+        pass
+
+    lines.append(f"\nBalance: {fmt(get_balance())}")
+    send_message(chat_id, "\n".join(lines))
+
+
 def handle_voice(chat_id, message):
     voice = message.get("voice") or {}
     file_id = voice.get("file_id")
@@ -866,7 +1015,7 @@ def handle_voice(chat_id, message):
     text = transcribe_voice(audio_bytes)
     if not text:
         return send_message(chat_id, "Couldn't transcribe that voice note. Try typing it instead.")
-    handle_freeform(chat_id, text)
+    handle_freeform(chat_id, text, message.get("message_id"))
 
 
 # ------------------------------------------------------------------- callbacks
@@ -915,7 +1064,7 @@ def handle_callback_query(cq):
         update_transaction(tx_id, category=category)
         tx = get_transaction(tx_id)
         if tx and tx.get("note"):
-            set_alias(tx["note"].lower().strip(), tx["type"], category, tx.get("payment_method"))
+            learn_alias_manual(tx["note"].lower().strip(), tx["type"], category, tx.get("payment_method"))
         text = _confirmation_text(tx) if tx else f"#{tx_id} updated"
         edit_message_text(chat_id, message_id, text, reply_markup=_main_keyboard(tx_id))
         return answer_callback_query(cq["id"], f"Category → {category}")
@@ -925,7 +1074,7 @@ def handle_callback_query(cq):
         update_transaction(tx_id, payment_method=method)
         tx = get_transaction(tx_id)
         if tx and tx.get("note"):
-            set_alias(tx["note"].lower().strip(), tx["type"], tx["category"], method)
+            learn_alias_manual(tx["note"].lower().strip(), tx["type"], tx["category"], method)
         text = _confirmation_text(tx) if tx else f"#{tx_id} updated"
         edit_message_text(chat_id, message_id, text, reply_markup=_main_keyboard(tx_id))
         return answer_callback_query(cq["id"], f"Payment → {method}")
@@ -959,7 +1108,20 @@ def webhook():
             answer_callback_query(cq.get("id", ""), "Something went wrong — try again.")
         return jsonify({"ok": True})
 
-    message = update.get("message") or update.get("edited_message")
+    message = update.get("message")
+    edited_message = update.get("edited_message")
+
+    if edited_message:
+        chat_id = edited_message["chat"]["id"]
+        user_id = edited_message.get("from", {}).get("id")
+        if user_id != OWNER_ID:
+            return jsonify({"ok": True})
+        try:
+            handle_edited_message(chat_id, edited_message)
+        except Exception as e:
+            send_message(chat_id, f"Something went wrong on that edit: {e}")
+        return jsonify({"ok": True})
+
     if not message:
         return jsonify({"ok": True})
 
@@ -979,7 +1141,7 @@ def webhook():
             if text.startswith("/"):
                 handle_command(chat_id, text)
             else:
-                handle_freeform(chat_id, text)
+                handle_freeform(chat_id, text, message.get("message_id"))
     except Exception as e:
         send_message(chat_id, f"Something went wrong on that one: {e}")
 
@@ -991,7 +1153,7 @@ def cron_backup():
     if request.args.get("token") != CRON_SECRET:
         return jsonify({"ok": False}), 401
     dump = all_data_dump()
-    send_document(OWNER_ID, "daily_backup.json", json.dumps(dump, indent=2, default=_json_default).encode(), "Daily auto-backup")  # FIX
+    send_document(OWNER_ID, "daily_backup.json", json.dumps(dump, indent=2, default=_json_default).encode(), "Daily auto-backup")
     cleanup_old_updates()
     return jsonify({"ok": True, "transactions": len(dump["transactions"])})
 
