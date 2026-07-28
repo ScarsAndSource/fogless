@@ -70,6 +70,7 @@ Fogless has no server that needs to be kept alive. Every message from Telegram a
 | Speech-to-text | Groq Whisper (`whisper-large-v3-turbo`) for voice notes |
 | Database | Supabase (Postgres, accessed via its REST API) |
 | Scheduling | GitHub Actions, once daily |
+| Structure | Single-file deployment (no module bundling issues) |
 
 **How a message becomes a transaction**
 
@@ -78,12 +79,13 @@ Fogless has no server that needs to be kept alive. Every message from Telegram a
 3. If the message is text, it is checked against a locally stored table of learned aliases first. A known item is logged instantly with no external call at all.
 4. If the message is new, unclear, or contains several transactions at once, it is sent to Groq, which returns structured data: type, amount, category, payment method, and note, for every transaction found.
 5. If the message is a voice note, it is transcribed by Groq's Whisper model first, then handled exactly as text from that point on.
-6. Each transaction is written to Supabase, the running balance is recalculated from the full transaction history plus a stored starting balance, and a confirmation is sent back with inline buttons for corrections.
+6. Each transaction is written to Supabase and a confirmation is sent back with inline buttons to fix the category, change the payment method, or undo the entry.
+7. The running balance is recalculated per payment method from the full transaction history plus that method's stored starting balance.
 
 **Data model**
 
 - `transactions`: every expense and income entry, with type, amount, category, payment method, note, and timestamp.
-- `settings`: a single stored starting balance used as the baseline for all balance calculations.
+- `settings`: stored starting balances per payment method (e.g. `starting_balance:cash`, `starting_balance:upi`), used as the baseline for per-method balance calculations.
 - `aliases`: learned mappings from a note (like "creatine") to its category and payment method, built automatically from usage and corrections.
 - `processed_updates`: a short-lived log of Telegram update IDs, used only to guarantee no message is ever logged twice.
 
