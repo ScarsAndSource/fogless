@@ -1,107 +1,104 @@
 # Fogless
 
-**The expense tracker that gets out of your way.**
+**Shared accountability for people who live together.**
 
-Fogless is not an app you open, navigate, and fill out. It is a chat you already have open, and a bot that understands what you mean the first time you say it. You type what happened, in your own words, and the ledger takes care of itself.
+Fogless started as a way to log your own expenses without ever opening an app. This is what it becomes when "who owes what" stops being a one-person question. It keeps the thing that already worked, you say what happened, in your own words, and it gets logged correctly, and extends it to a group: shared expenses that settle themselves, and commitments that don't get quietly forgotten.
 
-No forms. No dropdowns. No onboarding screens. Just clarity, instantly.
+No forms to fill, no spreadsheet to maintain, no one person stuck being "the guy who tracks the rent." You say what happened. The ledger and the reminders take care of themselves.
 
 ---
 
-## Why "Fogless"
+## Why this exists
 
-Every expense tracker on the market asks you to translate your life into their structure: pick a category, select a date, choose a currency, confirm the entry. That translation step is the fog. It is the small, constant tax between something happening and it being recorded.
+Every hostel room, flat share, or trip group ends up with the same two failure modes.
 
-Fogless removes the translation step entirely. You say what happened, exactly as you'd say it to a friend, and it is already logged, categorized, and filed. Nothing stands between the moment and the record of it.
+1. **Money.** Someone fronts the rent, someone else buys groceries, a third person covers the cab, and within two weeks nobody actually knows who owes whom. The usual fix (a shared spreadsheet, or an app like Splitwise) still asks you to stop and enter the transaction: pick a category, pick who's involved, hit save. That translation step is friction, and friction is why the spreadsheet dies in a week.
+2. **Commitments.** "I'll clean the kitchen by Friday." "I'll pay you back by the 1st." No app enforces this. It's either awkward group chat nagging or it just doesn't happen.
+
+Fogless treats both as the same underlying problem: an obligation, with a deadline, that either gets honored or gets escalated. Money and tasks are two flavors of the same thing under the hood.
 
 ---
 
 ## How it feels to use
 
-You are standing in line, and you just paid for milk on UPI. You do not open an app. You type:
+You pay the electricity bill for the flat. You don't open an app and navigate to "Add Expense." You type, in the webapp's single input box, exactly like you'd say it out loud:
 
-> `60 milk upi`
+> `1200 electricity bill upi, split with rohan and aman`
 
-It is done. Categorized, tagged with the payment method, that method's balance recalculated alongside the total, before your thumb even leaves the screen. A row of buttons appears under the confirmation so you can adjust the category, switch the payment method, or undo it in one tap.
+It's parsed, logged, and split three ways before you've closed the tab. No dropdowns, no "select participants" screen.
 
-You are rushing, three purchases deep before you remember to log the first one. You do not log them one at a time. You say all of it at once, exactly as it happened:
+A week later, the settlement view doesn't show you a tangle of five separate IOUs. It shows you the minimum number of payments needed to make everyone even. Sometimes that's one transfer instead of four.
 
-> `400 creatine cash, 60 milk upi, 1200 rent upi`
+Someone commits to a task with a deadline. If it's missed, they get a quiet nudge first. If it's still missed, it becomes visible to the group. If it's still missed after that, it goes straight to whoever's named as the accountability partner for that task, delivered as a direct Telegram message, because that's the one channel that reaches someone without requiring them to open anything.
 
-All three are sorted, filed with their respective payment methods, and confirmed with per-method and total balances in the time it takes to read the sentence back.
-
-Your hands are full, and typing is not an option. You send a voice note instead, the same way you'd leave one for a friend. Fogless listens, transcribes, understands, and logs it, exactly as if you had typed it yourself.
+Every entry, money or task, is written once and never silently edited. If a balance looks wrong, you can trace exactly how it got there.
 
 ---
 
 ## What makes it different
 
-1. **It speaks your language, not the other way around.**
-   No categories to memorize, no syntax to learn. You describe the transaction the way you naturally would, and Fogless does the parsing.
-
-2. **It learns you.**
-   Mention "creatine" once, and it never asks about "creatine" again. Categorization is remembered, not re-guessed, so every repeat entry is instant, free, and perfectly consistent.
-
-3. **It corrects itself without breaking your flow.**
-   Got something wrong? Fix it with a single tap on the confirmation message itself. No retyping, no separate undo command to remember.
-
-4. **It never repeats itself by accident.**
-   Every message is checked the instant it arrives. If the network stutters and the same message is delivered twice, only one of them ever becomes a transaction.
-
-5. **It handles more than one thing at once.**
-   Multiple purchases, one message. Fogless splits, categorizes, and logs each one individually.
-
-6. **It answers to exactly one person.**
-   Fogless is built for a single thread of thought. Every other sender is treated as if their message never arrived at all.
+- **The input never got more complicated.** Adding a group didn't mean adding forms. You still just describe what happened.
+- **It learns you, not just the group.** Categorization is remembered per person, so your shorthand doesn't clutter someone else's suggestions. Shared items like rent or wifi are recognized at the group level.
+- **Debts don't pile up as noise.** The system doesn't show you every individual IOU. It computes the smallest set of payments that clears the group's balance sheet.
+- **Nobody can quietly rewrite the ledger.** Every transaction is chained to the one before it. An edited amount after the fact breaks the chain and is detectable.
+- **Flaking has consequences that scale.** Escalation isn't a single reminder, it's a graduated sequence, and it applies identically whether the broken commitment was a chore or a payment.
+- **Telegram is a notification channel, not a data entry form.** It reaches you the same way a friend's text would, without asking you to open an app you'll eventually stop opening.
 
 ---
 
 ## Under the hood
 
-Fogless has no server that needs to be kept alive. Every message from Telegram arrives as a webhook call to a serverless function, which wakes up, does its work, replies, and shuts back down. There is nothing idling and nothing that needs monitoring.
+Fogless separates how things get in from how things get delivered, which is the core architectural change from the original version. The original used Telegram for both. Now the webapp handles input, and Telegram is used exclusively for escalation delivery.
 
-**Stack**
+### Stack
 
 | Layer | Technology |
 |---|---|
-| Runtime | Vercel serverless functions (Python, Flask) |
-| Messaging | Telegram Bot API (webhook, not polling) |
-| Language understanding | Groq (`llama-3.3-70b-versatile`) for text parsing |
-| Speech-to-text | Groq Whisper (`whisper-large-v3-turbo`) for voice notes |
-| Database | Supabase (Postgres, accessed via its REST API) |
-| Scheduling | GitHub Actions, once daily |
-| Structure | Single-file deployment (no module bundling issues) |
+| Frontend | React + TypeScript (group dashboard, settlement view, task timeline) |
+| Backend | FastAPI |
+| Language understanding | Groq (`llama-3.3-70b-versatile`) for parsing free text entries |
+| Speech to text | Groq Whisper (`whisper-large-v3-turbo`) for voice input |
+| Database | Supabase (Postgres) |
+| Escalation delivery | Telegram Bot API (webhook, delivery only, not ingestion) |
+| Scheduling | Scheduled job (Cloud Run / GitHub Actions) driving the escalation engine |
+| Deploy | Cloud Run |
 
-**How a message becomes a transaction**
+### How an entry becomes a ledger record
 
-1. Telegram delivers the message to a `/webhook` endpoint over HTTPS, signed with a secret token so only genuine Telegram traffic is accepted.
-2. The update is checked against a table of already-processed update IDs, so a retried delivery never creates a duplicate entry.
-3. If the message is text, it is checked against a locally stored table of learned aliases first. A known item is logged instantly with no external call at all.
-4. If the message is new, unclear, or contains several transactions at once, it is sent to Groq, which returns structured data: type, amount, category, payment method, and note, for every transaction found.
-5. If the message is a voice note, it is transcribed by Groq's Whisper model first, then handled exactly as text from that point on.
-6. Each transaction is written to Supabase and a confirmation is sent back with inline buttons to fix the category, change the payment method, or undo the entry.
-7. The running balance is recalculated per payment method from the full transaction history plus that method's stored starting balance.
+1. Text (typed or transcribed from voice) is sent to the parser.
+2. Known items are matched against a table of learned aliases, scoped first to the individual, then to the group, before falling back to a full parse.
+3. Unmatched or multi part entries are sent to Groq, which returns structured data for every transaction found in the message: amount, category, payment method, payer, and split.
+4. Each transaction is written to the ledger with a hash linking it to the previous entry, so the sequence is tamper evident.
+5. Per person and per group balances are recalculated from the full transaction history.
 
-**Data model**
+### The algorithmic core
 
-- `transactions`: every expense and income entry, with type, amount, category, payment method, note, and timestamp.
-- `settings`: stored starting balances per payment method (e.g. `starting_balance:cash`, `starting_balance:upi`), used as the baseline for per-method balance calculations.
-- `aliases`: learned mappings from a note (like "creatine") to its category and payment method, built automatically from usage and corrections.
-- `processed_updates`: a short-lived log of Telegram update IDs, used only to guarantee no message is ever logged twice.
+This is deliberately the opposite of an LLM wrapper. Groq only ever touches the parsing step, it never decides who owes whom or when to escalate. Two components own that:
 
-**Access control**
+- **Settlement engine.** A greedy min cash flow algorithm over a directed, weighted graph of debts, run on demand as a read only view. It never writes to the ledger, it only proposes. Actual repayment is logged as its own transaction, through the same parser, so the ledger stays append only and auditable.
+- **Escalation engine.** A finite state machine (`pending to nudged to escalated to resolved`) with configurable per tier delay and target. A missed task and an unpaid debt past threshold are both just "obligation" objects that plug into this one state machine, one reusable component, two features.
 
-- Every incoming message is checked against a single, fixed Telegram user ID before anything runs. Any other sender is silently ignored.
-- The webhook itself only accepts requests carrying the correct secret token, so the endpoint cannot be triggered by a guessed URL.
-- The database has row-level security enabled with no public policies, so only the server's own service key, never exposed in code, can read or write data.
-- A separate daily job keeps the database active and sends a full backup, so nothing is ever lost even during long stretches of inactivity.
+### Data model
+
+- `users`: identity, linked Telegram chat ID for escalation delivery.
+- `groups` / `group_members`: group membership.
+- `transactions`: every expense and income entry, amount, category, payment method, payer, split, settlement status, and hash chain fields (`prev_hash`, `hash`).
+- `aliases`: learned mappings from a note to its category and payment method, scoped per user with group level fallback.
+- `obligations`: unified record for tasks and outstanding debts, type, deadline, current escalation tier, linked entity.
+- `settings`: starting balances per user, per payment method.
+
+### Access control
+
+- Group membership is enforced with row level security. Only members of a group can read or write that group's data.
+- The Telegram webhook accepts escalation callbacks only (fixing a category, confirming a payment) and validates a secret token on every request.
+- Service credentials are never exposed client side. All writes go through the backend.
 
 ---
 
 ## The idea behind it
 
-Expense tracking has always carried a quiet cost: the more structure an app demands, the less honestly people actually use it. Every attempt to fix that has added more categories, more automation, more dashboards that get opened once and never used again.
+Shared living always carries the same quiet tax: someone has to be the tracker, the nagger, the one doing mental math about who paid for what three weeks ago. Every attempt to fix that adds more structure, more categories, more manual splitting screens, more spreadsheets nobody updates past week two.
 
-Fogless takes the opposite approach: less structure, not more. The words you'd already say out loud become the entire input, and everything downstream of that happens without you ever noticing the machinery turning.
+Fogless keeps the input as close to zero as it always was, and moves all the structure to where it belongs: underneath, in an algorithm that settles debts on its own and a state machine that doesn't forget a deadline.
 
-You do not log expenses anymore. You talk about your day, and the numbers take care of themselves.
+You don't manage the ledger. You just say what happened, and the group stays even.
