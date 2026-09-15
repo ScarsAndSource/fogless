@@ -691,7 +691,7 @@ def format_stats_html(period="month") -> str:
         <div>
           <div class="flex justify-between text-[12px] mb-1 font-bold">
             <span class="text-[#059669]">{c_name} ({pct}%)</span>
-            <span class="font-numeral text-[10px] text-[#064E3B]">${fmt(c_tot)}</span>
+            <span class="font-numeral text-[10px] text-[#064E3B]">₹{fmt(c_tot)}</span>
           </div>
           <div class="pixel-hp-bar">
             {cells_html}
@@ -705,13 +705,13 @@ def format_stats_html(period="month") -> str:
     <div class="space-y-2">
       <div class="flex justify-between items-center border-b border-[#A6DCB1] pb-1">
         <span class="font-bold text-[14px] text-[#142B1A]">{period.capitalize()} Spend Breakdown</span>
-        <span class="font-numeral text-[10px] bg-[#142B1A] text-[#FDE047] px-1.5 py-0.5">${fmt(s['total_expense'])} TOTAL</span>
+        <span class="font-numeral text-[10px] bg-[#142B1A] text-[#FDE047] px-1.5 py-0.5">₹{fmt(s['total_expense'])} TOTAL</span>
       </div>
       <div class="pixel-window-jrpg p-2 space-y-2.5">
         {rows_html}
       </div>
       <div class="flex items-center justify-between text-[11px] text-[#2D5A35]">
-        <span>⚔ Net Pouch: <strong>${fmt(s['net'])}</strong></span>
+        <span>⚔ Net Pouch: <strong>₹{fmt(s['net'])}</strong></span>
         <span class="font-bold underline cursor-pointer">Stats Complete ➔</span>
       </div>
     </div>
@@ -728,7 +728,7 @@ def format_balance_html() -> str:
         rows_html += f"""
         <div class="flex justify-between py-0.5 border-b border-[#E5DFC9]">
           <span>{method.capitalize()} Pouch</span>
-          <span class="font-numeral text-[10px] font-bold text-[#142B1A]">${fmt(amt)}</span>
+          <span class="font-numeral text-[10px] font-bold text-[#142B1A]">₹{fmt(amt)}</span>
         </div>
         """
 
@@ -736,7 +736,7 @@ def format_balance_html() -> str:
     <div class="space-y-1.5">
       <div class="font-bold text-[13px] text-[#142B1A] flex justify-between">
         <span>Treasury Balances</span>
-        <span class="font-numeral text-[9px] text-[#065F46]">${fmt(total_bal)}</span>
+        <span class="font-numeral text-[9px] text-[#065F46]">₹{fmt(total_bal)}</span>
       </div>
       <div class="pixel-window-jrpg p-2 text-[12px] space-y-1">
         {rows_html}
@@ -756,7 +756,7 @@ def format_history_html(limit=5) -> str:
         color = "text-[#059669]" if r["type"] == "income" else "text-[#E15554]"
         note = f" ({r['note']})" if r.get("note") else ""
         pay = f" [{r['payment_method']}]" if r.get("payment_method") else ""
-        lines.append(f"<div class='py-0.5 border-b border-[#E5DFC9] flex justify-between'><span>#{r['id']} {r['category']}{note}{pay}</span><span class='font-numeral font-bold {color}'>{sign}${fmt(r['amount'])}</span></div>")
+        lines.append(f"<div class='py-0.5 border-b border-[#E5DFC9] flex justify-between'><span>#{r['id']} {r['category']}{note}{pay}</span><span class='font-numeral font-bold {color}'>{sign}₹{fmt(r['amount'])}</span></div>")
 
     return f"""
     <div class="space-y-1">
@@ -854,12 +854,12 @@ def api_message():
                 reply_text = "Nothing to undo."
                 log_chat_message("assistant", reply_text)
                 return jsonify({"ok": True, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
-            reply_text = f"Reverted #{row['id']}: {row['type']} ${fmt(row['amount'])} ({row['category']})."
+            reply_text = f"Reverted #{row['id']}: {row['type']} ₹{fmt(row['amount'])} ({row['category']})."
             log_chat_message("assistant", reply_text)
             return jsonify({
                 "ok": True,
-                "text": f"SPELL: REVERT EXECUTED. Removed #{row['id']}: {row['type']} ${fmt(row['amount'])} ({row['category']}).",
-                "html": f"<p>Reverted <strong>#{row['id']}</strong> (${fmt(row['amount'])}) back to the treasury purse.</p>",
+                "text": f"SPELL: REVERT EXECUTED. Removed #{row['id']}: {row['type']} ₹{fmt(row['amount'])} ({row['category']}).",
+                "html": f"<p>Reverted <strong>#{row['id']}</strong> (₹{fmt(row['amount'])}) back to the treasury purse.</p>",
                 "balance": float(get_balance()),
                 "today_spent": float(get_today_expense()),
             })
@@ -1044,8 +1044,8 @@ def api_voice():
     return jsonify({
         "ok": True,
         "transcribed": transcribed,
-        "text": f"Logged voice note: ${fmt(last_tx['amount'])} on {last_tx['category']}",
-        "message_html": f"<p>Deciphered voice memo: <em>\"{transcribed}\"</em>! Logged <strong>${fmt(last_tx['amount'])}</strong> under <strong>{last_tx['category']}</strong>.</p>",
+        "text": f"Logged voice note: ₹{fmt(last_tx['amount'])} on {last_tx['category']}",
+        "message_html": f"<p>Deciphered voice memo: <em>\"{transcribed}\"</em>! Logged <strong>₹{fmt(last_tx['amount'])}</strong> under <strong>{last_tx['category']}</strong>.</p>",
         "balance": float(get_balance()),
         "today_spent": float(get_today_expense()),
     })
