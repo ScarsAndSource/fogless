@@ -95,18 +95,36 @@ document.addEventListener('DOMContentLoaded', () => {
   const sendBtn = document.getElementById('send-btn');
   const micBtn = document.getElementById('mic-btn');
   const chatThread = document.getElementById('chat-thread');
-  const balanceVal = document.getElementById('header-balance-val');
-  const balancePct = document.getElementById('header-balance-pct');
+  const balanceVal = document.getElementById('balance-val');
+  const balancePct = null; // removed in Sanctuary layout
   const todayLoggedVal = document.getElementById('today-logged-val');
   const todayGaugeCells = document.getElementById('today-gauge-cells');
-  const headerSprite = document.getElementById('mochi-header-sprite');
+  const todayPctVal = document.getElementById('today-pct-val');
+  const headerSprite = document.getElementById('mochi-master-svg');
   const pokeHeart = document.getElementById('poke-heart');
-  const mochiWrap = document.getElementById('mochi-avatar-wrap');
+  const mochiWrap = document.getElementById('mochi-poke-trigger');
   const btnA = document.getElementById('btn-a');
   const btnB = document.getElementById('btn-b');
-  const soundIndicator = document.getElementById('sound-indicator');
-  const retroClock = document.getElementById('retro-clock');
+  const soundIndicator = document.getElementById('sound-btn');
+  const retroClock = document.getElementById('clock-display');
   const greetingTime = document.getElementById('greeting-time');
+
+  // Slash spell drawer toggle
+  const spellsToggle = document.getElementById('spells-toggle');
+  const slashDrawer = document.getElementById('slash-suggest-drawer');
+  const drawerCloseBtn = document.getElementById('drawer-close-btn');
+  if (spellsToggle && slashDrawer) {
+    spellsToggle.addEventListener('click', () => {
+      playBeep(440);
+      slashDrawer.classList.toggle('hidden');
+    });
+  }
+  if (drawerCloseBtn && slashDrawer) {
+    drawerCloseBtn.addEventListener('click', () => {
+      playBeep(330);
+      slashDrawer.classList.add('hidden');
+    });
+  }
 
   let currentBalance = 2418.50;
   let todaySpent = 60.00;
@@ -120,11 +138,13 @@ document.addEventListener('DOMContentLoaded', () => {
   // Real Clock updating
   function updateClock() {
     const now = new Date();
-    const hrs = String(now.getHours()).padStart(2, '0');
+    let h = now.getHours();
     const mins = String(now.getMinutes()).padStart(2, '0');
-    const timeStr = `${hrs}:${mins}`;
+    const ampm = h >= 12 ? 'PM' : 'AM';
+    h = h % 12 || 12;
+    const timeStr = `${String(h).padStart(2, '0')}:${mins} ${ampm}`;
     if (retroClock) retroClock.textContent = timeStr;
-    if (greetingTime) greetingTime.textContent = timeStr + (now.getHours() >= 12 ? ' PM' : ' AM');
+    if (greetingTime) greetingTime.textContent = timeStr;
   }
   updateClock();
   setInterval(updateClock, 10000);
@@ -134,12 +154,12 @@ document.addEventListener('DOMContentLoaded', () => {
     soundIndicator.addEventListener('click', () => {
       soundEnabled = !soundEnabled;
       if (soundEnabled) {
-        soundIndicator.textContent = '♪ BEEP';
-        soundIndicator.className = 'cursor-pointer text-[#34D399] select-none';
+        soundIndicator.textContent = '♪ MIST LO-FI';
+        soundIndicator.style.color = '#6EE7B7';
         playBeep(880);
       } else {
-        soundIndicator.textContent = '✕ MUTE';
-        soundIndicator.className = 'cursor-pointer text-[#EF4444] select-none';
+        soundIndicator.textContent = '✕ MUTED';
+        soundIndicator.style.color = '#EF4444';
       }
     });
   }
@@ -148,14 +168,18 @@ document.addEventListener('DOMContentLoaded', () => {
   if (mochiWrap) {
     mochiWrap.addEventListener('click', () => {
       playPurr();
-      headerSprite.classList.remove('mochi-bounce');
-      headerSprite.classList.add('mochi-cheer');
-      pokeHeart.style.display = 'block';
+      if (headerSprite) {
+        headerSprite.classList.remove('mochi-idle');
+        headerSprite.classList.add('mochi-jump');
+      }
+      if (pokeHeart) pokeHeart.style.display = 'block';
       setTimeout(() => {
-        pokeHeart.style.display = 'none';
-        headerSprite.classList.remove('mochi-cheer');
-        headerSprite.classList.add('mochi-bounce');
-      }, 1200);
+        if (pokeHeart) pokeHeart.style.display = 'none';
+        if (headerSprite) {
+          headerSprite.classList.remove('mochi-jump');
+          headerSprite.classList.add('mochi-idle');
+        }
+      }, 1000);
     });
   }
 
@@ -234,17 +258,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function updateTodayPaceDisplay(newTodaySpent) {
     todaySpent = newTodaySpent;
-    if (todayLoggedVal) todayLoggedVal.textContent = `$${todaySpent.toFixed(2)} logged`;
-    
+    if (todayLoggedVal) todayLoggedVal.textContent = `$${todaySpent.toFixed(2)}`;
+    const pct = Math.min(100, Math.round((todaySpent / todayLimit) * 100));
+    if (todayPctVal) todayPctVal.textContent = `${pct}%`;
+
     if (todayGaugeCells) {
-      const filledCells = Math.min(8, Math.round((todaySpent / todayLimit) * 8));
+      const filledCells = Math.min(6, Math.round((todaySpent / todayLimit) * 6));
       todayGaugeCells.innerHTML = '';
-      for (let i = 0; i < 8; i++) {
+      for (let i = 0; i < 6; i++) {
         const cell = document.createElement('div');
         if (i < filledCells) {
-          cell.className = i >= 6 ? 'w-2 h-2.5 bg-[#E15554] border border-[#2B2638]' : 'w-2 h-2.5 bg-[#10B981] border border-[#2B2638]';
+          cell.className = i >= 4 ? 'w-2.5 h-2 bg-[#E15554] border border-[#3E5C46]' : 'w-2.5 h-2 bg-[#5B8B67] border border-[#3E5C46]';
         } else {
-          cell.className = 'w-2 h-2.5 bg-[#E5E7EB] border border-[#2B2638]';
+          cell.className = 'w-2.5 h-2 bg-[#E1E8DE] border border-[#A7B9A9]';
         }
         todayGaugeCells.appendChild(cell);
       }
@@ -362,12 +388,12 @@ document.addEventListener('DOMContentLoaded', () => {
     chatThread.scrollTop = chatThread.scrollHeight;
 
     if (headerSprite) {
-      headerSprite.classList.remove('mochi-bounce');
-      headerSprite.classList.add('mochi-cheer');
+      headerSprite.classList.remove('mochi-idle');
+      headerSprite.classList.add('mochi-jump');
       setTimeout(() => {
-        headerSprite.classList.remove('mochi-cheer');
-        headerSprite.classList.add('mochi-bounce');
-      }, 500);
+        headerSprite.classList.remove('mochi-jump');
+        headerSprite.classList.add('mochi-idle');
+      }, 700);
     }
 
     try {

@@ -3,278 +3,267 @@
 <head>
 <meta charset="utf-8"/>
 <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
-<title>Fogless — 16-bit JRPG Personal Finance Companion</title>
-<!-- Google Fonts: Pixelify Sans and Press Start 2P -->
+<title>Fogless — 16-bit JRPG Sanctuary</title>
+<!-- Google Fonts: Pixelify Sans, VT323 & Press Start 2P -->
 <link href="https://fonts.googleapis.com" rel="preconnect"/>
 <link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
-<link href="https://fonts.googleapis.com/css2?family=Pixelify+Sans:wght@400;600;700&amp;family=Press+Start+2P&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Pixelify+Sans:wght@400;500;600;700&family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
 <link rel="stylesheet" href="/style.css"/>
 </head>
 <body>
+
 <!-- Handheld Console Housing -->
 <div class="handheld-shell flex flex-col justify-between">
-  <!-- Top Handheld Trim & Stereo Dots -->
-  <div class="flex justify-between items-center px-3 mb-1.5 shrink-0">
+
+  <!-- Sleek Top Status & Subtle Speaker Holes -->
+  <div class="flex justify-between items-center px-4 mb-2 shrink-0">
     <div class="flex items-center gap-2">
-      <div class="w-2.5 h-2.5 rounded-full bg-[#10B981] shadow-[0_0_6px_#10B981] border border-[#064E3B]" title="Power ON"></div>
-      <span class="font-numeral text-[8px] text-[#A599BE] tracking-widest uppercase">FOGLESS SP · 16-BIT</span>
+      <div class="w-2 h-2 rounded-full bg-[#4ADE80] shadow-[0_0_6px_#4ADE80] border border-[#166534]"></div>
+      <span class="font-numeral text-[7.5px] text-[#A69CC0] tracking-widest uppercase">FOGLESS · SANCTUARY</span>
     </div>
-    <!-- Retro Speaker Vent Grille -->
-    <div class="flex items-center gap-1.5">
-      <div class="flex gap-1">
-        <div class="w-1.5 h-1.5 bg-[#171322] border-b border-[#4F446C] rounded-sm"></div>
-        <div class="w-1.5 h-1.5 bg-[#171322] border-b border-[#4F446C] rounded-sm"></div>
-        <div class="w-1.5 h-1.5 bg-[#171322] border-b border-[#4F446C] rounded-sm"></div>
-        <div class="w-1.5 h-1.5 bg-[#171322] border-b border-[#4F446C] rounded-sm"></div>
-      </div>
+    <!-- Minimalist Acoustic Dots -->
+    <div class="flex gap-1">
+      <div class="w-1.5 h-1.5 bg-[#171324] border-b border-[#4A4264] rounded-full"></div>
+      <div class="w-1.5 h-1.5 bg-[#171324] border-b border-[#4A4264] rounded-full"></div>
+      <div class="w-1.5 h-1.5 bg-[#171324] border-b border-[#4A4264] rounded-full"></div>
     </div>
   </div>
 
-  <!-- Screen Bezel & Screen Assembly -->
+  <!-- Screen Bezel -->
   <div class="screen-glass scanlines">
-    <!-- Top RPG Info Strip: Clock, Sound, Battery Status -->
-    <div class="bg-[#241F33] text-[#B8ADC9] px-2.5 py-1 flex items-center justify-between border-b-2 border-[#151221] shrink-0 font-numeral text-[8px]">
+
+    <!-- Serene Atmosphere Strip -->
+    <div class="bg-[#242033] text-[#AFA6C4] px-3 py-1.5 flex items-center justify-between border-b-2 border-[#161320] shrink-0 font-numeral text-[7.5px]">
       <div class="flex items-center gap-2">
-        <span class="text-[#FBBF24]">★ QUEST: MAY BUDGET</span>
-        <span class="text-[#7A6D96]">|</span>
-        <span class="text-[#E2D9F3]" id="retro-clock">14:24</span>
+        <span class="text-[#FBBF24]">☼ MORNING MIST</span>
+        <span class="text-[#594E73]">·</span>
+        <span class="text-[#D8D1E6]" id="clock-display">09:14 AM</span>
       </div>
-      <div class="flex items-center gap-2">
-        <!-- Audio Beeper Toggle Indicator -->
-        <span class="cursor-pointer text-[#34D399] select-none" id="sound-indicator" title="Toggle Sound SFX">♪ BEEP</span>
-        <!-- Battery Meter -->
-        <div class="flex items-center gap-0.5" title="Battery 80%">
-          <div class="w-4 h-2 border border-[#8B7CA8] p-0.5 flex gap-0.5">
-            <div class="w-1 h-full bg-[#34D399]"></div>
-            <div class="w-1 h-full bg-[#34D399]"></div>
+      <div class="flex items-center gap-3">
+        <span class="text-[#6EE7B7] cursor-pointer select-none" id="sound-btn" title="Toggle Lo-fi Audio">♪ MIST LO-FI</span>
+        <div class="flex items-center gap-0.5" title="Battery Serene">
+          <div class="w-3.5 h-1.5 border border-[#8C7DA8] p-0.5 flex">
+            <div class="w-full h-full bg-[#34D399]"></div>
           </div>
-          <div class="w-0.5 h-1 bg-[#8B7CA8]"></div>
         </div>
       </div>
     </div>
 
-    <!-- Main Companion & Net GP Bar -->
-    <header class="bg-[#EBE2CF] border-b-4 border-[#3D3554] p-2.5 flex items-center justify-between shrink-0 shadow-sm relative z-20">
-      <!-- Companion Sprite & XP Profile -->
-      <div class="flex items-center gap-2.5 cursor-pointer group" id="mochi-avatar-wrap" title="Click Mochi to poke!">
-        <!-- 36x36 Pixel Art Companion: Mochi The Finance Familiar -->
-        <div class="relative w-10 h-10 bg-[#FFFCE8] border-2 border-[#2B2638] shadow-[2px_2px_0_0_#9E927C] flex items-center justify-center overflow-visible">
-          <!-- Floating Poke Feedback Heart -->
-          <div class="popover-heart font-bold" id="poke-heart">♥ *PURR!*</div>
-          <!-- Mochi SVG Pixel Sprite -->
-          <svg class="w-8 h-8 mochi-bounce pixel-art" fill="none" id="mochi-header-sprite" viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg">
-            <!-- Leaf Sprout on top with wobble -->
-            <g class="leaf-wag">
-              <rect fill="#1F4D25" height="3" width="2" x="8" y="0"></rect>
-              <rect fill="#4ADE80" height="1" width="3" x="10" y="1"></rect>
-              <rect fill="#22C55E" height="1" width="3" x="9" y="2"></rect>
+    <!-- Generous, Airy Header: Sanctuary Companion & Clean Gold Ledger -->
+    <header class="bg-[#F6EFE2] border-b-2 border-[#D7CDBB] px-3.5 py-3 flex items-center justify-between shrink-0 shadow-sm relative z-20">
+      <!-- Companion Avatar & Heartfelt Level -->
+      <div class="flex items-center gap-3 cursor-pointer group" id="mochi-poke-trigger" title="Tap to greet Mochi">
+        <div class="relative w-11 h-11 bg-[#FCFAF5] border-2 border-[#334637] shadow-[2px_2px_0_0_#978C78] flex items-center justify-center">
+          <div class="poke-heart-popup font-numeral" id="poke-heart">♥ SWEET!</div>
+          <!-- Mochi Character Sprite with Leaf Umbrella -->
+          <svg class="w-9 h-9 mochi-idle" fill="none" id="mochi-master-svg" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">
+            <!-- Dewdrop leaf sprout / canopy -->
+            <g class="leaf-sway">
+              <rect fill="#204E2D" height="3" width="2" x="9" y="0"></rect>
+              <rect fill="#4ADE80" height="1" width="3" x="11" y="1"></rect>
+              <rect fill="#22C55E" height="2" width="4" x="10" y="2"></rect>
+              <rect fill="#86EFAC" height="1" width="2" x="8" y="1"></rect>
             </g>
-            <!-- Wizard Sprout Bell -->
-            <rect fill="#FBBF24" height="1" width="2" x="8" y="3"></rect>
-            <!-- Mochi Dumpling Body (Mint Frosting slime) -->
-            <rect fill="#264E2E" height="1" width="8" x="5" y="4"></rect>
-            <rect fill="#8CE0A0" height="8" width="10" x="4" y="5"></rect>
-            <rect fill="#264E2E" height="6" width="1" x="3" y="6"></rect>
-            <rect fill="#264E2E" height="6" width="1" x="14" y="6"></rect>
-            <rect fill="#264E2E" height="1" width="10" x="4" y="13"></rect>
-            <!-- Highlights -->
-            <rect fill="#E4FCEB" height="2" width="2" x="5" y="5"></rect>
-            <rect fill="#BAF7CB" height="1" width="4" x="7" y="5"></rect>
-            <!-- Rosy Cheeks -->
-            <rect fill="#F472B6" height="2" width="2" x="4" y="9"></rect>
-            <rect fill="#F472B6" height="2" width="2" x="12" y="9"></rect>
-            <!-- Big Shiny Anime Pixel Eyes -->
-            <rect fill="#142B1A" height="3" width="2" x="6" y="7"></rect>
-            <rect fill="#142B1A" height="3" width="2" x="10" y="7"></rect>
-            <rect fill="#FFFFFF" height="1" width="1" x="6" y="7"></rect>
-            <rect fill="#FFFFFF" height="1" width="1" x="10" y="7"></rect>
-            <!-- Tiny smile -->
-            <rect fill="#142B1A" height="1" width="2" x="8" y="10"></rect>
-            <!-- Little Feet -->
-            <rect fill="#1A3820" height="1" width="2" x="5" y="14"></rect>
-            <rect fill="#1A3820" height="1" width="2" x="11" y="14"></rect>
+            <!-- Bell / amulet charm -->
+            <rect fill="#FBBF24" height="1" width="2" x="9" y="3"></rect>
+            <!-- Dumpling Body: Mint Matcha Glaze -->
+            <rect fill="#22482E" height="1" width="8" x="6" y="4"></rect>
+            <rect fill="#9AE3AD" height="9" width="12" x="4" y="5"></rect>
+            <rect fill="#22482E" height="7" width="1" x="3" y="6"></rect>
+            <rect fill="#22482E" height="7" width="1" x="16" y="6"></rect>
+            <rect fill="#22482E" height="1" width="12" x="4" y="14"></rect>
+            <!-- Soft Morning Highlights -->
+            <rect fill="#E8FDF0" height="2" width="2" x="5" y="5"></rect>
+            <rect fill="#C1F5D0" height="1" width="4" x="7" y="5"></rect>
+            <!-- Blushing Peach Cheeks -->
+            <rect fill="#FCA5A5" height="2" width="2" x="4" y="9"></rect>
+            <rect fill="#FCA5A5" height="2" width="2" x="14" y="9"></rect>
+            <!-- Big Soulful Twinkling Eyes -->
+            <rect fill="#142B1A" height="3" width="2" x="7" y="7"></rect>
+            <rect fill="#142B1A" height="3" width="2" x="11" y="7"></rect>
+            <rect fill="#FFFFFF" height="1" width="1" x="7" y="7"></rect>
+            <rect fill="#FFFFFF" height="1" width="1" x="11" y="7"></rect>
+            <!-- Content Smile -->
+            <rect fill="#142B1A" height="1" width="2" x="9" y="11"></rect>
+            <!-- Little Pod Feet -->
+            <rect fill="#1A3820" height="1" width="2" x="6" y="15"></rect>
+            <rect fill="#1A3820" height="1" width="2" x="12" y="15"></rect>
           </svg>
-          <!-- Level Tag Badge -->
-          <div class="absolute -top-1.5 -right-2 bg-[#FBBF24] border border-[#2B2638] px-1 font-numeral text-[6px] font-bold text-[#3B2900]" id="mochi-level-tag">
+          <div class="absolute -top-1.5 -right-2 bg-[#FDE68A] border border-[#2F3E30] px-1 font-numeral text-[6px] text-[#422006] font-bold" id="mochi-level-tag">
             LV.4
           </div>
         </div>
-        <!-- Mochi Nameplate & EXP Bar -->
         <div>
           <div class="flex items-center gap-1.5">
-            <span class="font-bold text-[14px] text-[#252033] tracking-wide">MOCHI</span>
-            <span class="text-[9px] bg-[#34D399] text-[#064E3B] font-bold px-1 py-0.2 border border-[#064E3B]" id="mochi-status-badge">HAPPY</span>
+            <span class="font-bold text-[14px] text-[#243528] tracking-wide">Mochi</span>
+            <span class="text-[9px] bg-[#DCFCE7] text-[#166534] font-semibold px-1.5 border border-[#86EFAC]" id="mochi-status-badge">in peace</span>
           </div>
-          <!-- Mini EXP Bar -->
-          <div class="flex items-center gap-1.5 mt-0.5">
-            <span class="font-numeral text-[7px] text-[#6C5E48]">EXP</span>
-            <div class="w-16 h-2 bg-[#D1C7B2] border border-[#2B2638] p-0.5 flex">
-              <div class="h-full bg-[#10B981] w-[75%]" id="mochi-exp-bar"></div>
-            </div>
-            <span class="font-numeral text-[6px] text-[#554A36]" id="mochi-exp-val">340/400</span>
-          </div>
+          <p class="text-[11px] text-[#716450] mt-0.5">Your calm budget familiar</p>
         </div>
       </div>
 
-      <!-- Gold (GP) Balance Box: Styled like a JRPG Guild Vault -->
-      <div class="bg-[#FFFCE8] border-2 border-[#3D3554] shadow-[2px_2px_0_0_#9E927C] px-2.5 py-1 text-right min-w-[140px] flex flex-col justify-center">
-        <div class="flex items-center justify-between gap-1 text-[8px] font-bold text-[#8C7A59]">
-          <span class="flex items-center gap-1">
-            <span class="coin-shimmer text-[#F59E0B]">🪙</span> NET GOLD
-          </span>
-          <span class="text-[#059669] font-numeral text-[7px]" id="header-balance-pct">+12.4%</span>
+      <!-- Peaceful Gold Ledger Balance -->
+      <div class="bg-[#FCFAF5] border border-[#D5C9B3] shadow-[2px_2px_0_0_#C2B59D] px-3 py-1.5 text-right min-w-[130px]">
+        <div class="text-[8px] font-bold text-[#8A7B66] flex items-center justify-end gap-1">
+          <span class="sparkle-anim text-[#F59E0B]">✧</span>
+          <span>NET GOLD</span>
         </div>
-        <div class="font-numeral text-[13px] text-[#1E1B29] tracking-tight flex items-center justify-end overflow-hidden h-5 mt-0.5">
-          <span class="text-[#8C7A59] mr-1 text-[11px]">$</span>
-          <span class="font-bold text-[#14291B]" id="header-balance-val">2,418.50</span>
+        <div class="font-numeral text-[13px] text-[#243528] tracking-tight mt-0.5">
+          <span class="text-[#8F816D] mr-0.5 text-[10px]">$</span><span id="balance-val">2,418.50</span>
         </div>
       </div>
     </header>
 
-    <!-- Subheader: Daily Quest Pace Meter -->
-    <div class="bg-[#DFD5BF] border-b-2 border-[#3D3554] px-3 py-1 flex items-center justify-between text-[11px] text-[#4A4031]">
-      <div class="flex items-center gap-1.5 font-bold">
-        <span class="text-[#E15554]">⚔ TODAY:</span>
-        <span id="today-logged-val">$60.00 logged</span>
+    <!-- Gentle Breathing Space: Daily Pace Tracker -->
+    <div class="bg-[#F0E8D7] border-b border-[#DCD3C0] px-4 py-1.5 flex items-center justify-between text-[11px] text-[#5C503D]">
+      <div class="flex items-center gap-1.5">
+        <span class="text-[#5B8B67]">🌿 Today's outflow:</span>
+        <span class="font-bold text-[#2A4533]" id="today-logged-val">$60.00</span>
       </div>
-      <!-- Segmented 8-block budget gauge -->
-      <div class="flex items-center gap-1">
-        <span class="font-numeral text-[7px] text-[#7A6C53]">LIMIT:</span>
-        <div class="flex gap-0.5" id="today-gauge-cells">
-          <div class="w-2 h-2.5 bg-[#E15554] border border-[#2B2638]"></div>
-          <div class="w-2 h-2.5 bg-[#E15554] border border-[#2B2638]"></div>
-          <div class="w-2 h-2.5 bg-[#E15554] border border-[#2B2638]"></div>
-          <div class="w-2 h-2.5 bg-[#E15554] border border-[#2B2638]"></div>
-          <div class="w-2 h-2.5 bg-[#E5E7EB] border border-[#2B2638]"></div>
-          <div class="w-2 h-2.5 bg-[#E5E7EB] border border-[#2B2638]"></div>
-          <div class="w-2 h-2.5 bg-[#E5E7EB] border border-[#2B2638]"></div>
-          <div class="w-2 h-2.5 bg-[#E5E7EB] border border-[#2B2638]"></div>
+      <!-- Soft Stepped Garden Meter -->
+      <div class="flex items-center gap-1.5">
+        <span class="font-numeral text-[7px] text-[#86765F]">PACE</span>
+        <div class="flex gap-1" id="today-gauge-cells">
+          <div class="w-2.5 h-2 bg-[#5B8B67] border border-[#3E5C46]"></div>
+          <div class="w-2.5 h-2 bg-[#5B8B67] border border-[#3E5C46]"></div>
+          <div class="w-2.5 h-2 bg-[#5B8B67] border border-[#3E5C46]"></div>
+          <div class="w-2.5 h-2 bg-[#E1E8DE] border border-[#A7B9A9]"></div>
+          <div class="w-2.5 h-2 bg-[#E1E8DE] border border-[#A7B9A9]"></div>
+          <div class="w-2.5 h-2 bg-[#E1E8DE] border border-[#A7B9A9]"></div>
         </div>
-        <span class="font-numeral text-[8px] text-[#2B2638] font-bold ml-1">$120</span>
+        <span class="text-[10px] text-[#556958] font-numeral" id="today-pct-val">50%</span>
       </div>
     </div>
 
-    <!-- Dialogue Thread Viewport -->
-    <main class="flex-1 overflow-y-auto p-3 parchment-grid-bg space-y-4 text-[15px] leading-snug" id="chat-thread">
-      <!-- 1. JRPG Opening / Quest Greeting -->
-      <div class="flex items-start gap-2.5 max-w-[94%]">
-        <div class="shrink-0 w-8 h-8 bg-[#FFFCE8] border-2 border-[#345C3D] flex items-center justify-center shadow-[1px_1px_0_0_#345C3D]">
-          <svg class="w-6 h-6" fill="none" viewBox="0 0 16 16">
-            <rect fill="#1F4D25" height="2" width="2" x="7" y="1"></rect>
-            <rect fill="#8CE0A0" height="8" width="8" x="4" y="4"></rect>
-            <rect fill="#142B1A" height="1" width="2" x="5" y="7"></rect>
-            <rect fill="#142B1A" height="1" width="2" x="9" y="7"></rect>
-            <rect fill="#6B7280" height="1" width="2" x="12" y="2"></rect>
-            <rect fill="#6B7280" height="1" width="1" x="13" y="3"></rect>
-            <rect fill="#6B7280" height="1" width="2" x="12" y="4"></rect>
+    <!-- Main Airy Chat Stream -->
+    <main class="flex-1 overflow-y-auto p-4 sanctuary-meadow-bg space-y-4 text-[14px] leading-relaxed relative" id="chat-thread">
+      <!-- Ambient motes -->
+      <div class="mote-1"></div>
+      <div class="mote-2"></div>
+
+      <!-- Mochi's Morning Greeting -->
+      <div class="flex items-start gap-3 max-w-[92%]">
+        <div class="shrink-0 w-8 h-8 bg-[#FCFAF6] border-2 border-[#5B8B67] flex items-center justify-center shadow-[1px_1px_0_0_#5B8B67] mt-0.5">
+          <svg class="w-5 h-5 animate-pulse" fill="none" viewBox="0 0 16 16">
+            <rect fill="#F472B6" height="2" width="2" x="7" y="2"></rect>
+            <rect fill="#F472B6" height="2" width="2" x="4" y="5"></rect>
+            <rect fill="#F472B6" height="2" width="2" x="10" y="5"></rect>
+            <rect fill="#F472B6" height="2" width="2" x="7" y="8"></rect>
+            <rect fill="#FBBF24" height="2" width="2" x="7" y="5"></rect>
+            <rect fill="#4ADE80" height="5" width="2" x="7" y="10"></rect>
+            <rect fill="#22C55E" height="2" width="2" x="5" y="11"></rect>
           </svg>
         </div>
-        <div class="pixel-border-sage p-2.5 text-[#142B1A] flex-1">
-          <div class="flex items-center justify-between border-b border-[#A6DCB1] pb-1 mb-1">
-            <span class="font-numeral text-[8px] text-[#24522E] uppercase font-bold">Mochi · Companion</span>
-            <span class="font-numeral text-[7px] text-[#4F7D59]" id="greeting-time">09:12 AM</span>
+        <div class="pixel-box-sage p-3 text-[#1C3222] flex-1">
+          <div class="flex items-center justify-between border-b border-[#D2E7D6] pb-1 mb-1.5">
+            <span class="font-numeral text-[7.5px] text-[#40684C] font-bold uppercase tracking-wider">Mochi · Meadow Guide</span>
+            <span class="font-numeral text-[7px] text-[#789680]" id="greeting-time">09:14 AM</span>
           </div>
-          <p>Good morning, Adventurer! Mana is full. Tell me what you spent, or summon battle commands with <span class="bg-[#2B5433] text-[#E8F8EC] px-1 font-mono text-[13px] font-bold">/</span>.</p>
+          <p class="text-[#203D27] leading-normal">
+            The sanctuary is quiet and morning dew has settled. Speak or type whatever coins were shared, or press <span class="bg-[#D4EAD8] text-[#1E4327] font-bold px-1 py-0.5 border border-[#9DC9A5] text-[12px] font-mono">/</span> to explore softly.
+          </p>
         </div>
       </div>
     </main>
 
-    <!-- Bottom Interactive Command Deck & Terminal -->
-    <footer class="bg-[#E6DEC9] border-t-4 border-[#3D3554] relative z-30 shrink-0 shadow-lg">
-      <!-- Command Directory Bar with 13 Functional Clickable Chips -->
-      <div class="border-b-2 border-[#BDB198] p-2 bg-[#F2EBDA]" id="cmd-tray">
-        <div class="flex justify-between items-center mb-1.5 px-0.5">
-          <span class="font-numeral text-[8px] text-[#55493A] tracking-wider flex items-center gap-1">
-            <span class="text-[#D97706]">▶</span> COMMAND DIRECTORY (13)
-          </span>
-          <span class="font-numeral text-[7px] bg-[#3D3554] text-[#E0D8EE] px-1.5 py-0.5">TAP TO CAST</span>
+    <!-- Sleek Bottom Terminal Deck -->
+    <footer class="bg-[#EBE3D3] border-t-2 border-[#CFC5B1] relative z-30 shrink-0 p-2.5">
+
+      <!-- Slash Command Suggestion Drawer (hidden by default) -->
+      <div class="hidden pb-2 mb-2 border-b border-[#D8CEB9]" id="slash-suggest-drawer">
+        <div class="flex items-center justify-between text-[8px] font-numeral text-[#7C6E5A] mb-1.5">
+          <span>SANCTUARY SPELLS</span>
+          <span class="cursor-pointer text-[#5B8B67] select-none" id="drawer-close-btn">✕ CLOSE</span>
         </div>
-        <!-- 13 Pixel-Font Chips -->
-        <div class="flex flex-wrap gap-1.5 max-h-20 overflow-y-auto pr-1">
-          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/add</button>
-          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/income</button>
-          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/balance</button>
-          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/stats</button>
-          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/history</button>
-          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/undo</button>
-          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/delete</button>
-          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/alias</button>
-          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/aliases</button>
-          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/export</button>
-          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/backup</button>
-          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/setbalance</button>
-          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/reset</button>
+        <div class="flex gap-1.5 overflow-x-auto py-0.5" id="slash-chips">
+          <button class="cmd-chip font-numeral text-[7.5px] px-2 py-1 bg-[#FFFDF7] text-[#2D4535] border border-[#8AA892] shadow-sm hover:bg-[#D7EFE0]">/stats</button>
+          <button class="cmd-chip font-numeral text-[7.5px] px-2 py-1 bg-[#FFFDF7] text-[#2D4535] border border-[#8AA892] shadow-sm hover:bg-[#D7EFE0]">/balance</button>
+          <button class="cmd-chip font-numeral text-[7.5px] px-2 py-1 bg-[#FFFDF7] text-[#2D4535] border border-[#8AA892] shadow-sm hover:bg-[#D7EFE0]">/undo</button>
+          <button class="cmd-chip font-numeral text-[7.5px] px-2 py-1 bg-[#FFFDF7] text-[#2D4535] border border-[#8AA892] shadow-sm hover:bg-[#D7EFE0]">/income</button>
+          <button class="cmd-chip font-numeral text-[7.5px] px-2 py-1 bg-[#FFFDF7] text-[#2D4535] border border-[#8AA892] shadow-sm hover:bg-[#D7EFE0]">/history</button>
+          <button class="cmd-chip font-numeral text-[7.5px] px-2 py-1 bg-[#FFFDF7] text-[#2D4535] border border-[#8AA892] shadow-sm hover:bg-[#D7EFE0]">/add</button>
+          <button class="cmd-chip font-numeral text-[7.5px] px-2 py-1 bg-[#FFFDF7] text-[#2D4535] border border-[#8AA892] shadow-sm hover:bg-[#D7EFE0]">/delete</button>
+          <button class="cmd-chip font-numeral text-[7.5px] px-2 py-1 bg-[#FFFDF7] text-[#2D4535] border border-[#8AA892] shadow-sm hover:bg-[#D7EFE0]">/alias</button>
+          <button class="cmd-chip font-numeral text-[7.5px] px-2 py-1 bg-[#FFFDF7] text-[#2D4535] border border-[#8AA892] shadow-sm hover:bg-[#D7EFE0]">/aliases</button>
+          <button class="cmd-chip font-numeral text-[7.5px] px-2 py-1 bg-[#FFFDF7] text-[#2D4535] border border-[#8AA892] shadow-sm hover:bg-[#D7EFE0]">/export</button>
+          <button class="cmd-chip font-numeral text-[7.5px] px-2 py-1 bg-[#FFFDF7] text-[#2D4535] border border-[#8AA892] shadow-sm hover:bg-[#D7EFE0]">/backup</button>
+          <button class="cmd-chip font-numeral text-[7.5px] px-2 py-1 bg-[#FFFDF7] text-[#2D4535] border border-[#8AA892] shadow-sm hover:bg-[#D7EFE0]">/setbalance</button>
+          <button class="cmd-chip font-numeral text-[7.5px] px-2 py-1 bg-[#FFFDF7] text-[#2D4535] border border-[#8AA892] shadow-sm hover:bg-[#D7EFE0]">/reset</button>
         </div>
       </div>
 
-      <!-- Terminal-Style Input Bar -->
-      <div class="p-2 flex items-center gap-2 bg-[#E2D8C0]">
-        <!-- Microphone Voice Recording Button -->
-        <button class="bg-[#F59E0B] hover:bg-[#D97706] text-[#451A03] border-2 border-[#78350F] shadow-[1px_1px_0_0_#2B2638] active:translate-y-0.5 px-2 py-1.5 font-numeral text-[9px] font-bold flex items-center justify-center shrink-0" id="mic-btn" title="Hold/Click to record voice note">
-          🎙 REC
+      <!-- Input Row -->
+      <div class="flex items-center gap-2">
+        <!-- Voice Memo Trigger -->
+        <button class="w-9 h-9 bg-[#FAF6EE] hover:bg-[#F0E8D7] text-[#554737] border border-[#B8AA94] shadow-[1px_1px_0_0_#8E816E] flex items-center justify-center text-[13px] active:translate-y-0.5 shrink-0" id="mic-btn" title="Record Voice Note">
+          🎙️
         </button>
-
-        <!-- Input Inset Frame -->
-        <div class="flex-1 bg-[#FFFDF7] border-2 border-[#3D3554] shadow-inner px-2 py-1.5 flex items-center gap-2">
-          <span class="text-[#E15554] font-bold text-[16px] leading-none select-none">▶</span>
-          <input class="w-full bg-transparent outline-none font-bold text-[#142B1A] placeholder:text-[#A0947E] text-[15px]" id="terminal-input" placeholder="e.g. 60 lunch upi or /balance" type="text"/>
-          <!-- Blinking Pixel Block Cursor -->
-          <div class="w-2 h-4 bg-[#142B1A] shrink-0 rpg-cursor-blink"></div>
+        <!-- Pixel Input Field -->
+        <div class="flex-1 bg-[#FFFDF9] border-2 border-[#544B66] px-2.5 py-1.5 flex items-center gap-2 shadow-inner">
+          <span class="text-[#5B8B67] font-bold text-[14px] select-none">▶</span>
+          <input autocomplete="off" class="w-full bg-transparent outline-none font-bold text-[#233526] placeholder:text-[#A79C8A] text-[14.5px]" id="terminal-input" placeholder="Type '24 coffee' or '/' for spells…" type="text"/>
+          <span class="w-2 h-4 bg-[#233526] shrink-0 pixel-cursor"></span>
         </div>
-
-        <!-- 16-Bit Action Button -->
-        <button class="bg-[#10B981] hover:bg-[#059669] text-[#FFFCE8] border-2 border-[#134E35] shadow-[2px_2px_0_0_#1E1B29] active:translate-x-0.5 active:translate-y-0.5 active:shadow-none px-3.5 py-1.5 font-bold text-[14px] flex items-center gap-1" id="send-btn">
-          <span>CAST</span>
+        <!-- Log Button -->
+        <button class="bg-[#5B8B67] hover:bg-[#497554] text-[#F4FAF5] border-2 border-[#2C4934] shadow-[2px_2px_0_0_#1E3023] active:translate-x-0.5 active:translate-y-0.5 active:shadow-none px-3.5 py-1.5 font-bold text-[13.5px] flex items-center gap-1 shrink-0" id="send-btn">
+          <span>LOG</span>
         </button>
+      </div>
+
+      <!-- Footer Prompt Hints -->
+      <div class="flex items-center justify-between text-[9px] text-[#8C7E6A] mt-1.5 px-0.5 font-vt tracking-wider">
+        <span class="flex items-center gap-1">
+          <span class="text-[#5B8B67]">●</span> Instant AI Parsing (amount + tag + mode)
+        </span>
+        <span class="cursor-pointer hover:underline text-[#5B8B67] select-none" id="spells-toggle">[ / spells ]</span>
       </div>
     </footer>
   </div>
 
-  <!-- Handheld Controller Lower Bezel with Tactile D-Pad & Jeweled Buttons -->
+  <!-- Physical Controls -->
   <div class="mt-2.5 flex justify-between items-center px-4 py-1">
-    <!-- Directional Cross D-Pad -->
-    <div class="relative w-14 h-14 cursor-pointer" id="d-pad" title="D-Pad: Up/Down for History, Left/Right for Commands">
-      <div class="absolute top-0 left-5 w-4 h-14 bg-[#1C1728] border-2 border-[#453C5E] rounded-sm shadow-[0_2px_0_#0C0913]"></div>
-      <div class="absolute top-5 left-0 w-14 h-4 bg-[#1C1728] border-2 border-[#453C5E] rounded-sm shadow-[0_2px_0_#0C0913]"></div>
-      <div class="absolute top-5 left-5 w-4 h-4 bg-[#130F1C] flex items-center justify-center">
-        <div class="w-1.5 h-1.5 bg-[#2A233C] rounded-full"></div>
+    <!-- D-Pad -->
+    <div class="relative w-13 h-13 cursor-pointer" id="dpad" title="Meadow D-Pad">
+      <div class="absolute top-0 left-4.5 w-4 h-13 bg-[#1D1929] border-2 border-[#4E4466] rounded-sm shadow-[0_2px_0_#0E0C15]"></div>
+      <div class="absolute top-4.5 left-0 w-13 h-4 bg-[#1D1929] border-2 border-[#4E4466] rounded-sm shadow-[0_2px_0_#0E0C15]"></div>
+      <div class="absolute top-4.5 left-4.5 w-4 h-4 bg-[#14111E] flex items-center justify-center">
+        <div class="w-1.5 h-1.5 bg-[#312B43] rounded-full"></div>
       </div>
       <!-- Clickable D-pad quadrants -->
-      <div class="absolute top-0 left-5 w-4 h-5" id="dpad-up" title="Previous Command"></div>
-      <div class="absolute bottom-0 left-5 w-4 h-5" id="dpad-down" title="Next Command"></div>
-      <div class="absolute top-5 left-0 w-5 h-4" id="dpad-left" title="Prev Chip"></div>
-      <div class="absolute top-5 right-0 w-5 h-4" id="dpad-right" title="Next Chip"></div>
+      <div class="absolute top-0 left-4.5 w-4 h-5" id="dpad-up"></div>
+      <div class="absolute bottom-0 left-4.5 w-4 h-5" id="dpad-down"></div>
     </div>
 
-    <!-- Center Logo & Micro Vent Grille -->
+    <!-- Center Monogram -->
     <div class="flex flex-col items-center">
       <div class="flex gap-1 mb-1">
-        <div class="w-1 h-3 bg-[#171322] border-r border-[#4A4064] rounded-full"></div>
-        <div class="w-1 h-3 bg-[#171322] border-r border-[#4A4064] rounded-full"></div>
-        <div class="w-1 h-3 bg-[#171322] border-r border-[#4A4064] rounded-full"></div>
+        <div class="w-1 h-2.5 bg-[#1B1728] border-r border-[#4E4569] rounded-full"></div>
+        <div class="w-1 h-2.5 bg-[#1B1728] border-r border-[#4E4569] rounded-full"></div>
+        <div class="w-1 h-2.5 bg-[#1B1728] border-r border-[#4E4569] rounded-full"></div>
       </div>
-      <span class="font-numeral text-[7px] text-[#9A8DAF] tracking-widest uppercase">POCKET RUNTIME</span>
+      <span class="font-numeral text-[6.5px] text-[#A093BA] tracking-widest uppercase">GENTLE ENGINE</span>
     </div>
 
-    <!-- Jeweled A / B Action Buttons (Ruby Red & Teal Green) -->
-    <div class="flex items-center gap-3 transform -rotate-12">
+    <!-- Jeweled Pill Buttons -->
+    <div class="flex items-center gap-3.5 transform -rotate-6">
       <!-- B Button -->
       <div class="flex flex-col items-center">
-        <button class="w-8 h-8 rounded-full jewel-btn-ruby flex items-center justify-center font-numeral text-[10px] text-white font-bold cursor-pointer" id="btn-b" title="Button B (Undo / Cancel)">
+        <button class="w-8 h-8 rounded-full jewel-pill-b flex items-center justify-center font-numeral text-[9px] text-white font-bold cursor-pointer" id="btn-b" title="Undo / Step Back">
           B
         </button>
-        <span class="font-numeral text-[6px] text-[#A798C0] mt-1 font-bold">UNDO</span>
+        <span class="font-numeral text-[6px] text-[#B0A2C9] mt-1 font-bold">REVERT</span>
       </div>
       <!-- A Button -->
-      <div class="flex flex-col items-center -mt-3">
-        <button class="w-8 h-8 rounded-full jewel-btn-teal flex items-center justify-center font-numeral text-[10px] text-white font-bold cursor-pointer" id="btn-a" title="Button A (Log / Confirm)">
+      <div class="flex flex-col items-center -mt-2">
+        <button class="w-8 h-8 rounded-full jewel-pill-a flex items-center justify-center font-numeral text-[9px] text-white font-bold cursor-pointer" id="btn-a" title="Confirm / Log">
           A
         </button>
-        <span class="font-numeral text-[6px] text-[#A798C0] mt-1 font-bold">OK</span>
+        <span class="font-numeral text-[6px] text-[#B0A2C9] mt-1 font-bold">ENTER</span>
       </div>
     </div>
   </div>
+
 </div>
 
 <script src="/app.js"></script>
