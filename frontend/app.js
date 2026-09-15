@@ -100,9 +100,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const todayLoggedVal = document.getElementById('today-logged-val');
   const todayGaugeCells = document.getElementById('today-gauge-cells');
   const todayPctVal = document.getElementById('today-pct-val');
-  const headerSprite = document.getElementById('mochi-master-svg');
+  const headerSprite = document.getElementById('extreme-master-svg') || document.getElementById('mochi-master-svg');
   const pokeHeart = document.getElementById('poke-heart');
-  const mochiWrap = document.getElementById('mochi-poke-trigger');
+  const mochiWrap = document.getElementById('extreme-poke-trigger') || document.getElementById('mochi-poke-trigger');
   const btnA = document.getElementById('btn-a');
   const btnB = document.getElementById('btn-b');
   const soundIndicator = document.getElementById('sound-btn');
@@ -164,20 +164,20 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Mochi Avatar Poke Interaction
+  // Extreme Avatar Poke Interaction
   if (mochiWrap) {
     mochiWrap.addEventListener('click', () => {
       playPurr();
       if (headerSprite) {
-        headerSprite.classList.remove('mochi-idle');
-        headerSprite.classList.add('mochi-jump');
+        headerSprite.classList.remove('extreme-idle', 'mochi-idle');
+        headerSprite.classList.add('extreme-jump');
       }
       if (pokeHeart) pokeHeart.style.display = 'block';
       setTimeout(() => {
         if (pokeHeart) pokeHeart.style.display = 'none';
         if (headerSprite) {
-          headerSprite.classList.remove('mochi-jump');
-          headerSprite.classList.add('mochi-idle');
+          headerSprite.classList.remove('extreme-jump', 'mochi-jump');
+          headerSprite.classList.add('extreme-idle');
         }
       }, 1000);
     });
@@ -362,7 +362,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const messages = await res.json();
       if (!messages || !messages.length) return;
 
-      // Remove the default Mochi greeting so history replaces it cleanly
+      // Remove the default Extreme greeting so history replaces it cleanly
       const defaultGreeting = chatThread.querySelector('.msg-assistant');
       if (defaultGreeting) defaultGreeting.remove();
 
@@ -426,11 +426,11 @@ document.addEventListener('DOMContentLoaded', () => {
     chatThread.scrollTop = chatThread.scrollHeight;
 
     if (headerSprite) {
-      headerSprite.classList.remove('mochi-idle');
-      headerSprite.classList.add('mochi-jump');
+      headerSprite.classList.remove('extreme-idle', 'mochi-idle');
+      headerSprite.classList.add('extreme-jump');
       setTimeout(() => {
-        headerSprite.classList.remove('mochi-jump');
-        headerSprite.classList.add('mochi-idle');
+        headerSprite.classList.remove('extreme-jump', 'mochi-jump');
+        headerSprite.classList.add('extreme-idle');
       }, 700);
     }
 
@@ -530,7 +530,7 @@ document.addEventListener('DOMContentLoaded', () => {
       </div>
       <div class="bubble-sage">
         <div class="bubble-meta">
-          <span>MOCHI · MEADOW GUIDE</span>
+          <span>EXTREME · MEADOW GUIDE</span>
           <span>${timeStr}</span>
         </div>
         <div>${htmlContent}</div>

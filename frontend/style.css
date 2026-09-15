@@ -87,8 +87,8 @@ body {
   box-shadow: 0 0 8px #4ADE80;
 }
 
-/* Mochi avatar block */
-.mochi-card {
+/* Extreme avatar block */
+.extreme-card, .mochi-card {
   background: white;
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -100,9 +100,9 @@ body {
   transition: box-shadow 0.15s;
   position: relative;
 }
-.mochi-card:hover { box-shadow: var(--shadow-card); }
+.extreme-card:hover, .mochi-card:hover { box-shadow: var(--shadow-card); }
 
-.mochi-avatar {
+.extreme-avatar, .mochi-avatar {
   width: 44px; height: 44px;
   background: #F0FAF3;
   border: 1.5px solid var(--sage-border);
@@ -128,9 +128,9 @@ body {
   box-shadow: 0 2px 6px rgba(0,0,0,0.1);
 }
 
-.mochi-name { font-size: 15px; font-weight: 700; color: var(--ink); }
-.mochi-sub  { font-size: 11px; color: var(--ink-muted); margin-top: 2px; }
-.mochi-badge {
+.extreme-name, .mochi-name { font-size: 15px; font-weight: 700; color: var(--ink); }
+.extreme-sub, .mochi-sub  { font-size: 11px; color: var(--ink-muted); margin-top: 2px; }
+.extreme-badge, .mochi-badge {
   font-size: 9px;
   background: var(--sage-light);
   color: var(--sage-dark);
@@ -543,20 +543,20 @@ body {
   box-shadow: 0 3px 0 #144937;
 }
 
-/* ── Mochi animations (keep smooth) ── */
-@keyframes mochiBreathe {
+/* ── Extreme animations (keep smooth) ── */
+@keyframes extremeBreathe {
   0%, 100% { transform: translateY(0) scale(1); }
   50%       { transform: translateY(-2px) scale(1.02); }
 }
-.mochi-idle { animation: mochiBreathe 2.4s ease-in-out infinite; }
+.extreme-idle, .mochi-idle { animation: extremeBreathe 2.4s ease-in-out infinite; }
 
-@keyframes mochiBounceJoy {
+@keyframes extremeBounceJoy {
   0%   { transform: translateY(0) scale(1); }
   30%  { transform: translateY(-8px) scale(1.08, 0.93); }
   60%  { transform: translateY(0) scale(0.97, 1.03); }
   100% { transform: translateY(0) scale(1); }
 }
-.mochi-jump { animation: mochiBounceJoy 0.55s ease; }
+.extreme-jump, .mochi-jump { animation: extremeBounceJoy 0.55s ease; }
 
 @keyframes leafSway {
   0%, 100% { transform: rotate(-3deg); }
