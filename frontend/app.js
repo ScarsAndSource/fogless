@@ -258,7 +258,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function updateTodayPaceDisplay(newTodaySpent) {
     todaySpent = newTodaySpent;
-    if (todayLoggedVal) todayLoggedVal.textContent = `$${todaySpent.toFixed(2)}`;
+    if (todayLoggedVal) todayLoggedVal.textContent = todaySpent.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     const pct = Math.min(100, Math.round((todaySpent / todayLimit) * 100));
     if (todayPctVal) todayPctVal.textContent = `${pct}%`;
 
@@ -267,11 +267,9 @@ document.addEventListener('DOMContentLoaded', () => {
       todayGaugeCells.innerHTML = '';
       for (let i = 0; i < 6; i++) {
         const cell = document.createElement('div');
-        if (i < filledCells) {
-          cell.className = i >= 4 ? 'w-2.5 h-2 bg-[#E15554] border border-[#3E5C46]' : 'w-2.5 h-2 bg-[#5B8B67] border border-[#3E5C46]';
-        } else {
-          cell.className = 'w-2.5 h-2 bg-[#E1E8DE] border border-[#A7B9A9]';
-        }
+        cell.className = i < filledCells
+          ? (i >= 4 ? 'pace-cell warn' : 'pace-cell filled')
+          : 'pace-cell';
         todayGaugeCells.appendChild(cell);
       }
     }
@@ -313,28 +311,25 @@ document.addEventListener('DOMContentLoaded', () => {
 
   async function uploadVoiceRecording(blob) {
     const cassetteBubble = document.createElement('div');
-    cassetteBubble.className = 'flex justify-end';
+    cassetteBubble.className = 'msg-user';
     cassetteBubble.innerHTML = `
-      <div class="pixel-border-peach p-2 text-[#4E1B15] max-w-[85%] space-y-1">
-        <div class="flex items-center justify-between text-[8px] font-numeral text-[#8D382B]">
+      <div class="bubble-rose">
+        <div class="bubble-meta">
           <span>VOICE MEMO · CASSETTE ${String(Math.floor(Math.random()*90)+10)}</span>
           <span>JUST NOW</span>
         </div>
-        <div class="bg-[#F8ECE8] border-2 border-[#8D382B] p-2 flex items-center gap-3">
-          <button class="w-8 h-8 bg-[#8D382B] text-[#FFF4F0] flex items-center justify-center font-bold text-[12px] border-2 border-[#4E1B15] shadow-[1px_1px_0_0_#4E1B15] play-cassette-btn">
+        <div style="background:#FFF0ED;border:1px solid var(--rose-border);border-radius:8px;padding:8px 12px;display:flex;align-items:center;gap:12px;">
+          <button style="width:32px;height:32px;background:var(--rose-dark);color:white;border:none;border-radius:6px;display:flex;align-items:center;justify-content:center;cursor:pointer;" class="play-cassette-btn">
             ▶
           </button>
-          <div class="flex items-end gap-1.5 h-6 px-1 flex-1 bg-[#E8D4CE] border border-[#A65B4D] pt-1">
-            <div class="w-1.5 bg-[#8D382B] eq-bar-1"></div>
-            <div class="w-1.5 bg-[#8D382B] eq-bar-2"></div>
-            <div class="w-1.5 bg-[#8D382B] eq-bar-3"></div>
-            <div class="w-1.5 bg-[#8D382B] eq-bar-4"></div>
-            <div class="w-1.5 bg-[#8D382B] eq-bar-2"></div>
-            <div class="w-1.5 bg-[#8D382B] eq-bar-1"></div>
+          <div style="display:flex;align-items:flex-end;gap:4px;height:24px;flex:1;background:#FCE4DE;border-radius:4px;padding:4px 8px;">
+            <div style="width:4px;height:60%;background:var(--rose-dark);border-radius:2px;"></div>
+            <div style="width:4px;height:100%;background:var(--rose-dark);border-radius:2px;"></div>
+            <div style="width:4px;height:40%;background:var(--rose-dark);border-radius:2px;"></div>
+            <div style="width:4px;height:80%;background:var(--rose-dark);border-radius:2px;"></div>
+            <div style="width:4px;height:50%;background:var(--rose-dark);border-radius:2px;"></div>
           </div>
-          <div class="text-right">
-            <div class="font-numeral text-[9px] font-bold text-[#8D382B]">AUDIO</div>
-          </div>
+          <div style="font-family:'Press Start 2P',monospace;font-size:7px;color:var(--rose-dark);">AUDIO</div>
         </div>
       </div>
     `;
@@ -368,7 +363,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!messages || !messages.length) return;
 
       // Remove the default Mochi greeting so history replaces it cleanly
-      const defaultGreeting = chatThread.querySelector('.flex.items-start');
+      const defaultGreeting = chatThread.querySelector('.msg-assistant');
       if (defaultGreeting) defaultGreeting.remove();
 
       messages.forEach(msg => {
@@ -378,14 +373,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (msg.role === 'user') {
           const bubble = document.createElement('div');
-          bubble.className = 'flex justify-end';
+          bubble.className = 'msg-user';
           bubble.innerHTML = `
-            <div class="pixel-box-rose p-2.5 text-[#4E1B15] max-w-[82%]">
-              <div class="flex items-center justify-between border-b border-[#F7B6A4] pb-0.5 mb-1 gap-4">
-                <span class="font-numeral text-[8px] text-[#8D382B] uppercase font-bold">Hero</span>
-                <span class="font-numeral text-[7px] text-[#A8584B]">${ts}</span>
+            <div class="bubble-rose">
+              <div class="bubble-meta">
+                <span>HERO</span>
+                <span>${ts}</span>
               </div>
-              <p class="font-bold text-[15px]">${escapeHtml(msg.content)}</p>
+              <p style="font-weight:600">${escapeHtml(msg.content)}</p>
             </div>
           `;
           chatThread.appendChild(bubble);
@@ -417,14 +412,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
   async function executeCommandText(text) {
     const heroBubble = document.createElement('div');
-    heroBubble.className = 'flex justify-end';
+    heroBubble.className = 'msg-user';
     heroBubble.innerHTML = `
-      <div class="pixel-border-peach p-2.5 text-[#4E1B15] max-w-[82%]">
-        <div class="flex items-center justify-between border-b border-[#F7B6A4] pb-0.5 mb-1 gap-4">
-          <span class="font-numeral text-[8px] text-[#8D382B] uppercase font-bold">Hero</span>
-          <span class="font-numeral text-[7px] text-[#A8584B]">JUST NOW</span>
+      <div class="bubble-rose">
+        <div class="bubble-meta">
+          <span>HERO</span>
+          <span>JUST NOW</span>
         </div>
-        <p class="font-bold text-[15px]">${escapeHtml(text)}</p>
+        <p style="font-weight:600">${escapeHtml(text)}</p>
       </div>
     `;
     chatThread.appendChild(heroBubble);
@@ -477,48 +472,59 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function renderCompanionBubble(htmlContent, txId = null, category = null, paymentMethod = null) {
     const bubble = document.createElement('div');
-    bubble.className = 'flex items-start gap-2.5 max-w-[98%]';
+    bubble.className = 'msg-assistant';
     
     let inlineMenuHtml = '';
     if (txId) {
       inlineMenuHtml = `
-        <div class="pixel-window-jrpg p-2 text-[13px] space-y-1.5 mt-2">
-          <div class="flex items-center justify-between pixel-titleplate px-2 py-0.5 text-white">
-            <span class="font-numeral text-[8px] tracking-wider text-[#FCD34D]">COMMAND: EDIT RECORD</span>
-            <span class="font-numeral text-[7px] text-[#A5B4FC]">PRESS A</span>
+        <div style="background:#FAF8F3;border:1px solid var(--border);border-radius:6px;padding:8px;margin-top:8px;font-size:12px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;font-family:'Press Start 2P',monospace;font-size:6.5px;color:var(--sage);margin-bottom:6px;">
+            <span>COMMAND: EDIT RECORD</span>
+            <span style="color:var(--ink-muted);">PRESS A</span>
           </div>
-          <div class="flex flex-col gap-0.5 pt-0.5">
-            <button class="flex items-center text-left hover:bg-[#F3EEDD] px-1.5 py-0.5 text-[#1E1B29] group" onclick="window.changeCategory(${txId})">
-              <span class="text-[#E15554] font-bold mr-1.5 text-[12px] rpg-cursor-blink">▶</span>
-              <span>Category: <strong class="text-[#155E75]">${category || 'Dining'}</strong></span>
+          <div style="display:flex;flex-direction:column;gap:4px;">
+            <button style="display:flex;align-items:center;text-align:left;background:none;border:none;padding:3px 6px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:12px;color:var(--ink);" onclick="window.changeCategory(${txId})">
+              <span style="color:var(--sage);font-weight:bold;margin-right:6px;">▶</span>
+              <span>Category: <strong style="color:var(--sage-dark);">${category || 'Dining'}</strong></span>
             </button>
-            <button class="flex items-center text-left hover:bg-[#F3EEDD] px-1.5 py-0.5 text-[#1E1B29] group" onclick="window.changePayment(${txId})">
-              <span class="text-transparent group-hover:text-[#E15554] font-bold mr-1.5 text-[12px]">▶</span>
-              <span>Payment: <strong class="text-[#7C2D12]">${paymentMethod || 'UPI Wallet'}</strong></span>
+            <button style="display:flex;align-items:center;text-align:left;background:none;border:none;padding:3px 6px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:12px;color:var(--ink);" onclick="window.changePayment(${txId})">
+              <span style="color:var(--sage);font-weight:bold;margin-right:6px;">▶</span>
+              <span>Payment: <strong style="color:var(--rose-dark);">${paymentMethod || 'UPI Wallet'}</strong></span>
             </button>
-            <button class="flex items-center text-left hover:bg-[#FDE8E8] px-1.5 py-0.5 text-[#DC2626] group" onclick="window.undoTxId(${txId})">
-              <span class="text-transparent group-hover:text-[#DC2626] font-bold mr-1.5 text-[12px]">▶</span>
-              <span class="font-bold">Cast Undo (Reverse #${txId})</span>
+            <button style="display:flex;align-items:center;text-align:left;background:none;border:none;padding:3px 6px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:12px;color:#DC2626;" onclick="window.undoTxId(${txId})">
+              <span style="color:#DC2626;font-weight:bold;margin-right:6px;">▶</span>
+              <span style="font-weight:bold;">Cast Undo (Reverse #${txId})</span>
             </button>
           </div>
         </div>
       `;
     }
 
+    const now = new Date();
+    let h = now.getHours();
+    const mins = String(now.getMinutes()).padStart(2, '0');
+    const ampm = h >= 12 ? 'PM' : 'AM';
+    h = h % 12 || 12;
+    const timeStr = `${String(h).padStart(2, '0')}:${mins} ${ampm}`;
+
     bubble.innerHTML = `
-      <div class="shrink-0 w-8 h-8 bg-[#FFFCE8] border-2 border-[#345C3D] flex items-center justify-center shadow-[1px_1px_0_0_#345C3D]">
-        <svg class="w-6 h-6" viewBox="0 0 16 16" fill="none">
-          <rect x="7" y="1" width="2" height="2" fill="#1F4D25"/>
-          <rect x="4" y="4" width="8" height="8" fill="#8CE0A0"/>
-          <rect x="5" y="6" width="2" height="2" fill="#142B1A"/>
-          <rect x="9" y="6" width="2" height="2" fill="#142B1A"/>
-          <rect x="7" y="9" width="2" height="1" fill="#142B1A"/>
+      <div class="bubble-icon">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
+          <rect x="7" y="2"  width="2" height="2" fill="#F472B6"/>
+          <rect x="4" y="5"  width="2" height="2" fill="#F472B6"/>
+          <rect x="10" y="5" width="2" height="2" fill="#F472B6"/>
+          <rect x="7" y="8"  width="2" height="2" fill="#F472B6"/>
+          <rect x="7" y="5"  width="2" height="2" fill="#FBBF24"/>
+          <rect x="7" y="10" width="2" height="5" fill="#4ADE80"/>
+          <rect x="5" y="11" width="2" height="2" fill="#22C55E"/>
         </svg>
       </div>
-      <div class="flex-1 space-y-1">
-        <div class="pixel-border-sage p-2.5 text-[#142B1A]">
-          ${htmlContent}
+      <div class="bubble-sage">
+        <div class="bubble-meta">
+          <span>MOCHI · MEADOW GUIDE</span>
+          <span>${timeStr}</span>
         </div>
+        <div>${htmlContent}</div>
         ${inlineMenuHtml}
       </div>
     `;
@@ -539,7 +545,7 @@ document.addEventListener('DOMContentLoaded', () => {
       renderCompanionBubble(data.text || `⚔ SPELL: REVERT EXECUTED. Restored GP to the treasury purse.`);
     } catch(e) {
       updateBalanceDisplay(currentBalance + 60.00);
-      renderCompanionBubble(`⚔ SPELL: REVERT EXECUTED. Restored $60.00 GP back to the treasury purse.`);
+      renderCompanionBubble(`⚔ SPELL: REVERT EXECUTED. Restored ₹60.00 GP back to the treasury purse.`);
     }
   };
 
@@ -602,11 +608,11 @@ document.addEventListener('DOMContentLoaded', () => {
       renderCompanionBubble(data.html || data.text);
     } catch(e) {
       renderCompanionBubble(`
-        <div class="font-bold text-[13px] text-[#142B1A] flex justify-between mb-1">
+        <div style="font-weight:700;font-size:13px;color:var(--ink);display:flex;justify-content:space-between;margin-bottom:4px;">
           <span>⚔ Dungeon Expense Report</span>
-          <span class="font-numeral text-[9px] text-[#059669]">STATUS: ON TRACK</span>
+          <span style="font-family:'Press Start 2P',monospace;font-size:8px;color:#059669;">STATUS: ON TRACK</span>
         </div>
-        <p class="text-[12px] text-[#142B1A]">May pace is currently 22% under the safe ceiling. Remaining safe pouch: <strong>$558.00</strong>.</p>
+        <p style="font-size:13px;color:var(--ink);">Pace is currently 22% under the safe ceiling. Remaining safe pouch: <strong>₹558.00</strong>.</p>
       `);
     }
   }
@@ -621,7 +627,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const data = await res.json();
       renderCompanionBubble(data.html || data.text);
     } catch(e) {
-      renderCompanionBubble(`Treasury Total: $${currentBalance.toFixed(2)} GP.`);
+      renderCompanionBubble(`Treasury Total: ₹${currentBalance.toFixed(2)} GP.`);
     }
   }
 
@@ -644,7 +650,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const amt = matchNum ? parseFloat(matchNum[0]) : 20.00;
     updateBalanceDisplay(currentBalance - amt);
     updateTodayPaceDisplay(todaySpent + amt);
-    renderCompanionBubble(`Logged <strong class="font-numeral text-[12px]">$${amt.toFixed(2)}</strong>! Vault updated successfully.`, Math.floor(Math.random()*100)+1, 'dining', 'upi');
+    renderCompanionBubble(`Logged <strong style="font-weight:700;">₹${amt.toFixed(2)}</strong>! Vault updated successfully.`, Math.floor(Math.random()*100)+1, 'dining', 'upi');
   }
 
   function escapeHtml(str) {
