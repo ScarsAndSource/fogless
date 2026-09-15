@@ -595,3 +595,11 @@ body {
   #right-panel { display: none; }
   #chat-area { border-right: none; grid-row: 1 / -1; }
 }
+
+:root {
+  --font-main: 'Space Mono', monospace;
+}
+*, *::before, *::after {
+  font-family: var(--font-main) !important;
+}
+
