@@ -358,6 +358,49 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // Server Communication & Logic Execution
+
+  // Restore persisted chat history on page load
+  async function loadChatHistory() {
+    try {
+      const res = await fetch('/api/history?limit=50');
+      if (!res.ok) throw new Error(`history fetch failed: ${res.status}`);
+      const messages = await res.json();
+      if (!messages || !messages.length) return;
+
+      // Remove the default Mochi greeting so history replaces it cleanly
+      const defaultGreeting = chatThread.querySelector('.flex.items-start');
+      if (defaultGreeting) defaultGreeting.remove();
+
+      messages.forEach(msg => {
+        const ts = msg.created_at
+          ? new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          : '';
+
+        if (msg.role === 'user') {
+          const bubble = document.createElement('div');
+          bubble.className = 'flex justify-end';
+          bubble.innerHTML = `
+            <div class="pixel-box-rose p-2.5 text-[#4E1B15] max-w-[82%]">
+              <div class="flex items-center justify-between border-b border-[#F7B6A4] pb-0.5 mb-1 gap-4">
+                <span class="font-numeral text-[8px] text-[#8D382B] uppercase font-bold">Hero</span>
+                <span class="font-numeral text-[7px] text-[#A8584B]">${ts}</span>
+              </div>
+              <p class="font-bold text-[15px]">${escapeHtml(msg.content)}</p>
+            </div>
+          `;
+          chatThread.appendChild(bubble);
+        } else {
+          renderCompanionBubble(escapeHtml(msg.content));
+        }
+      });
+
+      chatThread.scrollTop = chatThread.scrollHeight;
+    } catch (err) {
+      console.error('Failed to load chat history:', err);
+    }
+  }
+  loadChatHistory();
+
   async function fetchInitialState() {
     try {
       const res = await fetch('/api/state');
