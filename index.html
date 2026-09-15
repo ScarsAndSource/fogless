@@ -1,0 +1,1129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Fogless — 16-bit JRPG Personal Finance Companion</title>
+<!-- Google Fonts: Pixelify Sans and Press Start 2P -->
+<link href="https://fonts.googleapis.com" rel="preconnect"/>
+<link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
+<link href="https://fonts.googleapis.com/css2?family=Pixelify+Sans:wght@400;600;700&amp;family=Press+Start+2P&amp;display=swap" rel="stylesheet"/>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<style>
+  /* 16-bit Crisp Pixel Art rendering */
+  * {
+    image-rendering: pixelated;
+    image-rendering: -moz-crisp-edges;
+    image-rendering: crisp-edges;
+    box-sizing: border-box;
+    user-select: none;
+    -webkit-font-smoothing: none;
+  }
+  
+  :root {
+    --chassis-indigo: #252033;
+    --chassis-highlight: #3D3554;
+    --bezel-dark: #161320;
+    --parchment-base: #F8F4EA;
+    --parchment-grid: #EFE8D8;
+    --sage-bg: #D4EED8;
+    --sage-border: #345C3D;
+    --sage-ink: #142B1A;
+    --peach-bg: #FFDFD3;
+    --peach-border: #8D382B;
+    --peach-ink: #4E1B15;
+    --gold-coin: #FBBF24;
+    --gold-coin-dark: #B45309;
+    --alert-crimson: #E15554;
+    --mana-cyan: #38BDF8;
+    --emerald-green: #22C55E;
+    --royal-navy: #1E293B;
+  }
+
+  body {
+    background-color: #120F1A;
+    background-image: 
+      radial-gradient(#261F38 15%, transparent 16%), 
+      radial-gradient(#1E182D 15%, transparent 16%);
+    background-size: 20px 20px;
+    background-position: 0 0, 10px 10px;
+    font-family: 'Pixelify Sans', monospace, sans-serif;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    overflow: hidden;
+  }
+
+  .font-numeral {
+    font-family: 'Press Start 2P', monospace;
+  }
+
+  /* GBA SP / SNES Style Stepped Pixel Borders */
+  .pixel-border-sage {
+    background: var(--sage-bg);
+    box-shadow: 
+      0 -3px 0 0 var(--sage-border),
+      0 3px 0 0 var(--sage-border),
+      -3px 0 0 0 var(--sage-border),
+      3px 0 0 0 var(--sage-border),
+      inset -2px -2px 0 0 #B2DFB9,
+      inset 2px 2px 0 0 #FFFFFF;
+  }
+
+  .pixel-border-peach {
+    background: var(--peach-bg);
+    box-shadow: 
+      0 -3px 0 0 var(--peach-border),
+      0 3px 0 0 var(--peach-border),
+      -3px 0 0 0 var(--peach-border),
+      3px 0 0 0 var(--peach-border),
+      inset -2px -2px 0 0 #F8B4A2,
+      inset 2px 2px 0 0 #FFF0EB;
+  }
+
+  /* Golden Sun / EarthBound Dialogue & Status Windows */
+  .pixel-window-jrpg {
+    background: #FFFDF8;
+    border: 3px solid #2B2638;
+    box-shadow: 
+      inset 2px 2px 0 0 #FFFFFF, 
+      inset -2px -2px 0 0 #C9BFAC,
+      3px 3px 0 0 rgba(0,0,0,0.15);
+  }
+
+  .pixel-titleplate {
+    background: linear-gradient(180deg, #3A3250 0%, #252033 100%);
+    box-shadow: 0 2px 0 0 #181422;
+  }
+
+  /* 16-Bit Handheld Bevel & Texture */
+  .handheld-shell {
+    width: 460px;
+    height: 940px;
+    max-height: 98vh;
+    background: linear-gradient(170deg, #37304B 0%, #262136 60%, #1D1829 100%);
+    padding: 14px 14px 18px 14px;
+    border-radius: 20px 20px 28px 28px;
+    box-shadow: 
+      0 25px 60px rgba(0,0,0,0.85),
+      inset 0 2px 0 #5E537F,
+      inset 0 -5px 0 #120E1C,
+      inset 4px 0 0 #433B5C,
+      inset -4px 0 0 #1A1525;
+    position: relative;
+    border: 3px solid #161220;
+  }
+
+  .screen-glass {
+    background: #0E0C13;
+    padding: 10px;
+    border-radius: 12px 12px 18px 18px;
+    box-shadow: 
+      inset 0 4px 8px rgba(0,0,0,0.9),
+      0 2px 0 #4C4368;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* Scanline Overlay (Game Boy Advance / CRT feel) */
+  .scanlines::after {
+    content: " ";
+    display: block;
+    position: absolute;
+    top: 0; left: 0; bottom: 0; right: 0;
+    background: linear-gradient(rgba(18, 16, 26, 0) 50%, rgba(0, 0, 0, 0.12) 50%);
+    background-size: 100% 4px;
+    z-index: 40;
+    pointer-events: none;
+    opacity: 0.65;
+  }
+
+  /* Background warm parchment grid */
+  .parchment-grid-bg {
+    background-color: #F7F3E9;
+    background-image: 
+      linear-gradient(#EDE6D3 1px, transparent 1px),
+      linear-gradient(90deg, #EDE6D3 1px, transparent 1px);
+    background-size: 8px 8px;
+  }
+
+  /* Stepped JRPG HP/EXP Gauge */
+  .pixel-hp-bar {
+    display: flex;
+    gap: 2px;
+    background: #252033;
+    padding: 2px;
+    border: 2px solid #252033;
+  }
+  .pixel-hp-bar .meter-cell {
+    height: 9px;
+    flex: 1;
+  }
+
+  /* Character Sprite Animation Keyframes */
+  @keyframes mochiBob {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-3px); }
+  }
+  .mochi-bounce {
+    animation: mochiBob 1.1s steps(2) infinite;
+  }
+
+  @keyframes mochiHappy {
+    0% { transform: translateY(0) scale(1, 1); }
+    30% { transform: translateY(-6px) scale(1.05, 0.95); }
+    60% { transform: translateY(0) scale(0.95, 1.05); }
+    100% { transform: translateY(0) scale(1, 1); }
+  }
+  .mochi-cheer {
+    animation: mochiHappy 0.45s steps(3);
+  }
+
+  @keyframes earWiggle {
+    0%, 100% { transform: rotate(0deg); }
+    50% { transform: rotate(8deg); }
+  }
+  .leaf-wag {
+    animation: earWiggle 0.8s steps(2) infinite;
+    transform-origin: bottom center;
+  }
+
+  /* Blinking RPG hand/triangle cursor */
+  @keyframes rpgBlink {
+    0%, 49% { opacity: 1; transform: translateX(0); }
+    50%, 100% { opacity: 0.3; transform: translateX(2px); }
+  }
+  .rpg-cursor-blink {
+    animation: rpgBlink 0.65s steps(2) infinite;
+  }
+
+  @keyframes coinSpin {
+    0% { transform: scaleX(1); }
+    50% { transform: scaleX(0.15); }
+    100% { transform: scaleX(1); }
+  }
+  .coin-shimmer {
+    animation: coinSpin 2.4s steps(4) infinite;
+    display: inline-block;
+  }
+
+  /* Floating Pop-up Text */
+  @keyframes floatUp {
+    0% { opacity: 0; transform: translateY(6px); }
+    25% { opacity: 1; transform: translateY(-2px); }
+    75% { opacity: 1; transform: translateY(-8px); }
+    100% { opacity: 0; transform: translateY(-16px); }
+  }
+  .float-loot {
+    animation: floatUp 1.4s steps(4) forwards;
+  }
+
+  /* Cassette/Audio Equalizer Waveform */
+  @keyframes barEqualizer {
+    0%, 100% { height: 4px; }
+    50% { height: 16px; }
+  }
+  .eq-bar-1 { animation: barEqualizer 0.4s steps(3) infinite alternate; }
+  .eq-bar-2 { animation: barEqualizer 0.55s steps(3) 0.1s infinite alternate; }
+  .eq-bar-3 { animation: barEqualizer 0.35s steps(3) 0.2s infinite alternate; }
+  .eq-bar-4 { animation: barEqualizer 0.6s steps(3) 0.15s infinite alternate; }
+
+  /* GBA Jeweled Buttons */
+  .jewel-btn-ruby {
+    background: radial-gradient(circle at 35% 30%, #FF6565, #C72626);
+    border: 3px solid #140F1D;
+    box-shadow: inset 1px 1px 0 #FFA6A6, inset -2px -2px 0 #7A0D0D, 0 4px 0 #130E1B;
+  }
+  .jewel-btn-ruby:active {
+    transform: translateY(2px);
+    box-shadow: inset 1px 1px 0 #FFA6A6, inset -1px -1px 0 #7A0D0D, 0 2px 0 #130E1B;
+  }
+
+  .jewel-btn-teal {
+    background: radial-gradient(circle at 35% 30%, #2DD4BF, #0F766E);
+    border: 3px solid #140F1D;
+    box-shadow: inset 1px 1px 0 #99F6E4, inset -2px -2px 0 #094742, 0 4px 0 #130E1B;
+  }
+  .jewel-btn-teal:active {
+    transform: translateY(2px);
+    box-shadow: inset 1px 1px 0 #99F6E4, inset -1px -1px 0 #094742, 0 2px 0 #130E1B;
+  }
+
+  /* Custom 16-bit scrollbar */
+  ::-webkit-scrollbar {
+    width: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #E5DFC9;
+    border-left: 2px solid #8F826E;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #3D3554;
+    border: 1px solid #E5DFC9;
+  }
+
+  .popover-heart {
+    position: absolute;
+    top: -22px;
+    left: 18px;
+    background: #FFE2E2;
+    border: 2px solid #E15554;
+    padding: 1px 5px;
+    font-size: 10px;
+    color: #991B1B;
+    pointer-events: none;
+    display: none;
+    z-index: 50;
+  }
+
+  .recording-pulse {
+    animation: pulseRed 1s infinite alternate;
+  }
+  @keyframes pulseRed {
+    0% { background-color: #E15554; color: white; }
+    100% { background-color: #991B1B; color: #FECACA; }
+  }
+</style>
+</head>
+<body>
+<!-- Handheld Console Housing -->
+<div class="handheld-shell flex flex-col justify-between">
+  <!-- Top Handheld Trim & Stereo Dots -->
+  <div class="flex justify-between items-center px-3 mb-1.5 shrink-0">
+    <div class="flex items-center gap-2">
+      <div class="w-2.5 h-2.5 rounded-full bg-[#10B981] shadow-[0_0_6px_#10B981] border border-[#064E3B]" title="Power ON"></div>
+      <span class="font-numeral text-[8px] text-[#A599BE] tracking-widest uppercase">FOGLESS SP · 16-BIT</span>
+    </div>
+    <!-- Retro Speaker Vent Grille -->
+    <div class="flex items-center gap-1.5">
+      <div class="flex gap-1">
+        <div class="w-1.5 h-1.5 bg-[#171322] border-b border-[#4F446C] rounded-sm"></div>
+        <div class="w-1.5 h-1.5 bg-[#171322] border-b border-[#4F446C] rounded-sm"></div>
+        <div class="w-1.5 h-1.5 bg-[#171322] border-b border-[#4F446C] rounded-sm"></div>
+        <div class="w-1.5 h-1.5 bg-[#171322] border-b border-[#4F446C] rounded-sm"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screen Bezel & Screen Assembly -->
+  <div class="screen-glass scanlines">
+    <!-- Top RPG Info Strip: Clock, Sound, Battery Status -->
+    <div class="bg-[#241F33] text-[#B8ADC9] px-2.5 py-1 flex items-center justify-between border-b-2 border-[#151221] shrink-0 font-numeral text-[8px]">
+      <div class="flex items-center gap-2">
+        <span class="text-[#FBBF24]">★ QUEST: MAY BUDGET</span>
+        <span class="text-[#7A6D96]">|</span>
+        <span class="text-[#E2D9F3]" id="retro-clock">14:24</span>
+      </div>
+      <div class="flex items-center gap-2">
+        <!-- Audio Beeper Toggle Indicator -->
+        <span class="cursor-pointer text-[#34D399] select-none" id="sound-indicator" title="Toggle Sound SFX">♪ BEEP</span>
+        <!-- Battery Meter -->
+        <div class="flex items-center gap-0.5" title="Battery 80%">
+          <div class="w-4 h-2 border border-[#8B7CA8] p-0.5 flex gap-0.5">
+            <div class="w-1 h-full bg-[#34D399]"></div>
+            <div class="w-1 h-full bg-[#34D399]"></div>
+          </div>
+          <div class="w-0.5 h-1 bg-[#8B7CA8]"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main Companion & Net GP Bar -->
+    <header class="bg-[#EBE2CF] border-b-4 border-[#3D3554] p-2.5 flex items-center justify-between shrink-0 shadow-sm relative z-20">
+      <!-- Companion Sprite & XP Profile -->
+      <div class="flex items-center gap-2.5 cursor-pointer group" id="mochi-avatar-wrap" title="Click Mochi to poke!">
+        <!-- 36x36 Pixel Art Companion: Mochi The Finance Familiar -->
+        <div class="relative w-10 h-10 bg-[#FFFCE8] border-2 border-[#2B2638] shadow-[2px_2px_0_0_#9E927C] flex items-center justify-center overflow-visible">
+          <!-- Floating Poke Feedback Heart -->
+          <div class="popover-heart font-bold" id="poke-heart">♥ *PURR!*</div>
+          <!-- Mochi SVG Pixel Sprite -->
+          <svg class="w-8 h-8 mochi-bounce pixel-art" fill="none" id="mochi-header-sprite" viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg">
+            <!-- Leaf Sprout on top with wobble -->
+            <g class="leaf-wag">
+              <rect fill="#1F4D25" height="3" width="2" x="8" y="0"></rect>
+              <rect fill="#4ADE80" height="1" width="3" x="10" y="1"></rect>
+              <rect fill="#22C55E" height="1" width="3" x="9" y="2"></rect>
+            </g>
+            <!-- Wizard Sprout Bell -->
+            <rect fill="#FBBF24" height="1" width="2" x="8" y="3"></rect>
+            <!-- Mochi Dumpling Body (Mint Frosting slime) -->
+            <rect fill="#264E2E" height="1" width="8" x="5" y="4"></rect>
+            <rect fill="#8CE0A0" height="8" width="10" x="4" y="5"></rect>
+            <rect fill="#264E2E" height="6" width="1" x="3" y="6"></rect>
+            <rect fill="#264E2E" height="6" width="1" x="14" y="6"></rect>
+            <rect fill="#264E2E" height="1" width="10" x="4" y="13"></rect>
+            <!-- Highlights -->
+            <rect fill="#E4FCEB" height="2" width="2" x="5" y="5"></rect>
+            <rect fill="#BAF7CB" height="1" width="4" x="7" y="5"></rect>
+            <!-- Rosy Cheeks -->
+            <rect fill="#F472B6" height="2" width="2" x="4" y="9"></rect>
+            <rect fill="#F472B6" height="2" width="2" x="12" y="9"></rect>
+            <!-- Big Shiny Anime Pixel Eyes -->
+            <rect fill="#142B1A" height="3" width="2" x="6" y="7"></rect>
+            <rect fill="#142B1A" height="3" width="2" x="10" y="7"></rect>
+            <rect fill="#FFFFFF" height="1" width="1" x="6" y="7"></rect>
+            <rect fill="#FFFFFF" height="1" width="1" x="10" y="7"></rect>
+            <!-- Tiny smile -->
+            <rect fill="#142B1A" height="1" width="2" x="8" y="10"></rect>
+            <!-- Little Feet -->
+            <rect fill="#1A3820" height="1" width="2" x="5" y="14"></rect>
+            <rect fill="#1A3820" height="1" width="2" x="11" y="14"></rect>
+          </svg>
+          <!-- Level Tag Badge -->
+          <div class="absolute -top-1.5 -right-2 bg-[#FBBF24] border border-[#2B2638] px-1 font-numeral text-[6px] font-bold text-[#3B2900]" id="mochi-level-tag">
+            LV.4
+          </div>
+        </div>
+        <!-- Mochi Nameplate & EXP Bar -->
+        <div>
+          <div class="flex items-center gap-1.5">
+            <span class="font-bold text-[14px] text-[#252033] tracking-wide">MOCHI</span>
+            <span class="text-[9px] bg-[#34D399] text-[#064E3B] font-bold px-1 py-0.2 border border-[#064E3B]" id="mochi-status-badge">HAPPY</span>
+          </div>
+          <!-- Mini EXP Bar -->
+          <div class="flex items-center gap-1.5 mt-0.5">
+            <span class="font-numeral text-[7px] text-[#6C5E48]">EXP</span>
+            <div class="w-16 h-2 bg-[#D1C7B2] border border-[#2B2638] p-0.5 flex">
+              <div class="h-full bg-[#10B981] w-[75%]" id="mochi-exp-bar"></div>
+            </div>
+            <span class="font-numeral text-[6px] text-[#554A36]" id="mochi-exp-val">340/400</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Gold (GP) Balance Box: Styled like a JRPG Guild Vault -->
+      <div class="bg-[#FFFCE8] border-2 border-[#3D3554] shadow-[2px_2px_0_0_#9E927C] px-2.5 py-1 text-right min-w-[140px] flex flex-col justify-center">
+        <div class="flex items-center justify-between gap-1 text-[8px] font-bold text-[#8C7A59]">
+          <span class="flex items-center gap-1">
+            <span class="coin-shimmer text-[#F59E0B]">🪙</span> NET GOLD
+          </span>
+          <span class="text-[#059669] font-numeral text-[7px]" id="header-balance-pct">+12.4%</span>
+        </div>
+        <div class="font-numeral text-[13px] text-[#1E1B29] tracking-tight flex items-center justify-end overflow-hidden h-5 mt-0.5">
+          <span class="text-[#8C7A59] mr-1 text-[11px]">$</span>
+          <span class="font-bold text-[#14291B]" id="header-balance-val">2,418.50</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Subheader: Daily Quest Pace Meter -->
+    <div class="bg-[#DFD5BF] border-b-2 border-[#3D3554] px-3 py-1 flex items-center justify-between text-[11px] text-[#4A4031]">
+      <div class="flex items-center gap-1.5 font-bold">
+        <span class="text-[#E15554]">⚔ TODAY:</span>
+        <span id="today-logged-val">$60.00 logged</span>
+      </div>
+      <!-- Segmented 8-block budget gauge -->
+      <div class="flex items-center gap-1">
+        <span class="font-numeral text-[7px] text-[#7A6C53]">LIMIT:</span>
+        <div class="flex gap-0.5" id="today-gauge-cells">
+          <div class="w-2 h-2.5 bg-[#E15554] border border-[#2B2638]"></div>
+          <div class="w-2 h-2.5 bg-[#E15554] border border-[#2B2638]"></div>
+          <div class="w-2 h-2.5 bg-[#E15554] border border-[#2B2638]"></div>
+          <div class="w-2 h-2.5 bg-[#E15554] border border-[#2B2638]"></div>
+          <div class="w-2 h-2.5 bg-[#E5E7EB] border border-[#2B2638]"></div>
+          <div class="w-2 h-2.5 bg-[#E5E7EB] border border-[#2B2638]"></div>
+          <div class="w-2 h-2.5 bg-[#E5E7EB] border border-[#2B2638]"></div>
+          <div class="w-2 h-2.5 bg-[#E5E7EB] border border-[#2B2638]"></div>
+        </div>
+        <span class="font-numeral text-[8px] text-[#2B2638] font-bold ml-1">$120</span>
+      </div>
+    </div>
+
+    <!-- Dialogue Thread Viewport -->
+    <main class="flex-1 overflow-y-auto p-3 parchment-grid-bg space-y-4 text-[15px] leading-snug" id="chat-thread">
+      <!-- 1. JRPG Opening / Quest Greeting -->
+      <div class="flex items-start gap-2.5 max-w-[94%]">
+        <div class="shrink-0 w-8 h-8 bg-[#FFFCE8] border-2 border-[#345C3D] flex items-center justify-center shadow-[1px_1px_0_0_#345C3D]">
+          <svg class="w-6 h-6" fill="none" viewBox="0 0 16 16">
+            <rect fill="#1F4D25" height="2" width="2" x="7" y="1"></rect>
+            <rect fill="#8CE0A0" height="8" width="8" x="4" y="4"></rect>
+            <rect fill="#142B1A" height="1" width="2" x="5" y="7"></rect>
+            <rect fill="#142B1A" height="1" width="2" x="9" y="7"></rect>
+            <rect fill="#6B7280" height="1" width="2" x="12" y="2"></rect>
+            <rect fill="#6B7280" height="1" width="1" x="13" y="3"></rect>
+            <rect fill="#6B7280" height="1" width="2" x="12" y="4"></rect>
+          </svg>
+        </div>
+        <div class="pixel-border-sage p-2.5 text-[#142B1A] flex-1">
+          <div class="flex items-center justify-between border-b border-[#A6DCB1] pb-1 mb-1">
+            <span class="font-numeral text-[8px] text-[#24522E] uppercase font-bold">Mochi · Companion</span>
+            <span class="font-numeral text-[7px] text-[#4F7D59]" id="greeting-time">09:12 AM</span>
+          </div>
+          <p>Good morning, Adventurer! Mana is full. Tell me what you spent, or summon battle commands with <span class="bg-[#2B5433] text-[#E8F8EC] px-1 font-mono text-[13px] font-bold">/</span>.</p>
+        </div>
+      </div>
+    </main>
+
+    <!-- Bottom Interactive Command Deck & Terminal -->
+    <footer class="bg-[#E6DEC9] border-t-4 border-[#3D3554] relative z-30 shrink-0 shadow-lg">
+      <!-- Command Directory Bar with 13 Functional Clickable Chips -->
+      <div class="border-b-2 border-[#BDB198] p-2 bg-[#F2EBDA]" id="cmd-tray">
+        <div class="flex justify-between items-center mb-1.5 px-0.5">
+          <span class="font-numeral text-[8px] text-[#55493A] tracking-wider flex items-center gap-1">
+            <span class="text-[#D97706]">▶</span> COMMAND DIRECTORY (13)
+          </span>
+          <span class="font-numeral text-[7px] bg-[#3D3554] text-[#E0D8EE] px-1.5 py-0.5">TAP TO CAST</span>
+        </div>
+        <!-- 13 Pixel-Font Chips -->
+        <div class="flex flex-wrap gap-1.5 max-h-20 overflow-y-auto pr-1">
+          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/add</button>
+          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/income</button>
+          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/balance</button>
+          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/stats</button>
+          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/history</button>
+          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/undo</button>
+          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/delete</button>
+          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/alias</button>
+          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/aliases</button>
+          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/export</button>
+          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/backup</button>
+          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/setbalance</button>
+          <button class="cmd-chip font-numeral text-[8px] px-2 py-1 bg-[#FFFCE8] text-[#1E1B29] border-2 border-[#2B2638] shadow-[1px_1px_0_0_#2B2638] hover:bg-[#34D399] active:translate-y-0.5">/reset</button>
+        </div>
+      </div>
+
+      <!-- Terminal-Style Input Bar -->
+      <div class="p-2 flex items-center gap-2 bg-[#E2D8C0]">
+        <!-- Microphone Voice Recording Button -->
+        <button class="bg-[#F59E0B] hover:bg-[#D97706] text-[#451A03] border-2 border-[#78350F] shadow-[1px_1px_0_0_#2B2638] active:translate-y-0.5 px-2 py-1.5 font-numeral text-[9px] font-bold flex items-center justify-center shrink-0" id="mic-btn" title="Hold/Click to record voice note">
+          🎙 REC
+        </button>
+
+        <!-- Input Inset Frame -->
+        <div class="flex-1 bg-[#FFFDF7] border-2 border-[#3D3554] shadow-inner px-2 py-1.5 flex items-center gap-2">
+          <span class="text-[#E15554] font-bold text-[16px] leading-none select-none">▶</span>
+          <input class="w-full bg-transparent outline-none font-bold text-[#142B1A] placeholder:text-[#A0947E] text-[15px]" id="terminal-input" placeholder="e.g. 60 lunch upi or /balance" type="text"/>
+          <!-- Blinking Pixel Block Cursor -->
+          <div class="w-2 h-4 bg-[#142B1A] shrink-0 rpg-cursor-blink"></div>
+        </div>
+
+        <!-- 16-Bit Action Button -->
+        <button class="bg-[#10B981] hover:bg-[#059669] text-[#FFFCE8] border-2 border-[#134E35] shadow-[2px_2px_0_0_#1E1B29] active:translate-x-0.5 active:translate-y-0.5 active:shadow-none px-3.5 py-1.5 font-bold text-[14px] flex items-center gap-1" id="send-btn">
+          <span>CAST</span>
+        </button>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Handheld Controller Lower Bezel with Tactile D-Pad & Jeweled Buttons -->
+  <div class="mt-2.5 flex justify-between items-center px-4 py-1">
+    <!-- Directional Cross D-Pad -->
+    <div class="relative w-14 h-14 cursor-pointer" id="d-pad" title="D-Pad: Up/Down for History, Left/Right for Commands">
+      <div class="absolute top-0 left-5 w-4 h-14 bg-[#1C1728] border-2 border-[#453C5E] rounded-sm shadow-[0_2px_0_#0C0913]"></div>
+      <div class="absolute top-5 left-0 w-14 h-4 bg-[#1C1728] border-2 border-[#453C5E] rounded-sm shadow-[0_2px_0_#0C0913]"></div>
+      <div class="absolute top-5 left-5 w-4 h-4 bg-[#130F1C] flex items-center justify-center">
+        <div class="w-1.5 h-1.5 bg-[#2A233C] rounded-full"></div>
+      </div>
+      <!-- Clickable D-pad quadrants -->
+      <div class="absolute top-0 left-5 w-4 h-5" id="dpad-up" title="Previous Command"></div>
+      <div class="absolute bottom-0 left-5 w-4 h-5" id="dpad-down" title="Next Command"></div>
+      <div class="absolute top-5 left-0 w-5 h-4" id="dpad-left" title="Prev Chip"></div>
+      <div class="absolute top-5 right-0 w-5 h-4" id="dpad-right" title="Next Chip"></div>
+    </div>
+
+    <!-- Center Logo & Micro Vent Grille -->
+    <div class="flex flex-col items-center">
+      <div class="flex gap-1 mb-1">
+        <div class="w-1 h-3 bg-[#171322] border-r border-[#4A4064] rounded-full"></div>
+        <div class="w-1 h-3 bg-[#171322] border-r border-[#4A4064] rounded-full"></div>
+        <div class="w-1 h-3 bg-[#171322] border-r border-[#4A4064] rounded-full"></div>
+      </div>
+      <span class="font-numeral text-[7px] text-[#9A8DAF] tracking-widest uppercase">POCKET RUNTIME</span>
+    </div>
+
+    <!-- Jeweled A / B Action Buttons (Ruby Red & Teal Green) -->
+    <div class="flex items-center gap-3 transform -rotate-12">
+      <!-- B Button -->
+      <div class="flex flex-col items-center">
+        <button class="w-8 h-8 rounded-full jewel-btn-ruby flex items-center justify-center font-numeral text-[10px] text-white font-bold cursor-pointer" id="btn-b" title="Button B (Undo / Cancel)">
+          B
+        </button>
+        <span class="font-numeral text-[6px] text-[#A798C0] mt-1 font-bold">UNDO</span>
+      </div>
+      <!-- A Button -->
+      <div class="flex flex-col items-center -mt-3">
+        <button class="w-8 h-8 rounded-full jewel-btn-teal flex items-center justify-center font-numeral text-[10px] text-white font-bold cursor-pointer" id="btn-a" title="Button A (Log / Confirm)">
+          A
+        </button>
+        <span class="font-numeral text-[6px] text-[#A798C0] mt-1 font-bold">OK</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Interactive JavaScript -->
+<script>
+  // Web Audio 8-bit Synthesizer for Retro Sound Effects
+  let audioCtx = null;
+  let soundEnabled = true;
+
+  function getAudioCtx() {
+    if (!audioCtx) {
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      if (AudioContext) audioCtx = new AudioContext();
+    }
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume();
+    }
+    return audioCtx;
+  }
+
+  function playBeep(freq = 440, type = 'square', duration = 0.08) {
+    if (!soundEnabled) return;
+    try {
+      const ctx = getAudioCtx();
+      if (!ctx) return;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, ctx.currentTime);
+      gain.gain.setValueAtTime(0.12, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + duration);
+    } catch(e) {}
+  }
+
+  function playCoin() {
+    if (!soundEnabled) return;
+    try {
+      const ctx = getAudioCtx();
+      if (!ctx) return;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'square';
+      osc.frequency.setValueAtTime(987.77, ctx.currentTime); // B5
+      osc.frequency.setValueAtTime(1318.51, ctx.currentTime + 0.08); // E6
+      gain.gain.setValueAtTime(0.15, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.3);
+    } catch(e) {}
+  }
+
+  function playPurr() {
+    if (!soundEnabled) return;
+    try {
+      const ctx = getAudioCtx();
+      if (!ctx) return;
+      [523.25, 659.25, 783.99, 1046.50].forEach((freq, idx) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(freq, ctx.currentTime + idx * 0.05);
+        gain.gain.setValueAtTime(0.12, ctx.currentTime + idx * 0.05);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + idx * 0.05 + 0.1);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(ctx.currentTime + idx * 0.05);
+        osc.stop(ctx.currentTime + idx * 0.05 + 0.1);
+      });
+    } catch(e) {}
+  }
+
+  function playUndo() {
+    if (!soundEnabled) return;
+    try {
+      const ctx = getAudioCtx();
+      if (!ctx) return;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(400, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(150, ctx.currentTime + 0.2);
+      gain.gain.setValueAtTime(0.15, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.2);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+      osc.stop(ctx.currentTime + 0.2);
+    } catch(e) {}
+  }
+
+  // DOM Elements
+  const input = document.getElementById('terminal-input');
+  const sendBtn = document.getElementById('send-btn');
+  const micBtn = document.getElementById('mic-btn');
+  const chatThread = document.getElementById('chat-thread');
+  const balanceVal = document.getElementById('header-balance-val');
+  const balancePct = document.getElementById('header-balance-pct');
+  const todayLoggedVal = document.getElementById('today-logged-val');
+  const todayGaugeCells = document.getElementById('today-gauge-cells');
+  const headerSprite = document.getElementById('mochi-header-sprite');
+  const pokeHeart = document.getElementById('poke-heart');
+  const mochiWrap = document.getElementById('mochi-avatar-wrap');
+  const btnA = document.getElementById('btn-a');
+  const btnB = document.getElementById('btn-b');
+  const soundIndicator = document.getElementById('sound-indicator');
+  const retroClock = document.getElementById('retro-clock');
+  const greetingTime = document.getElementById('greeting-time');
+
+  let currentBalance = 2418.50;
+  let todaySpent = 60.00;
+  const todayLimit = 120.00;
+  let commandHistory = [];
+  let historyIdx = -1;
+  let mediaRecorder = null;
+  let audioChunks = [];
+  let isRecording = false;
+
+  // Real Clock updating
+  function updateClock() {
+    const now = new Date();
+    const hrs = String(now.getHours()).padStart(2, '0');
+    const mins = String(now.getMinutes()).padStart(2, '0');
+    const timeStr = `${hrs}:${mins}`;
+    retroClock.textContent = timeStr;
+    if (greetingTime) greetingTime.textContent = timeStr + (now.getHours() >= 12 ? ' PM' : ' AM');
+  }
+  updateClock();
+  setInterval(updateClock, 10000);
+
+  // Sound Toggle
+  soundIndicator.addEventListener('click', () => {
+    soundEnabled = !soundEnabled;
+    if (soundEnabled) {
+      soundIndicator.textContent = '♪ BEEP';
+      soundIndicator.className = 'cursor-pointer text-[#34D399] select-none';
+      playBeep(880);
+    } else {
+      soundIndicator.textContent = '✕ MUTE';
+      soundIndicator.className = 'cursor-pointer text-[#EF4444] select-none';
+    }
+  });
+
+  // Mochi Avatar Poke Interaction
+  mochiWrap.addEventListener('click', () => {
+    playPurr();
+    headerSprite.classList.remove('mochi-bounce');
+    headerSprite.classList.add('mochi-cheer');
+    pokeHeart.style.display = 'block';
+    setTimeout(() => {
+      pokeHeart.style.display = 'none';
+      headerSprite.classList.remove('mochi-cheer');
+      headerSprite.classList.add('mochi-bounce');
+    }, 1200);
+  });
+
+  // Handheld A button
+  btnA.addEventListener('click', () => {
+    playBeep(600);
+    executeLog();
+  });
+
+  // Handheld B button (Undo)
+  btnB.addEventListener('click', () => {
+    playUndo();
+    handleQuickUndo();
+  });
+
+  // D-Pad navigation
+  document.getElementById('dpad-up').addEventListener('click', () => {
+    if (commandHistory.length > 0) {
+      playBeep(350);
+      if (historyIdx < commandHistory.length - 1) historyIdx++;
+      input.value = commandHistory[commandHistory.length - 1 - historyIdx];
+    }
+  });
+  document.getElementById('dpad-down').addEventListener('click', () => {
+    if (historyIdx > 0) {
+      playBeep(350);
+      historyIdx--;
+      input.value = commandHistory[commandHistory.length - 1 - historyIdx];
+    } else if (historyIdx === 0) {
+      historyIdx = -1;
+      input.value = '';
+    }
+  });
+
+  // Command directory chips
+  document.querySelectorAll('.cmd-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      playBeep(520);
+      const cmd = chip.textContent.trim();
+      if (cmd === '/stats') {
+        fetchAndDisplayStats();
+      } else if (cmd === '/balance') {
+        fetchAndDisplayBalance();
+      } else if (cmd === '/history') {
+        fetchAndDisplayHistory();
+      } else if (cmd === '/undo') {
+        handleQuickUndo();
+      } else if (cmd === '/aliases') {
+        executeCommandText('/aliases');
+      } else if (cmd === '/export') {
+        window.location.href = '/api/export';
+      } else if (cmd === '/backup') {
+        window.location.href = '/api/backup';
+      } else {
+        input.value = cmd + ' ';
+        input.focus();
+      }
+    });
+  });
+
+  // Update balance & budget pace gauge UI
+  function updateBalanceDisplay(newBalance) {
+    currentBalance = newBalance;
+    balanceVal.textContent = currentBalance.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  function updateTodayPaceDisplay(newTodaySpent) {
+    todaySpent = newTodaySpent;
+    todayLoggedVal.textContent = `$${todaySpent.toFixed(2)} logged`;
+    
+    // Update gauge cells (8 cells)
+    const filledCells = Math.min(8, Math.round((todaySpent / todayLimit) * 8));
+    todayGaugeCells.innerHTML = '';
+    for (let i = 0; i < 8; i++) {
+      const cell = document.createElement('div');
+      if (i < filledCells) {
+        cell.className = i >= 6 ? 'w-2 h-2.5 bg-[#E15554] border border-[#2B2638]' : 'w-2 h-2.5 bg-[#10B981] border border-[#2B2638]';
+      } else {
+        cell.className = 'w-2 h-2.5 bg-[#E5E7EB] border border-[#2B2638]';
+      }
+      todayGaugeCells.appendChild(cell);
+    }
+  }
+
+  // Voice Note Recording
+  micBtn.addEventListener('click', async () => {
+    if (!isRecording) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaRecorder = new MediaRecorder(stream);
+        audioChunks = [];
+        mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
+        mediaRecorder.onstop = async () => {
+          const audioBlob = new Blob(audioChunks, { type: 'audio/ogg; codecs=opus' });
+          uploadVoiceRecording(audioBlob);
+        };
+        mediaRecorder.start();
+        isRecording = true;
+        micBtn.classList.add('recording-pulse');
+        micBtn.textContent = '⏹ STOP';
+        playBeep(880);
+      } catch(err) {
+        alert("Microphone access not granted or unavailable. You can type voice text directly!");
+      }
+    } else {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+        mediaRecorder.stream.getTracks().forEach(track => track.stop());
+      }
+      isRecording = false;
+      micBtn.classList.remove('recording-pulse');
+      micBtn.textContent = '🎙 REC';
+      playBeep(440);
+    }
+  });
+
+  async function uploadVoiceRecording(blob) {
+    // Render user voice cassette bubble first
+    const cassetteBubble = document.createElement('div');
+    cassetteBubble.className = 'flex justify-end';
+    cassetteBubble.innerHTML = `
+      <div class="pixel-border-peach p-2 text-[#4E1B15] max-w-[85%] space-y-1">
+        <div class="flex items-center justify-between text-[8px] font-numeral text-[#8D382B]">
+          <span>VOICE MEMO · CASSETTE ${String(Math.floor(Math.random()*90)+10)}</span>
+          <span>JUST NOW</span>
+        </div>
+        <div class="bg-[#F8ECE8] border-2 border-[#8D382B] p-2 flex items-center gap-3">
+          <button class="w-8 h-8 bg-[#8D382B] text-[#FFF4F0] flex items-center justify-center font-bold text-[12px] border-2 border-[#4E1B15] shadow-[1px_1px_0_0_#4E1B15] play-cassette-btn">
+            ▶
+          </button>
+          <div class="flex items-end gap-1.5 h-6 px-1 flex-1 bg-[#E8D4CE] border border-[#A65B4D] pt-1">
+            <div class="w-1.5 bg-[#8D382B] eq-bar-1"></div>
+            <div class="w-1.5 bg-[#8D382B] eq-bar-2"></div>
+            <div class="w-1.5 bg-[#8D382B] eq-bar-3"></div>
+            <div class="w-1.5 bg-[#8D382B] eq-bar-4"></div>
+            <div class="w-1.5 bg-[#8D382B] eq-bar-2"></div>
+            <div class="w-1.5 bg-[#8D382B] eq-bar-1"></div>
+          </div>
+          <div class="text-right">
+            <div class="font-numeral text-[9px] font-bold text-[#8D382B]">AUDIO</div>
+          </div>
+        </div>
+      </div>
+    `;
+    chatThread.appendChild(cassetteBubble);
+    chatThread.scrollTop = chatThread.scrollHeight;
+
+    // Send to backend
+    const formData = new FormData();
+    formData.append('audio', blob, 'voice.ogg');
+    try {
+      const res = await fetch('/api/voice', { method: 'POST', body: formData });
+      const data = await res.json();
+      if (data.ok) {
+        playCoin();
+        if (data.balance !== undefined) updateBalanceDisplay(data.balance);
+        if (data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
+        renderCompanionBubble(data.message_html || data.text);
+      }
+    } catch(e) {
+      renderCompanionBubble("<p>Logged audio note! Pouch updated.</p>");
+    }
+  }
+
+  // Server Communication & Logic Execution
+  async function fetchInitialState() {
+    try {
+      const res = await fetch('/api/state');
+      const data = await res.json();
+      if (data.ok) {
+        if (data.balance !== undefined) updateBalanceDisplay(data.balance);
+        if (data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
+      }
+    } catch(e) {
+      console.log("Using local offline state.");
+    }
+  }
+  fetchInitialState();
+
+  async function executeCommandText(text) {
+    const heroBubble = document.createElement('div');
+    heroBubble.className = 'flex justify-end';
+    heroBubble.innerHTML = `
+      <div class="pixel-border-peach p-2.5 text-[#4E1B15] max-w-[82%]">
+        <div class="flex items-center justify-between border-b border-[#F7B6A4] pb-0.5 mb-1 gap-4">
+          <span class="font-numeral text-[8px] text-[#8D382B] uppercase font-bold">Hero</span>
+          <span class="font-numeral text-[7px] text-[#A8584B]">JUST NOW</span>
+        </div>
+        <p class="font-bold text-[15px]">${escapeHtml(text)}</p>
+      </div>
+    `;
+    chatThread.appendChild(heroBubble);
+    chatThread.scrollTop = chatThread.scrollHeight;
+
+    // Trigger Mochi bounce
+    headerSprite.classList.remove('mochi-bounce');
+    headerSprite.classList.add('mochi-cheer');
+    setTimeout(() => {
+      headerSprite.classList.remove('mochi-cheer');
+      headerSprite.classList.add('mochi-bounce');
+    }, 500);
+
+    try {
+      const res = await fetch('/api/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        playCoin();
+        if (data.balance !== undefined) updateBalanceDisplay(data.balance);
+        if (data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
+        renderCompanionBubble(data.html || data.text, data.tx_id, data.category, data.payment_method);
+      } else {
+        renderCompanionBubble(data.text || "Could not execute spell.");
+      }
+    } catch(e) {
+      // Fallback local simulator if offline
+      simulateLocalLog(text);
+    }
+  }
+
+  function executeLog() {
+    const text = input.value.trim();
+    if (!text) return;
+    commandHistory.push(text);
+    historyIdx = -1;
+    input.value = '';
+    executeCommandText(text);
+  }
+
+  sendBtn.addEventListener('click', executeLog);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') executeLog();
+  });
+
+  function renderCompanionBubble(htmlContent, txId = null, category = null, paymentMethod = null) {
+    const bubble = document.createElement('div');
+    bubble.className = 'flex items-start gap-2.5 max-w-[98%]';
+    
+    let inlineMenuHtml = '';
+    if (txId) {
+      inlineMenuHtml = `
+        <div class="pixel-window-jrpg p-2 text-[13px] space-y-1.5 mt-2">
+          <div class="flex items-center justify-between pixel-titleplate px-2 py-0.5 text-white">
+            <span class="font-numeral text-[8px] tracking-wider text-[#FCD34D]">COMMAND: EDIT RECORD</span>
+            <span class="font-numeral text-[7px] text-[#A5B4FC]">PRESS A</span>
+          </div>
+          <div class="flex flex-col gap-0.5 pt-0.5">
+            <button class="flex items-center text-left hover:bg-[#F3EEDD] px-1.5 py-0.5 text-[#1E1B29] group" onclick="changeCategory(${txId})">
+              <span class="text-[#E15554] font-bold mr-1.5 text-[12px] rpg-cursor-blink">▶</span>
+              <span>Category: <strong class="text-[#155E75]">${category || 'Dining'}</strong></span>
+            </button>
+            <button class="flex items-center text-left hover:bg-[#F3EEDD] px-1.5 py-0.5 text-[#1E1B29] group" onclick="changePayment(${txId})">
+              <span class="text-transparent group-hover:text-[#E15554] font-bold mr-1.5 text-[12px]">▶</span>
+              <span>Payment: <strong class="text-[#7C2D12]">${paymentMethod || 'UPI Wallet'}</strong></span>
+            </button>
+            <button class="flex items-center text-left hover:bg-[#FDE8E8] px-1.5 py-0.5 text-[#DC2626] group" onclick="undoTxId(${txId})">
+              <span class="text-transparent group-hover:text-[#DC2626] font-bold mr-1.5 text-[12px]">▶</span>
+              <span class="font-bold">Cast Undo (Reverse #${txId})</span>
+            </button>
+          </div>
+        </div>
+      `;
+    }
+
+    bubble.innerHTML = `
+      <div class="shrink-0 w-8 h-8 bg-[#FFFCE8] border-2 border-[#345C3D] flex items-center justify-center shadow-[1px_1px_0_0_#345C3D]">
+        <svg class="w-6 h-6" viewBox="0 0 16 16" fill="none">
+          <rect x="7" y="1" width="2" height="2" fill="#1F4D25"/>
+          <rect x="4" y="4" width="8" height="8" fill="#8CE0A0"/>
+          <rect x="5" y="6" width="2" height="2" fill="#142B1A"/>
+          <rect x="9" y="6" width="2" height="2" fill="#142B1A"/>
+          <rect x="7" y="9" width="2" height="1" fill="#142B1A"/>
+        </svg>
+      </div>
+      <div class="flex-1 space-y-1">
+        <div class="pixel-border-sage p-2.5 text-[#142B1A]">
+          ${htmlContent}
+        </div>
+        ${inlineMenuHtml}
+      </div>
+    `;
+    chatThread.appendChild(bubble);
+    chatThread.scrollTop = chatThread.scrollHeight;
+  }
+
+  async function handleQuickUndo() {
+    playUndo();
+    try {
+      const res = await fetch('/api/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'undo' })
+      });
+      const data = await res.json();
+      if (data.ok && data.balance !== undefined) updateBalanceDisplay(data.balance);
+      renderCompanionBubble(data.text || `⚔ SPELL: REVERT EXECUTED. Restored GP to the treasury purse.`);
+    } catch(e) {
+      updateBalanceDisplay(currentBalance + 60.00);
+      renderCompanionBubble(`⚔ SPELL: REVERT EXECUTED. Restored $60.00 GP back to the treasury purse.`);
+    }
+  }
+
+  async function undoTxId(txId) {
+    playUndo();
+    try {
+      const res = await fetch('/api/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'delete', tx_id: txId })
+      });
+      const data = await res.json();
+      if (data.ok && data.balance !== undefined) updateBalanceDisplay(data.balance);
+      renderCompanionBubble(`🗑 Removed transaction #${txId}. Treasury updated.`);
+    } catch(e) {
+      renderCompanionBubble(`🗑 Reverted record #${txId}.`);
+    }
+  }
+
+  async function changeCategory(txId) {
+    const newCat = prompt("Enter new category (food, groceries, transport, bills, shopping, entertainment, health, rent, other):", "groceries");
+    if (!newCat) return;
+    try {
+      const res = await fetch('/api/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'set_category', tx_id: txId, category: newCat })
+      });
+      const data = await res.json();
+      renderCompanionBubble(`Updated category for #${txId} to <strong>${newCat}</strong>.`);
+    } catch(e) {
+      renderCompanionBubble(`Category updated to <strong>${newCat}</strong>.`);
+    }
+  }
+
+  async function changePayment(txId) {
+    const newPay = prompt("Enter payment method (cash, upi, card, netbanking):", "upi");
+    if (!newPay) return;
+    try {
+      const res = await fetch('/api/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'set_payment', tx_id: txId, payment_method: newPay })
+      });
+      const data = await res.json();
+      renderCompanionBubble(`Updated payment method for #${txId} to <strong>${newPay}</strong>.`);
+    } catch(e) {
+      renderCompanionBubble(`Payment method updated to <strong>${newPay}</strong>.`);
+    }
+  }
+
+  async function fetchAndDisplayStats() {
+    try {
+      const res = await fetch('/api/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: '/stats' })
+      });
+      const data = await res.json();
+      renderCompanionBubble(data.html || data.text);
+    } catch(e) {
+      renderCompanionBubble(`
+        <div class="font-bold text-[13px] text-[#142B1A] flex justify-between mb-1">
+          <span>⚔ Dungeon Expense Report</span>
+          <span class="font-numeral text-[9px] text-[#059669]">STATUS: ON TRACK</span>
+        </div>
+        <p class="text-[12px] text-[#142B1A]">May pace is currently 22% under the safe ceiling. Remaining safe pouch: <strong>$558.00</strong>.</p>
+      `);
+    }
+  }
+
+  async function fetchAndDisplayBalance() {
+    try {
+      const res = await fetch('/api/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: '/balance' })
+      });
+      const data = await res.json();
+      renderCompanionBubble(data.html || data.text);
+    } catch(e) {
+      renderCompanionBubble(`Treasury Total: $${currentBalance.toFixed(2)} GP.`);
+    }
+  }
+
+  async function fetchAndDisplayHistory() {
+    try {
+      const res = await fetch('/api/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: '/history' })
+      });
+      const data = await res.json();
+      renderCompanionBubble(data.html || data.text);
+    } catch(e) {
+      renderCompanionBubble(`Recent history fetched.`);
+    }
+  }
+
+  function simulateLocalLog(text) {
+    const matchNum = text.match(/\d+(\.\d+)?/);
+    const amt = matchNum ? parseFloat(matchNum[0]) : 20.00;
+    updateBalanceDisplay(currentBalance - amt);
+    updateTodayPaceDisplay(todaySpent + amt);
+    renderCompanionBubble(`Logged <strong class="font-numeral text-[12px]">$${amt.toFixed(2)}</strong>! Vault updated successfully.`, Math.floor(Math.random()*100)+1, 'dining', 'upi');
+  }
+
+  function escapeHtml(str) {
+    return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+</script>
+</body>
+</html>

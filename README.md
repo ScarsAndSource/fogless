@@ -54,14 +54,12 @@ Fogless separates how things get in from how things get delivered, which is the 
 
 | Layer | Technology |
 |---|---|
-| Frontend | React + TypeScript (group dashboard, settlement view, task timeline) |
-| Backend | FastAPI |
-| Language understanding | Groq (`llama-3.3-70b-versatile`) for parsing free text entries |
-| Speech to text | Groq Whisper (`whisper-large-v3-turbo`) for voice input |
-| Database | Supabase (Postgres) |
-| Escalation delivery | Telegram Bot API (webhook, delivery only, not ingestion) |
-| Scheduling | Scheduled job (Cloud Run / GitHub Actions) driving the escalation engine |
-| Deploy | Cloud Run |
+| Frontend | 16-bit JRPG Retro Handheld UI (HTML5, Vanilla JS, TailwindCSS, Web Audio API synth) |
+| Backend | Flask (Vercel Python Serverless / Local) |
+| Language understanding | Groq (`llama-3.3-70b-versatile` / `gpt-oss-120b`) & heuristic rule parser fallback |
+| Speech to text | Groq Whisper (`whisper-large-v3-turbo`) & Browser MediaRecorder API |
+| Database | Supabase (Postgres) with in-memory fallback for local development |
+| Deployment | Vercel Serverless / Cloud Run |
 
 ### How an entry becomes a ledger record
 

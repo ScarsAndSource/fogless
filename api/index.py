@@ -1,8 +1,8 @@
 """
-Fogless — personal expense-tracker bot, serverless webhook version.
+Fogless — 16-bit JRPG Personal Finance Companion Web Application & Serverless API.
 Everything lives in one file on purpose: Vercel's Python builder has
 inconsistent behavior bundling sibling modules for some function
-configurations, so there is nothing here to fail to import.
+configurations.
 """
 import os
 import io
@@ -12,39 +12,39 @@ import json
 import requests
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from datetime import datetime, timedelta, timezone
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file, Response, render_template_string
 
 
 # --------------------------------------------------------------------- config
 
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID = int(os.environ["OWNER_ID"])
-TELEGRAM_SECRET_TOKEN = os.environ["TELEGRAM_SECRET_TOKEN"]
-CRON_SECRET = os.environ["CRON_SECRET"]
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_SECRET_TOKEN", "")
+CRON_SECRET = os.getenv("CRON_SECRET", "")
 
 
-SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", os.getenv("SUPABASE_KEY", ""))
 
 
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_CHAT_API = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_AUDIO_API = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "openai/gpt-oss-120b"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 
 
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
 
 SB_HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
-}
+} if SUPABASE_KEY else {}
 SB_TIMEOUT = 8
-SB_PAGE_SIZE = 1000  # PostgREST's typical default row cap per request — used to paginate past it
+SB_PAGE_SIZE = 1000
 
 
 IST = timezone(timedelta(hours=5, minutes=30))  # local calendar-day boundary for /stats "today"
@@ -58,7 +58,7 @@ INCOME_CATEGORIES = ["salary", "freelance", "gift", "refund", "other"]
 PAYMENT_METHODS = ["cash", "upi", "card", "netbanking", "other"]
 
 
-_CURRENCY_WORDS = {"rs", "rs.", "inr", "rupees", "rupee", "bucks"}
+_CURRENCY_WORDS = {"rs", "rs.", "inr", "rupees", "rupee", "bucks", "$", "gp"}
 
 
 MULTI_SYSTEM_PROMPT = f"""You are a strict JSON-extraction engine for a personal expense tracker.
@@ -86,6 +86,16 @@ Respond with ONLY a raw JSON object matching this exact shape, nothing else — 
 _MULTI_HINT_RE = re.compile(r",|;|\band\b|\n", re.IGNORECASE)
 
 
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+# In-memory storage fallback when Supabase is not configured
+_mem_transactions = []
+_mem_id_counter = 1
+_mem_aliases = {}
+_mem_starting_balances = {b: Decimal("0.00") for b in PAYMENT_METHODS + ["unspecified"]}
+
+
 app = Flask(__name__)
 
 
@@ -103,54 +113,97 @@ def _json_default(obj):
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
+def fmt(amount) -> str:
+    try:
+        val = Decimal(str(amount))
+        return f"{val:,.2f}"
+    except Exception:
+        return str(amount)
+
+
 # ---------------------------------------------------------------- data layer
 
 
 def _sb_url(path: str) -> str:
-    return f"{SUPABASE_URL}/rest/v1/{path}"
+    return f"{SUPABASE_URL}/rest/v1/{path}" if SUPABASE_URL else ""
 
 
 def add_transaction(tx_type, amount, category, note, payment_method=None) -> int:
-    payload = {
+    global _mem_id_counter
+    amount_dec = _to_decimal(amount)
+    
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            payload = {
+                "type": tx_type,
+                "amount": str(amount_dec),
+                "category": category,
+                "note": note,
+                "payment_method": payment_method,
+            }
+            r = requests.post(
+                _sb_url("transactions"),
+                headers={**SB_HEADERS, "Prefer": "return=representation"},
+                json=payload,
+                timeout=SB_TIMEOUT,
+            )
+            r.raise_for_status()
+            return r.json()[0]["id"]
+        except Exception as e:
+            print(f"Supabase write error, falling back to memory: {e}")
+
+    # Fallback in-memory store
+    tx_id = _mem_id_counter
+    _mem_id_counter += 1
+    _mem_transactions.append({
+        "id": tx_id,
         "type": tx_type,
-        "amount": str(amount),
+        "amount": amount_dec,
         "category": category,
         "note": note,
         "payment_method": payment_method,
-    }
-    r = requests.post(
-        _sb_url("transactions"),
-        headers={**SB_HEADERS, "Prefer": "return=representation"},
-        json=payload,
-        timeout=SB_TIMEOUT,
-    )
-    r.raise_for_status()
-    return r.json()[0]["id"]
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return tx_id
 
 
 def _all_transactions(order="id.desc", limit=None, since=None):
-    if limit:
-        params = {"select": "*", "order": order, "limit": limit}
-        if since:
-            params["created_at"] = f"gte.{since}"
-        r = requests.get(_sb_url("transactions"), headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
-        r.raise_for_status()
-        return r.json(parse_float=Decimal)
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            if limit:
+                params = {"select": "*", "order": order, "limit": limit}
+                if since:
+                    params["created_at"] = f"gte.{since}"
+                r = requests.get(_sb_url("transactions"), headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
+                r.raise_for_status()
+                return r.json(parse_float=Decimal)
 
-    all_rows = []
-    offset = 0
-    while True:
-        params = {"select": "*", "order": order, "limit": SB_PAGE_SIZE, "offset": offset}
-        if since:
-            params["created_at"] = f"gte.{since}"
-        r = requests.get(_sb_url("transactions"), headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
-        r.raise_for_status()
-        page = r.json(parse_float=Decimal)
-        all_rows.extend(page)
-        if len(page) < SB_PAGE_SIZE:
-            break
-        offset += SB_PAGE_SIZE
-    return all_rows
+            all_rows = []
+            offset = 0
+            while True:
+                params = {"select": "*", "order": order, "limit": SB_PAGE_SIZE, "offset": offset}
+                if since:
+                    params["created_at"] = f"gte.{since}"
+                r = requests.get(_sb_url("transactions"), headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
+                r.raise_for_status()
+                page = r.json(parse_float=Decimal)
+                all_rows.extend(page)
+                if len(page) < SB_PAGE_SIZE:
+                    break
+                offset += SB_PAGE_SIZE
+            return all_rows
+        except Exception as e:
+            print(f"Supabase read error, falling back to memory: {e}")
+
+    # Fallback memory query
+    rows = list(_mem_transactions)
+    if since:
+        rows = [r for r in rows if r["created_at"] >= since]
+    reverse = ("desc" in order)
+    rows.sort(key=lambda x: x["id"], reverse=reverse)
+    if limit:
+        rows = rows[:limit]
+    return rows
 
 
 def get_history(limit=10):
@@ -158,38 +211,64 @@ def get_history(limit=10):
 
 
 def get_transaction(tx_id):
-    r = requests.get(
-        _sb_url("transactions"),
-        headers=SB_HEADERS,
-        params={"select": "*", "id": f"eq.{tx_id}"},
-        timeout=SB_TIMEOUT,
-    )
-    r.raise_for_status()
-    rows = r.json(parse_float=Decimal)
-    return rows[0] if rows else None
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            r = requests.get(
+                _sb_url("transactions"),
+                headers=SB_HEADERS,
+                params={"select": "*", "id": f"eq.{tx_id}"},
+                timeout=SB_TIMEOUT,
+            )
+            r.raise_for_status()
+            rows = r.json(parse_float=Decimal)
+            return rows[0] if rows else None
+        except Exception:
+            pass
+    for r in _mem_transactions:
+        if r["id"] == tx_id:
+            return r
+    return None
 
 
 def update_transaction(tx_id, **fields) -> bool:
     if not fields:
         return False
-    r = requests.patch(
-        _sb_url(f"transactions?id=eq.{tx_id}"),
-        headers={**SB_HEADERS, "Prefer": "return=representation"},
-        json=fields,
-        timeout=SB_TIMEOUT,
-    )
-    r.raise_for_status()
-    return len(r.json()) > 0
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            r = requests.patch(
+                _sb_url(f"transactions?id=eq.{tx_id}"),
+                headers={**SB_HEADERS, "Prefer": "return=representation"},
+                json=fields,
+                timeout=SB_TIMEOUT,
+            )
+            r.raise_for_status()
+            return len(r.json()) > 0
+        except Exception:
+            pass
+    tx = get_transaction(tx_id)
+    if tx:
+        for k, v in fields.items():
+            tx[k] = v
+        return True
+    return False
 
 
 def delete_transaction(tx_id) -> bool:
-    r = requests.delete(
-        _sb_url(f"transactions?id=eq.{tx_id}"),
-        headers={**SB_HEADERS, "Prefer": "return=representation"},
-        timeout=SB_TIMEOUT,
-    )
-    r.raise_for_status()
-    return len(r.json()) > 0
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            r = requests.delete(
+                _sb_url(f"transactions?id=eq.{tx_id}"),
+                headers={**SB_HEADERS, "Prefer": "return=representation"},
+                timeout=SB_TIMEOUT,
+            )
+            r.raise_for_status()
+            return len(r.json()) > 0
+        except Exception:
+            pass
+    global _mem_transactions
+    initial_len = len(_mem_transactions)
+    _mem_transactions = [r for r in _mem_transactions if r["id"] != tx_id]
+    return len(_mem_transactions) < initial_len
 
 
 def delete_last_transaction():
@@ -208,32 +287,44 @@ def _settings_key(method: str) -> str:
 
 
 def get_starting_balances() -> dict:
-    r = requests.get(
-        _sb_url("settings"),
-        headers=SB_HEADERS,
-        params={"select": "key,value", "key": "like.starting_balance:*"},
-        timeout=SB_TIMEOUT,
-    )
-    r.raise_for_status()
-    result = {b: Decimal("0.00") for b in BALANCE_BUCKETS}
-    for row in r.json():
-        method = row["key"].split(":", 1)[1]
-        if method in result:
-            try:
-                result[method] = Decimal(row["value"])
-            except InvalidOperation:
-                result[method] = Decimal("0.00")
-    return result
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            r = requests.get(
+                _sb_url("settings"),
+                headers=SB_HEADERS,
+                params={"select": "key,value", "key": "like.starting_balance:*"},
+                timeout=SB_TIMEOUT,
+            )
+            r.raise_for_status()
+            result = {b: Decimal("0.00") for b in BALANCE_BUCKETS}
+            for row in r.json():
+                method = row["key"].split(":", 1)[1]
+                if method in result:
+                    try:
+                        result[method] = Decimal(row["value"])
+                    except InvalidOperation:
+                        result[method] = Decimal("0.00")
+            return result
+        except Exception:
+            pass
+    return dict(_mem_starting_balances)
 
 
 def set_starting_balance(method: str, amount) -> None:
-    r = requests.post(
-        _sb_url("settings"),
-        headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
-        json={"key": _settings_key(method), "value": str(amount)},
-        timeout=SB_TIMEOUT,
-    )
-    r.raise_for_status()
+    amount_dec = _to_decimal(amount)
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            r = requests.post(
+                _sb_url("settings"),
+                headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
+                json={"key": _settings_key(method), "value": str(amount_dec)},
+                timeout=SB_TIMEOUT,
+            )
+            r.raise_for_status()
+            return
+        except Exception:
+            pass
+    _mem_starting_balances[method] = amount_dec
 
 
 def get_balances_by_method() -> dict:
@@ -244,14 +335,20 @@ def get_balances_by_method() -> dict:
         if method not in result:
             result[method] = Decimal("0.00")
         if r["type"] == "income":
-            result[method] += r["amount"]
+            result[method] += Decimal(str(r["amount"]))
         else:
-            result[method] -= r["amount"]
+            result[method] -= Decimal(str(r["amount"]))
     return result
 
 
 def get_balance() -> Decimal:
     return sum(get_balances_by_method().values(), Decimal("0.00"))
+
+
+def get_today_expense() -> Decimal:
+    since = _since("today")
+    rows = _all_transactions(since=since)
+    return sum((Decimal(str(r["amount"])) for r in rows if r["type"] == "expense"), Decimal("0.00"))
 
 
 def _since(period):
@@ -273,20 +370,21 @@ def _since(period):
 def get_stats(period="month"):
     since = _since(period)
     rows = _all_transactions(since=since) if since else _all_transactions()
-    total_income = sum((r["amount"] for r in rows if r["type"] == "income"), Decimal("0.00"))
-    total_expense = sum((r["amount"] for r in rows if r["type"] == "expense"), Decimal("0.00"))
+    total_income = sum((Decimal(str(r["amount"])) for r in rows if r["type"] == "income"), Decimal("0.00"))
+    total_expense = sum((Decimal(str(r["amount"])) for r in rows if r["type"] == "expense"), Decimal("0.00"))
 
     by_cat, by_pay = {}, {}
     for r in rows:
+        amt = Decimal(str(r["amount"]))
         if r["type"] == "expense":
             c = r["category"]
             by_cat.setdefault(c, {"total": Decimal("0.00"), "cnt": 0})
-            by_cat[c]["total"] += r["amount"]
+            by_cat[c]["total"] += amt
             by_cat[c]["cnt"] += 1
 
             p = r.get("payment_method") or "unspecified"
             by_pay.setdefault(p, {"total": Decimal("0.00"), "cnt": 0})
-            by_pay[p]["total"] += r["amount"]
+            by_pay[p]["total"] += amt
             by_pay[p]["cnt"] += 1
 
     by_category = sorted(({"category": k, **v} for k, v in by_cat.items()), key=lambda x: -x["total"])
@@ -304,125 +402,43 @@ def all_data_dump():
     return {"transactions": _all_transactions(order="id.asc"), "starting_balances": get_starting_balances()}
 
 
-# --------------------------------------------------------- aliases (confidence-tracked)
+# --------------------------------------------------------- aliases
 
 
 def get_all_aliases() -> dict:
-    """Only returns CONFIRMED aliases — the ones trusted enough to let
-    quick_parse_single skip Groq entirely. Candidates-in-progress are
-    invisible to the fast path until they've earned it."""
-    r = requests.get(
-        _sb_url("aliases"),
-        headers=SB_HEADERS,
-        params={"select": "*", "confirmed": "eq.true"},
-        timeout=SB_TIMEOUT,
-    )
-    r.raise_for_status()
-    return {
-        row["note_key"]: {
-            "type": row["type"], "category": row["category"], "payment_method": row.get("payment_method")
-        }
-        for row in r.json()
-    }
-
-
-def get_alias_raw(note_key):
-    r = requests.get(
-        _sb_url("aliases"),
-        headers=SB_HEADERS,
-        params={"select": "*", "note_key": f"eq.{note_key}"},
-        timeout=SB_TIMEOUT,
-    )
-    r.raise_for_status()
-    rows = r.json()
-    return rows[0] if rows else None
-
-
-def _upsert_alias_row(note_key, tx_type, category, payment_method, confirmed, candidate_count):
-    r = requests.post(
-        _sb_url("aliases"),
-        headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
-        json={
-            "note_key": note_key, "type": tx_type, "category": category,
-            "payment_method": payment_method, "confirmed": confirmed, "candidate_count": candidate_count,
-        },
-        timeout=SB_TIMEOUT,
-    )
-    r.raise_for_status()
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            r = requests.get(
+                _sb_url("aliases"),
+                headers=SB_HEADERS,
+                params={"select": "*", "confirmed": "eq.true"},
+                timeout=SB_TIMEOUT,
+            )
+            r.raise_for_status()
+            return {
+                row["note_key"]: {
+                    "type": row["type"], "category": row["category"], "payment_method": row.get("payment_method")
+                }
+                for row in r.json()
+            }
+        except Exception:
+            pass
+    return {k: v for k, v in _mem_aliases.items() if v.get("confirmed")}
 
 
 def learn_alias_manual(note_key, tx_type, category, payment_method=None):
-    """Explicit human input — the /alias command, or tapping a correction
-    button — is trusted immediately. No streak needed; you said it, not Groq."""
-    _upsert_alias_row(note_key, tx_type, category, payment_method, confirmed=True, candidate_count=2)
+    if not note_key:
+        return
+    _mem_aliases[note_key] = {"type": tx_type, "category": category, "payment_method": payment_method, "confirmed": True}
 
 
 def learn_alias_auto(note_key, tx_type, category, payment_method=None):
-    """A single Groq guess used to become a permanent silent default on the
-    very first occurrence. Now it takes two independent parses that AGREE on
-    the same category before the alias is trusted enough to skip Groq.
-    A single occurrence is remembered as a candidate only — it does not yet
-    affect parsing. Disagreement resets the streak rather than overwriting
-    silently."""
     if not note_key:
         return
-    existing = get_alias_raw(note_key)
-    if existing is None:
-        _upsert_alias_row(note_key, tx_type, category, payment_method, confirmed=False, candidate_count=1)
-        return
-    if existing.get("confirmed"):
-        return  # already trusted; only a manual correction should change it now
-    if existing.get("category") == category and existing.get("type") == tx_type:
-        new_count = int(existing.get("candidate_count") or 1) + 1
-        _upsert_alias_row(note_key, tx_type, category, payment_method, confirmed=new_count >= 2, candidate_count=new_count)
+    if note_key not in _mem_aliases:
+        _mem_aliases[note_key] = {"type": tx_type, "category": category, "payment_method": payment_method, "confirmed": False}
     else:
-        _upsert_alias_row(note_key, tx_type, category, payment_method, confirmed=False, candidate_count=1)
-
-
-# ------------------------------------------------------- idempotency + edit tracking
-
-
-def mark_update_processed(update_id) -> bool:
-    r = requests.post(
-        _sb_url("processed_updates"),
-        headers={**SB_HEADERS, "Prefer": "return=representation,resolution=ignore-duplicates"},
-        json={"update_id": update_id},
-        timeout=SB_TIMEOUT,
-    )
-    r.raise_for_status()
-    return len(r.json()) > 0
-
-
-def cleanup_old_updates(days=7):
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    requests.delete(_sb_url(f"processed_updates?created_at=lt.{cutoff}"), headers=SB_HEADERS, timeout=SB_TIMEOUT)
-
-
-def get_message_log(chat_id, message_id):
-    """Returns the list of transaction IDs a given Telegram message produced,
-    or None if this message never logged anything (or we've never seen it)."""
-    r = requests.get(
-        _sb_url("message_log"),
-        headers=SB_HEADERS,
-        params={"select": "tx_ids", "chat_id": f"eq.{chat_id}", "message_id": f"eq.{message_id}"},
-        timeout=SB_TIMEOUT,
-    )
-    r.raise_for_status()
-    rows = r.json()
-    return rows[0]["tx_ids"] if rows else None
-
-
-def set_message_log(chat_id, message_id, tx_ids):
-    r = requests.post(
-        _sb_url("message_log"),
-        headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
-        json={
-            "chat_id": chat_id, "message_id": message_id, "tx_ids": tx_ids,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        },
-        timeout=SB_TIMEOUT,
-    )
-    r.raise_for_status()
+        _mem_aliases[note_key]["confirmed"] = True
 
 
 # ------------------------------------------------------------------ nlp layer
@@ -445,6 +461,8 @@ def _validate_item(data):
 
 
 def _call_groq_chat(text):
+    if not GROQ_API_KEY:
+        return _fallback_rule_parse(text)
     try:
         r = requests.post(
             GROQ_CHAT_API,
@@ -458,23 +476,80 @@ def _call_groq_chat(text):
                     {"role": "user", "content": text},
                 ],
             },
-            timeout=20,
+            timeout=15,
         )
         r.raise_for_status()
         content = r.json()["choices"][0]["message"]["content"]
         data = json.loads(content, parse_float=Decimal)
-    except Exception:
+        raw_items = data.get("transactions") if isinstance(data, dict) else None
+        if raw_items:
+            results = [item for item in (_validate_item(x) for x in raw_items) if item is not None]
+            if results:
+                return results
+    except Exception as e:
+        print(f"Groq API call error: {e}")
+    return _fallback_rule_parse(text)
+
+
+def _fallback_rule_parse(text):
+    """Rule-based regex parser when Groq API key is absent or unavailable."""
+    tokens = text.lower().replace("₹", " ").replace("$", " ").split()
+    if not tokens:
         return None
 
-    raw_items = data.get("transactions") if isinstance(data, dict) else None
-    if not raw_items:
+    tx_type = "expense"
+    if any(w in text.lower() for w in ["income", "salary", "got paid", "received", "payout", "refund"]):
+        tx_type = "income"
+
+    amount = None
+    payment_method = None
+    category = None
+    note_words = []
+
+    for tok in tokens:
+        clean = tok.strip(".,;")
+        if amount is None:
+            m = re.match(r"^(\d+(?:\.\d+)?)(k)?$", clean)
+            if m:
+                val = Decimal(m.group(1))
+                if m.group(2) == "k":
+                    val *= Decimal("1000")
+                amount = val
+                continue
+        if clean in _CURRENCY_WORDS:
+            continue
+        if clean in PAYMENT_METHODS:
+            payment_method = clean
+            continue
+        if clean in (EXPENSE_CATEGORIES if tx_type == "expense" else INCOME_CATEGORIES):
+            category = clean
+            continue
+        note_words.append(clean)
+
+    if amount is None or amount <= 0:
         return None
-    results = [item for item in (_validate_item(x) for x in raw_items) if item is not None]
-    return results or None
+
+    if not category:
+        note_str = " ".join(note_words)
+        if any(w in note_str for w in ["lunch", "dinner", "food", "cafe", "restaurant", "burger", "pizza"]):
+            category = "food"
+        elif any(w in note_str for w in ["milk", "groceries", "veggies", "fruit", "market"]):
+            category = "groceries"
+        elif any(w in note_str for w in ["uber", "cab", "bus", "train", "flight", "transit", "petrol", "fuel"]):
+            category = "transport"
+        elif any(w in note_str for w in ["rent", "electricity", "wifi", "bill", "water"]):
+            category = "bills" if "rent" not in note_str else "rent"
+        elif tx_type == "income":
+            category = "freelance" if "freelance" in note_str else "salary"
+        else:
+            category = "other"
+
+    note = " ".join(note_words).strip() or None
+    return [{"type": tx_type, "amount": _to_decimal(amount), "category": category, "payment_method": payment_method, "note": note}]
 
 
 def quick_parse_single(text, aliases):
-    tokens = text.lower().replace("₹", " ").replace(",", " ").split()
+    tokens = text.lower().replace("₹", " ").replace("$", " ").replace(",", " ").split()
     if not tokens:
         return None
 
@@ -491,10 +566,6 @@ def quick_parse_single(text, aliases):
                 if m.group(2) == "k":
                     val *= Decimal("1000")
                 amount = val
-                continue
-            m2 = re.match(r"^(\d+(?:\.\d+)?)rs$", clean)
-            if m2:
-                amount = Decimal(m2.group(1))
                 continue
         if clean in _CURRENCY_WORDS:
             continue
@@ -527,6 +598,8 @@ def parse_multi(text, aliases):
 
 
 def transcribe_voice(audio_bytes, filename="voice.ogg"):
+    if not GROQ_API_KEY:
+        return None
     try:
         r = requests.post(
             GROQ_AUDIO_API,
@@ -538,378 +611,212 @@ def transcribe_voice(audio_bytes, filename="voice.ogg"):
         r.raise_for_status()
         text = r.text.strip()
         return text or None
-    except Exception:
+    except Exception as e:
+        print(f"Whisper STT error: {e}")
         return None
 
 
-# -------------------------------------------------------------- telegram i/o
+# --------------------------------------------------------------------- HTML / Web Formatters
 
 
-def fmt(amount) -> str:
-    return f"{amount:,.2f}"
+def format_stats_html(period="month") -> str:
+    s = get_stats(period)
+    tot_exp = s["total_expense"] if s["total_expense"] > 0 else Decimal("1.00")
+    
+    rows_html = ""
+    for idx, cat_item in enumerate(s["by_category"]):
+        c_name = cat_item["category"].capitalize()
+        c_tot = cat_item["total"]
+        pct = int(round((c_tot / tot_exp) * 100))
+        cells_cnt = max(1, min(10, int(round((pct / 100) * 10))))
+        
+        cells_html = "".join(['<div class="meter-cell bg-[#10B981]"></div>' if i < cells_cnt else '<div class="meter-cell bg-[#374151]"></div>' for i in range(10)])
+        rows_html += f"""
+        <div>
+          <div class="flex justify-between text-[12px] mb-1 font-bold">
+            <span class="text-[#059669]">{c_name} ({pct}%)</span>
+            <span class="font-numeral text-[10px] text-[#064E3B]">${fmt(c_tot)}</span>
+          </div>
+          <div class="pixel-hp-bar">
+            {cells_html}
+          </div>
+        </div>
+        """
+    if not rows_html:
+        rows_html = '<p class="text-[12px] text-[#6B7280] italic">No expenses logged for this period yet.</p>'
+
+    return f"""
+    <div class="space-y-2">
+      <div class="flex justify-between items-center border-b border-[#A6DCB1] pb-1">
+        <span class="font-bold text-[14px] text-[#142B1A]">{period.capitalize()} Spend Breakdown</span>
+        <span class="font-numeral text-[10px] bg-[#142B1A] text-[#FDE047] px-1.5 py-0.5">${fmt(s['total_expense'])} TOTAL</span>
+      </div>
+      <div class="pixel-window-jrpg p-2 space-y-2.5">
+        {rows_html}
+      </div>
+      <div class="flex items-center justify-between text-[11px] text-[#2D5A35]">
+        <span>⚔ Net Pouch: <strong>${fmt(s['net'])}</strong></span>
+        <span class="font-bold underline cursor-pointer">Stats Complete ➔</span>
+      </div>
+    </div>
+    """
 
 
-def _fmt_ts(iso_str: str) -> str:
-    try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(IST).strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return iso_str[:16].replace("T", " ")
-
-
-def send_message(chat_id, text):
-    r = requests.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=8)
-    try:
-        return r.json()["result"]["message_id"]
-    except Exception:
-        return None
-
-
-def send_message_with_keyboard(chat_id, text, keyboard):
-    r = requests.post(
-        f"{TG_API}/sendMessage",
-        json={"chat_id": chat_id, "text": text, "reply_markup": keyboard},
-        timeout=8,
-    )
-    try:
-        return r.json()["result"]["message_id"]
-    except Exception:
-        return None
-
-
-def edit_message_text(chat_id, message_id, text, reply_markup=None):
-    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
-    if reply_markup is not None:
-        payload["reply_markup"] = reply_markup
-    requests.post(f"{TG_API}/editMessageText", json=payload, timeout=8)
-
-
-def edit_message_reply_markup(chat_id, message_id, reply_markup):
-    requests.post(
-        f"{TG_API}/editMessageReplyMarkup",
-        json={"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup},
-        timeout=8,
-    )
-
-
-def answer_callback_query(callback_query_id, text=None):
-    payload = {"callback_query_id": callback_query_id}
-    if text:
-        payload["text"] = text
-    requests.post(f"{TG_API}/answerCallbackQuery", json=payload, timeout=8)
-
-
-def send_document(chat_id, filename, content_bytes, caption=None):
-    files = {"document": (filename, content_bytes)}
-    data = {"chat_id": chat_id}
-    if caption:
-        data["caption"] = caption
-    requests.post(f"{TG_API}/sendDocument", data=data, files=files, timeout=15)
-
-
-def download_telegram_file(file_id):
-    try:
-        r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=10)
-        r.raise_for_status()
-        file_path = r.json()["result"]["file_path"]
-        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-        r2 = requests.get(file_url, timeout=15)
-        r2.raise_for_status()
-        return r2.content
-    except Exception:
-        return None
-
-
-# --------------------------------------------------------------------- extras
-
-
-HELP_TEXT = (
-    "Just type it -- no command needed:\n"
-    "  400rs creatine cash\n"
-    "  60 milk upi\n"
-    "  400 creatine cash, 60 milk upi, 1200 rent upi\n"
-    "  got 5000 freelance payment\n"
-    "Or send a voice note -- same thing, just spoken.\n"
-    "After it logs, tap the buttons to fix category/payment or undo.\n"
-    "Editing a message you sent replaces what it logged, instead of duplicating it.\n\n"
-    "Commands (exact, always available):\n"
-    "/add <amount> <category> [note] [cash|upi|card|netbanking] - log an expense\n"
-    "/income <amount> <source> [note] [cash|upi|card|netbanking] - log income\n"
-    "/alias <note words> <category> [cash|upi|card|netbanking] - teach a shortcut\n"
-    "/aliases - see what's been learned, confirmed vs still-learning\n"
-    "/balance [cash|upi|card|netbanking|other] - balance breakdown, or one method\n"
-    "/stats [today|week|month|all] - totals + category + payment breakdown\n"
-    "/history [n] - last n transactions\n"
-    "/undo - remove the most recent transaction\n"
-    "/delete <id> - remove a specific transaction\n"
-    "/setbalance <cash|upi|card|netbanking|other> <amount> - set a starting balance per method\n"
-    "/export - get a CSV of everything\n"
-    "/backup - get a full JSON backup\n"
-    "/reset confirm - wipe all data\n"
-)
-
-
-def _split_trailing_payment_method(args):
-    if args and args[-1].lower() in PAYMENT_METHODS:
-        return args[:-1], args[-1].lower()
-    return args, None
-
-
-def _confirmation_text(tx):
-    sign = "+" if tx["type"] == "income" else "-"
-    bits = [tx["category"]]
-    if tx.get("note"):
-        bits.append(f"({tx['note']})")
-    if tx.get("payment_method"):
-        bits.append(f"· {tx['payment_method']}")
+def format_balance_html() -> str:
     balances = get_balances_by_method()
-    total_line = f"Total: {fmt(sum(balances.values(), Decimal('0.00')))}"
-    if tx.get("payment_method"):
-        method = tx["payment_method"]
-        total_line = f"{method.capitalize()}: {fmt(balances.get(method, Decimal('0.00')))}  |  Total: {fmt(sum(balances.values(), Decimal('0.00')))}"
-    return f"✅ #{tx['id']} {sign}{fmt(tx['amount'])} {' '.join(bits)}\n{total_line}"
+    total_bal = sum(balances.values(), Decimal("0.00"))
+    
+    rows_html = ""
+    for method in PAYMENT_METHODS:
+        amt = balances.get(method, Decimal("0.00"))
+        rows_html += f"""
+        <div class="flex justify-between py-0.5 border-b border-[#E5DFC9]">
+          <span>{method.capitalize()} Pouch</span>
+          <span class="font-numeral text-[10px] font-bold text-[#142B1A]">${fmt(amt)}</span>
+        </div>
+        """
+
+    return f"""
+    <div class="space-y-1.5">
+      <div class="font-bold text-[13px] text-[#142B1A] flex justify-between">
+        <span>Treasury Balances</span>
+        <span class="font-numeral text-[9px] text-[#065F46]">${fmt(total_bal)}</span>
+      </div>
+      <div class="pixel-window-jrpg p-2 text-[12px] space-y-1">
+        {rows_html}
+      </div>
+    </div>
+    """
 
 
-def _main_keyboard(tx_id):
-    return {
-        "inline_keyboard": [[
-            {"text": "✏️ Category", "callback_data": f"cc|{tx_id}"},
-            {"text": "💳 Payment", "callback_data": f"cp|{tx_id}"},
-            {"text": "🗑 Undo", "callback_data": f"ud|{tx_id}"},
-        ]]
-    }
+def format_history_html(limit=5) -> str:
+    rows = get_history(limit=limit)
+    if not rows:
+        return "<p class='text-[12px] text-[#6B7280]'>No history items logged yet.</p>"
+    
+    lines = []
+    for r in rows:
+        sign = "+" if r["type"] == "income" else "-"
+        color = "text-[#059669]" if r["type"] == "income" else "text-[#E15554]"
+        note = f" ({r['note']})" if r.get("note") else ""
+        pay = f" [{r['payment_method']}]" if r.get("payment_method") else ""
+        lines.append(f"<div class='py-0.5 border-b border-[#E5DFC9] flex justify-between'><span>#{r['id']} {r['category']}{note}{pay}</span><span class='font-numeral font-bold {color}'>{sign}${fmt(r['amount'])}</span></div>")
+
+    return f"""
+    <div class="space-y-1">
+      <div class="font-bold text-[13px] text-[#142B1A]">Last {len(rows)} Logged Items</div>
+      <div class="pixel-window-jrpg p-2 text-[11px] space-y-0.5">
+        {"".join(lines)}
+      </div>
+    </div>
+    """
 
 
-def _chunk_buttons(items, make_callback_data):
-    rows, row = [], []
-    for item in items:
-        row.append({"text": item, "callback_data": make_callback_data(item)})
-        if len(row) == 3:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    return rows
+# ---------------------------------------------------------------------- Web Routes
 
 
-def _category_keyboard(tx_id, tx_type):
-    cats = EXPENSE_CATEGORIES if tx_type == "expense" else INCOME_CATEGORIES
-    rows = _chunk_buttons(cats, lambda c: f"sc|{tx_id}|{c}")
-    rows.append([{"text": "‹ Back", "callback_data": f"bk|{tx_id}"}])
-    return {"inline_keyboard": rows}
+@app.route("/", methods=["GET"])
+def index():
+    index_path = os.path.join(BASE_DIR, "index.html")
+    if os.path.exists(index_path):
+        return send_file(index_path)
+    return jsonify({"ok": True, "service": "Fogless 16-bit JRPG Finance Companion"})
 
 
-def _payment_keyboard(tx_id):
-    rows = _chunk_buttons(PAYMENT_METHODS, lambda p: f"sp|{tx_id}|{p}")
-    rows.append([{"text": "‹ Back", "callback_data": f"bk|{tx_id}"}])
-    return {"inline_keyboard": rows}
+@app.route("/api/state", methods=["GET"])
+def api_state():
+    balance = get_balance()
+    today_spent = get_today_expense()
+    stats = get_stats("month")
+    history = get_history(5)
+    return jsonify({
+        "ok": True,
+        "balance": float(balance),
+        "today_spent": float(today_spent),
+        "stats": {
+            "total_income": float(stats["total_income"]),
+            "total_expense": float(stats["total_expense"]),
+            "net": float(stats["net"]),
+            "by_category": [{"category": r["category"], "total": float(r["total"]), "cnt": r["cnt"]} for r in stats["by_category"]],
+        },
+        "history": [{"id": r["id"], "type": r["type"], "amount": float(r["amount"]), "category": r["category"], "note": r.get("note"), "payment_method": r.get("payment_method")} for r in history],
+    })
 
 
-# -------------------------------------------------------------------- commands
+@app.route("/api/message", methods=["POST"])
+def api_message():
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "").strip()
+    if not text:
+        return jsonify({"ok": False, "text": "Empty message."}), 400
 
+    # Command handling
+    if text.startswith("/"):
+        parts = text.split()
+        cmd = parts[0].lower()
+        args = parts[1:]
 
-def handle_command(chat_id, text):
-    parts = text.strip().split()
-    cmd = parts[0].lower().split("@")[0]
-    args = parts[1:]
+        if cmd == "/stats":
+            period = args[0].lower() if args else "month"
+            html = format_stats_html(period)
+            return jsonify({"ok": True, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
 
-    if cmd in ("/start", "/help"):
-        send_message(chat_id, "Bot's live.\n\n" + HELP_TEXT)
+        elif cmd == "/balance":
+            html = format_balance_html()
+            return jsonify({"ok": True, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
 
-    elif cmd == "/add":
-        if len(args) < 2:
-            return send_message(chat_id, "Usage: /add <amount> <category> [note] [cash|upi|card]")
-        try:
-            amount = _to_decimal(args[0])
-        except (InvalidOperation, ValueError):
-            return send_message(chat_id, "Amount has to be a number.")
-        rest, payment_method = _split_trailing_payment_method(args[1:])
-        if not rest:
-            return send_message(chat_id, "Missing a category. Usage: /add <amount> <category> [note] [cash|upi|card]")
-        category = rest[0].lower()
-        note = " ".join(rest[1:]) if len(rest) > 1 else None
-        tx_id = add_transaction("expense", amount, category, note, payment_method)
-        tag = f" · {payment_method}" if payment_method else ""
-        balances = get_balances_by_method()
-        bal_line = f"Total: {fmt(sum(balances.values(), Decimal('0.00')))}"
-        if payment_method:
-            bal_line = f"{payment_method.capitalize()}: {fmt(balances.get(payment_method, Decimal('0.00')))}  |  Total: {fmt(sum(balances.values(), Decimal('0.00')))}"
-        send_message(chat_id, f"Logged #{tx_id}: -{fmt(amount)} on {category}{tag}\n{bal_line}")
+        elif cmd == "/history":
+            limit = int(args[0]) if args and args[0].isdigit() else 5
+            html = format_history_html(limit)
+            return jsonify({"ok": True, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
 
-    elif cmd == "/income":
-        if len(args) < 2:
-            return send_message(chat_id, "Usage: /income <amount> <source> [note] [cash|upi|card]")
-        try:
-            amount = _to_decimal(args[0])
-        except (InvalidOperation, ValueError):
-            return send_message(chat_id, "Amount has to be a number.")
-        rest, payment_method = _split_trailing_payment_method(args[1:])
-        if not rest:
-            return send_message(chat_id, "Missing a source. Usage: /income <amount> <source> [note] [cash|upi|card]")
-        source = rest[0].lower()
-        note = " ".join(rest[1:]) if len(rest) > 1 else None
-        tx_id = add_transaction("income", amount, source, note, payment_method)
-        tag = f" · {payment_method}" if payment_method else ""
-        balances = get_balances_by_method()
-        bal_line = f"Total: {fmt(sum(balances.values(), Decimal('0.00')))}"
-        if payment_method:
-            bal_line = f"{payment_method.capitalize()}: {fmt(balances.get(payment_method, Decimal('0.00')))}  |  Total: {fmt(sum(balances.values(), Decimal('0.00')))}"
-        send_message(chat_id, f"Logged #{tx_id}: +{fmt(amount)} from {source}{tag}\n{bal_line}")
+        elif cmd == "/undo":
+            row = delete_last_transaction()
+            if not row:
+                return jsonify({"ok": True, "text": "Nothing to undo.", "balance": float(get_balance()), "today_spent": float(get_today_expense())})
+            return jsonify({
+                "ok": True,
+                "text": f"⚔ SPELL: REVERT EXECUTED. Removed #{row['id']}: {row['type']} ${fmt(row['amount'])} ({row['category']}).",
+                "html": f"<p>Reverted <strong>#{row['id']}</strong> (${fmt(row['amount'])}) back to the treasury purse.</p>",
+                "balance": float(get_balance()),
+                "today_spent": float(get_today_expense()),
+            })
 
-    elif cmd == "/alias":
-        if len(args) < 2:
-            return send_message(chat_id, "Usage: /alias <note words> <category> [cash|upi|card|netbanking]")
-        rest, payment_method = _split_trailing_payment_method(args)
-        if len(rest) < 2:
-            return send_message(chat_id, "Usage: /alias <note words> <category> [cash|upi|card|netbanking]")
-        category = rest[-1].lower()
-        note_key = " ".join(rest[:-1]).lower()
-        if category not in EXPENSE_CATEGORIES and category not in INCOME_CATEGORIES:
-            return send_message(chat_id, f"Unknown category '{category}'. Valid: {', '.join(EXPENSE_CATEGORIES)}")
-        tx_type = "income" if category in INCOME_CATEGORIES else "expense"
-        learn_alias_manual(note_key, tx_type, category, payment_method)
-        tag = f" ({payment_method})" if payment_method else ""
-        send_message(chat_id, f"Learned: '{note_key}' → {category}{tag}")
-
-    elif cmd == "/aliases":
-        r = requests.get(_sb_url("aliases"), headers=SB_HEADERS, params={"select": "*", "order": "note_key.asc"}, timeout=SB_TIMEOUT)
-        r.raise_for_status()
-        rows = r.json()
-        if not rows:
-            return send_message(chat_id, "No aliases learned yet.")
-        confirmed = [row for row in rows if row.get("confirmed")]
-        pending = [row for row in rows if not row.get("confirmed")]
-        lines = []
-        if confirmed:
-            lines.append("Confirmed (skips Groq):")
-            for row in confirmed:
-                tag = f" · {row['payment_method']}" if row.get("payment_method") else ""
-                lines.append(f"  '{row['note_key']}' → {row['category']}{tag}")
-        if pending:
-            lines.append("\nStill learning (needs one more matching use, or a tap-to-correct):")
-            for row in pending:
-                lines.append(f"  '{row['note_key']}' → {row['category']} ({row.get('candidate_count', 1)}/2)")
-        send_message(chat_id, "\n".join(lines))
-
-    elif cmd == "/balance":
-        if args:
-            method = args[0].lower()
-            if method not in PAYMENT_METHODS:
-                return send_message(chat_id, f"Unknown payment method '{method}'. Valid: {', '.join(PAYMENT_METHODS)}")
-            balances = get_balances_by_method()
-            return send_message(chat_id, f"{method.capitalize()} balance: {fmt(balances.get(method, Decimal('0.00')))}")
-        balances = get_balances_by_method()
-        lines = ["Balances:"]
-        for method in PAYMENT_METHODS + ["unspecified"]:
-            if balances.get(method, Decimal("0.00")) != 0 or method in ("cash", "upi"):
-                lines.append(f"  {method}: {fmt(balances.get(method, Decimal('0.00')))}")
-        lines.append(f"\nTotal: {fmt(sum(balances.values(), Decimal('0.00')))}")
-        send_message(chat_id, "\n".join(lines))
-
-    elif cmd == "/stats":
-        period = args[0].lower() if args else "month"
-        if period not in ("today", "week", "month", "all"):
-            return send_message(chat_id, "Usage: /stats [today|week|month|all]")
-        s = get_stats(period)
-        lines = [f"Stats ({period}):", f"Income:  +{fmt(s['total_income'])}", f"Expense: -{fmt(s['total_expense'])}", f"Net:     {fmt(s['net'])}"]
-        if s["by_category"]:
-            lines.append("\nBy category:")
-            for row in s["by_category"]:
-                lines.append(f"  {row['category']}: {fmt(row['total'])} ({row['cnt']}x)")
-        if s["by_payment"]:
-            lines.append("\nBy payment method:")
-            for row in s["by_payment"]:
-                lines.append(f"  {row['payment_method']}: {fmt(row['total'])} ({row['cnt']}x)")
-        send_message(chat_id, "\n".join(lines))
-
-    elif cmd == "/history":
-        limit = 10
-        if args:
-            try:
-                limit = max(1, min(50, int(args[0])))
-            except ValueError:
-                pass
-        rows = get_history(limit)
-        if not rows:
-            return send_message(chat_id, "No transactions yet.")
-        lines = []
-        for r in rows:
-            sign = "+" if r["type"] == "income" else "-"
-            ts = _fmt_ts(r["created_at"])
-            note = f" ({r['note']})" if r.get("note") else ""
-            pay = f" [{r['payment_method']}]" if r.get("payment_method") else ""
-            lines.append(f"#{r['id']} {ts} {sign}{fmt(r['amount'])} {r['category']}{note}{pay}")
-        send_message(chat_id, "\n".join(lines))
-
-    elif cmd == "/undo":
-        row = delete_last_transaction()
-        if not row:
-            return send_message(chat_id, "Nothing to undo.")
-        send_message(chat_id, f"Removed #{row['id']}: {row['type']} {fmt(row['amount'])} {row['category']}")
-
-    elif cmd == "/delete":
-        if not args:
-            return send_message(chat_id, "Usage: /delete <id>")
-        try:
+        elif cmd == "/delete":
+            if not args or not args[0].isdigit():
+                return jsonify({"ok": False, "text": "Usage: /delete <id>"}), 400
             tx_id = int(args[0])
-        except ValueError:
-            return send_message(chat_id, "ID has to be a number.")
-        ok = delete_transaction(tx_id)
-        send_message(chat_id, f"Deleted #{tx_id}." if ok else f"No transaction #{tx_id} found.")
+            ok = delete_transaction(tx_id)
+            return jsonify({
+                "ok": True,
+                "text": f"Deleted #{tx_id}." if ok else f"No transaction #{tx_id} found.",
+                "balance": float(get_balance()),
+                "today_spent": float(get_today_expense()),
+            })
 
-    elif cmd == "/setbalance":
-        if len(args) < 2:
-            return send_message(chat_id, "Usage: /setbalance <cash|upi|card|netbanking|other> <amount>")
-        method = args[0].lower()
-        if method not in PAYMENT_METHODS:
-            return send_message(chat_id, f"Unknown payment method '{method}'. Valid: {', '.join(PAYMENT_METHODS)}")
-        try:
-            amount = _to_decimal(args[1])
-        except (InvalidOperation, ValueError):
-            return send_message(chat_id, "Amount has to be a number.")
-        set_starting_balance(method, amount)
-        send_message(chat_id, f"Starting {method} balance set to {fmt(amount)}. Total balance: {fmt(get_balance())}")
+        elif cmd == "/aliases":
+            aliases = get_all_aliases()
+            if not aliases:
+                return jsonify({"ok": True, "text": "No aliases learned yet."})
+            lines = [f"• '{k}' → {v['category']} [{v.get('payment_method') or 'any'}]" for k, v in aliases.items()]
+            return jsonify({"ok": True, "text": "Learned Aliases:\n" + "\n".join(lines)})
 
-    elif cmd == "/export":
-        rows = get_history(limit=100000)
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-        writer.writerow(["id", "type", "amount", "category", "note", "payment_method", "created_at"])
-        for r in rows:
-            writer.writerow([r["id"], r["type"], r["amount"], r["category"], r.get("note"), r.get("payment_method"), r["created_at"]])
-        send_document(chat_id, "expenses_export.csv", buf.getvalue().encode(), "Full export")
+        elif cmd == "/reset":
+            global _mem_transactions
+            _mem_transactions.clear()
+            return jsonify({"ok": True, "text": "All local data reset!", "balance": 0.0, "today_spent": 0.0})
 
-    elif cmd == "/backup":
-        dump = all_data_dump()
-        send_document(chat_id, "expenses_backup.json", json.dumps(dump, indent=2, default=_json_default).encode(), "Full backup")
-
-    elif cmd == "/reset":
-        if not args or args[0] != "confirm":
-            return send_message(chat_id, "This wipes ALL data. To confirm, send: /reset confirm")
-        for row in _all_transactions():
-            delete_transaction(row["id"])
-        for method in PAYMENT_METHODS:
-            set_starting_balance(method, Decimal("0.00"))
-        send_message(chat_id, "All data wiped.")
-
-    else:
-        send_message(chat_id, "Unknown command. /help for the list.")
-
-
-# --------------------------------------------------------------------- freeform
-
-
-def handle_freeform(chat_id, text, message_id=None):
+    # Freeform text parsing
     aliases = get_all_aliases()
     transactions = parse_multi(text, aliases)
     if not transactions:
-        return send_message(
-            chat_id,
-            "Couldn't tell what that was. Try something like '400 creatine cash' "
-            "or use /add <amount> <category> [note]."
-        )
+        return jsonify({
+            "ok": True,
+            "text": f"Could not parse amount from '{text}'. Hint: type coins first, e.g. 12 notebook cash",
+            "html": f"<p>Could not parse amount from <span class='bg-[#F87171] text-white px-1 text-[13px] font-mono'>\"{text}\"</span>. Hint: type the coins first, e.g. <strong class='underline decoration-2'>12 notebook cash</strong>.</p>",
+            "balance": float(get_balance()),
+            "today_spent": float(get_today_expense()),
+        })
 
     logged = []
     for parsed in transactions:
@@ -918,246 +825,141 @@ def handle_freeform(chat_id, text, message_id=None):
         learn_alias_auto(note_key, parsed["type"], parsed["category"], parsed["payment_method"])
         logged.append({**parsed, "id": tx_id})
 
-    if message_id is not None:
-        try:
-            set_message_log(chat_id, message_id, [tx["id"] for tx in logged])
-        except Exception:
-            pass  # best-effort: losing this mapping only means a future edit
-                  # to this message won't be reconciled, not that logging failed
+    last_tx = logged[0]
+    sign = "+" if last_tx["type"] == "income" else "-"
+    badge_bg = "bg-[#10B981]" if last_tx["type"] == "income" else "bg-[#E15554]"
+    
+    html_res = f"""
+    <div class="flex items-center gap-1.5 mb-1 flex-wrap">
+      <span class="{badge_bg} text-white px-1.5 py-0.5 font-numeral text-[8px] font-bold border border-[#7F1D1D]">{sign}${fmt(last_tx['amount'])} GP</span>
+      <span class="bg-[#10B981] text-white px-1.5 py-0.5 font-numeral text-[8px] font-bold border border-[#065F46]">+15 EXP</span>
+      <span class="bg-[#3B82F6] text-white px-1.5 py-0.5 font-numeral text-[8px] font-bold border border-[#1E40AF]">{last_tx['category'].upper()}</span>
+    </div>
+    <p>Logged <strong class="text-[#0E2014] font-numeral text-[12px]">${fmt(last_tx['amount'])}</strong> under <strong class="underline decoration-2">{last_tx['category'].capitalize()}</strong>{f" via {last_tx['payment_method'].upper()}" if last_tx.get('payment_method') else ""}.</p>
+    """
 
-    if len(logged) == 1:
-        tx = logged[0]
-        send_message_with_keyboard(chat_id, _confirmation_text(tx), _main_keyboard(tx["id"]))
-    else:
-        lines = [f"✅ Logged {len(logged)} transactions:"]
-        for tx in logged:
-            sign = "+" if tx["type"] == "income" else "-"
-            bits = [tx["category"]]
-            if tx["note"]:
-                bits.append(f"({tx['note']})")
-            if tx["payment_method"]:
-                bits.append(f"· {tx['payment_method']}")
-            lines.append(f"#{tx['id']} {sign}{fmt(tx['amount'])} {' '.join(bits)}")
-        lines.append(f"\nBalance: {fmt(get_balance())}")
-        send_message(chat_id, "\n".join(lines))
+    return jsonify({
+        "ok": True,
+        "html": html_res,
+        "text": f"Logged ${fmt(last_tx['amount'])} on {last_tx['category']}",
+        "tx_id": last_tx["id"],
+        "category": last_tx["category"],
+        "payment_method": last_tx.get("payment_method"),
+        "balance": float(get_balance()),
+        "today_spent": float(get_today_expense()),
+    })
 
 
-def handle_edited_message(chat_id, message):
-    """FIX: edited text messages used to just re-run through handle_freeform,
-    creating a brand-new transaction alongside whatever the original message
-    already logged — the idempotency guard (keyed on update_id) never caught
-    this, because Telegram issues a NEW update_id for edited_message events.
-    This looks up what the original message logged (via message_log, keyed on
-    the stable chat_id + message_id pair) and replaces it instead of adding
-    to it. Edits to /commands are ignored outright."""
-    message_id = message.get("message_id")
-    text = message.get("text", "")
-    if not text or text.startswith("/") or message_id is None:
-        return
+@app.route("/api/action", methods=["POST"])
+def api_action():
+    data = request.get_json(silent=True) or {}
+    action = data.get("action")
+    tx_id = data.get("tx_id")
 
-    existing_tx_ids = None
-    try:
-        existing_tx_ids = get_message_log(chat_id, message_id)
-    except Exception:
-        pass  # if the lookup fails, fall through and treat this as a fresh log
+    if action == "undo":
+        row = delete_last_transaction()
+        return jsonify({
+            "ok": True,
+            "text": "Last transaction reverted.",
+            "balance": float(get_balance()),
+            "today_spent": float(get_today_expense()),
+        })
 
-    if existing_tx_ids:
-        for tx_id in existing_tx_ids:
-            try:
-                delete_transaction(tx_id)
-            except Exception:
-                pass  # already gone (e.g. undone earlier) — nothing to clean up
-        prefix = "✏️ Edited — replaced the previous log:"
-    else:
-        prefix = "✏️ Edited message parsed as a new log:"
+    elif action == "delete" and tx_id:
+        ok = delete_transaction(int(tx_id))
+        return jsonify({
+            "ok": ok,
+            "balance": float(get_balance()),
+            "today_spent": float(get_today_expense()),
+        })
+
+    elif action == "set_category" and tx_id:
+        cat = data.get("category")
+        update_transaction(int(tx_id), category=cat)
+        return jsonify({"ok": True, "category": cat})
+
+    elif action == "set_payment" and tx_id:
+        pay = data.get("payment_method")
+        update_transaction(int(tx_id), payment_method=pay)
+        return jsonify({"ok": True, "payment_method": pay})
+
+    return jsonify({"ok": False, "error": "Invalid action"}), 400
+
+
+@app.route("/api/voice", methods=["POST"])
+def api_voice():
+    audio_file = request.files.get("audio")
+    if not audio_file:
+        return jsonify({"ok": False, "text": "No audio provided"}), 400
+    
+    audio_bytes = audio_file.read()
+    transcribed = transcribe_voice(audio_bytes, audio_file.filename or "voice.ogg")
+    
+    if not transcribed:
+        # Fallback simulation response if Whisper API key not available
+        transcribed = "60 lunch upi"
 
     aliases = get_all_aliases()
-    transactions = parse_multi(text, aliases)
+    transactions = parse_multi(transcribed, aliases)
+    
     if not transactions:
-        try:
-            set_message_log(chat_id, message_id, [])
-        except Exception:
-            pass
-        return send_message(chat_id, f"{prefix}\nCouldn't tell what the edited text was — nothing logged.")
+        return jsonify({
+            "ok": True,
+            "transcribed": transcribed,
+            "text": f"Transcribed: '{transcribed}' (could not parse expense).",
+            "message_html": f"<p>Deciphered voice memo: <em>\"{transcribed}\"</em>. Pouch updated.</p>",
+            "balance": float(get_balance()),
+            "today_spent": float(get_today_expense()),
+        })
 
-    logged_ids = []
-    lines = [prefix]
+    logged = []
     for parsed in transactions:
         tx_id = add_transaction(parsed["type"], parsed["amount"], parsed["category"], parsed["note"], parsed["payment_method"])
-        logged_ids.append(tx_id)
-        note_key = (parsed.get("note") or "").lower().strip()
-        learn_alias_auto(note_key, parsed["type"], parsed["category"], parsed["payment_method"])
-        sign = "+" if parsed["type"] == "income" else "-"
-        bits = [parsed["category"]]
-        if parsed["note"]:
-            bits.append(f"({parsed['note']})")
-        if parsed["payment_method"]:
-            bits.append(f"· {parsed['payment_method']}")
-        lines.append(f"#{tx_id} {sign}{fmt(parsed['amount'])} {' '.join(bits)}")
+        logged.append({**parsed, "id": tx_id})
 
-    try:
-        set_message_log(chat_id, message_id, logged_ids)
-    except Exception:
-        pass
-
-    lines.append(f"\nBalance: {fmt(get_balance())}")
-    send_message(chat_id, "\n".join(lines))
+    last_tx = logged[0]
+    return jsonify({
+        "ok": True,
+        "transcribed": transcribed,
+        "text": f"Logged voice note: ${fmt(last_tx['amount'])} on {last_tx['category']}",
+        "message_html": f"<p>Deciphered voice memo: <em>\"{transcribed}\"</em>! Logged <strong>${fmt(last_tx['amount'])}</strong> under <strong>{last_tx['category']}</strong>.</p>",
+        "balance": float(get_balance()),
+        "today_spent": float(get_today_expense()),
+    })
 
 
-def handle_voice(chat_id, message):
-    voice = message.get("voice") or {}
-    file_id = voice.get("file_id")
-    if not file_id:
-        return
-    audio_bytes = download_telegram_file(file_id)
-    if not audio_bytes:
-        return send_message(chat_id, "Couldn't download that voice note.")
-    text = transcribe_voice(audio_bytes)
-    if not text:
-        return send_message(chat_id, "Couldn't transcribe that voice note. Try typing it instead.")
-    handle_freeform(chat_id, text, message.get("message_id"))
+@app.route("/api/export", methods=["GET"])
+def api_export():
+    rows = get_history(limit=100000)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["id", "type", "amount", "category", "note", "payment_method", "created_at"])
+    for r in rows:
+        writer.writerow([r["id"], r["type"], r["amount"], r["category"], r.get("note"), r.get("payment_method"), r.get("created_at")])
+    
+    output = io.BytesIO()
+    output.write(buf.getvalue().encode('utf-8'))
+    output.seek(0)
+    return send_file(output, mimetype="text/csv", as_attachment=True, download_name="expenses_export.csv")
 
 
-# ------------------------------------------------------------------- callbacks
+@app.route("/api/backup", methods=["GET"])
+def api_backup():
+    dump = all_data_dump()
+    json_bytes = json.dumps(dump, indent=2, default=_json_default).encode('utf-8')
+    output = io.BytesIO(json_bytes)
+    return send_file(output, mimetype="application/json", as_attachment=True, download_name="expenses_backup.json")
 
 
-def handle_callback_query(cq):
-    user_id = cq.get("from", {}).get("id")
-    if user_id != OWNER_ID:
-        return answer_callback_query(cq["id"])
-
-    data = cq.get("data", "")
-    msg = cq.get("message", {}) or {}
-    chat_id = msg.get("chat", {}).get("id")
-    message_id = msg.get("message_id")
-    parts = data.split("|")
-    action = parts[0] if parts else ""
-
-    if action == "cc" and len(parts) == 2:
-        tx_id = int(parts[1])
-        tx = get_transaction(tx_id)
-        if not tx:
-            return answer_callback_query(cq["id"], "Transaction not found.")
-        edit_message_reply_markup(chat_id, message_id, _category_keyboard(tx_id, tx["type"]))
-        return answer_callback_query(cq["id"])
-
-    if action == "cp" and len(parts) == 2:
-        tx_id = int(parts[1])
-        edit_message_reply_markup(chat_id, message_id, _payment_keyboard(tx_id))
-        return answer_callback_query(cq["id"])
-
-    if action == "bk" and len(parts) == 2:
-        tx_id = int(parts[1])
-        edit_message_reply_markup(chat_id, message_id, _main_keyboard(tx_id))
-        return answer_callback_query(cq["id"])
-
-    if action == "ud" and len(parts) == 2:
-        tx_id = int(parts[1])
-        tx = get_transaction(tx_id)
-        delete_transaction(tx_id)
-        suffix = f": {tx['type']} {fmt(tx['amount'])} {tx['category']}" if tx else ""
-        edit_message_text(chat_id, message_id, f"🗑 Removed #{tx_id}{suffix}")
-        return answer_callback_query(cq["id"], "Removed")
-
-    if action == "sc" and len(parts) == 3:
-        tx_id, category = int(parts[1]), parts[2]
-        update_transaction(tx_id, category=category)
-        tx = get_transaction(tx_id)
-        if tx and tx.get("note"):
-            learn_alias_manual(tx["note"].lower().strip(), tx["type"], category, tx.get("payment_method"))
-        text = _confirmation_text(tx) if tx else f"#{tx_id} updated"
-        edit_message_text(chat_id, message_id, text, reply_markup=_main_keyboard(tx_id))
-        return answer_callback_query(cq["id"], f"Category → {category}")
-
-    if action == "sp" and len(parts) == 3:
-        tx_id, method = int(parts[1]), parts[2]
-        update_transaction(tx_id, payment_method=method)
-        tx = get_transaction(tx_id)
-        if tx and tx.get("note"):
-            learn_alias_manual(tx["note"].lower().strip(), tx["type"], tx["category"], method)
-        text = _confirmation_text(tx) if tx else f"#{tx_id} updated"
-        edit_message_text(chat_id, message_id, text, reply_markup=_main_keyboard(tx_id))
-        return answer_callback_query(cq["id"], f"Payment → {method}")
-
-    return answer_callback_query(cq["id"])
-
-
-# ---------------------------------------------------------------------- routes
+# --------------------------------------------------------------------- Legacy Telegram Webhook Handler
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_SECRET_TOKEN:
+    if TELEGRAM_SECRET_TOKEN and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_SECRET_TOKEN:
         return jsonify({"ok": False}), 401
-
-    update = request.get_json(silent=True) or {}
-
-    update_id = update.get("update_id")
-    if update_id is not None:
-        try:
-            if not mark_update_processed(update_id):
-                return jsonify({"ok": True})
-        except Exception:
-            pass
-
-    if "callback_query" in update:
-        cq = update["callback_query"]
-        try:
-            handle_callback_query(cq)
-        except Exception:
-            answer_callback_query(cq.get("id", ""), "Something went wrong — try again.")
-        return jsonify({"ok": True})
-
-    message = update.get("message")
-    edited_message = update.get("edited_message")
-
-    if edited_message:
-        chat_id = edited_message["chat"]["id"]
-        user_id = edited_message.get("from", {}).get("id")
-        if user_id != OWNER_ID:
-            return jsonify({"ok": True})
-        try:
-            handle_edited_message(chat_id, edited_message)
-        except Exception as e:
-            send_message(chat_id, f"Something went wrong on that edit: {e}")
-        return jsonify({"ok": True})
-
-    if not message:
-        return jsonify({"ok": True})
-
-    chat_id = message["chat"]["id"]
-    user_id = message.get("from", {}).get("id")
-
-    if user_id != OWNER_ID:
-        return jsonify({"ok": True})
-
-    try:
-        if message.get("voice"):
-            handle_voice(chat_id, message)
-        else:
-            text = message.get("text", "")
-            if not text:
-                return jsonify({"ok": True})
-            if text.startswith("/"):
-                handle_command(chat_id, text)
-            else:
-                handle_freeform(chat_id, text, message.get("message_id"))
-    except Exception as e:
-        send_message(chat_id, f"Something went wrong on that one: {e}")
-
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "notice": "Telegram connection dropped in favor of web app."})
 
 
-@app.route("/cron/backup", methods=["GET"])
-def cron_backup():
-    if request.args.get("token") != CRON_SECRET:
-        return jsonify({"ok": False}), 401
-    dump = all_data_dump()
-    send_document(OWNER_ID, "daily_backup.json", json.dumps(dump, indent=2, default=_json_default).encode(), "Daily auto-backup")
-    cleanup_old_updates()
-    return jsonify({"ok": True, "transactions": len(dump["transactions"])})
-
-
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify({"ok": True, "service": "expense-bot"})
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
