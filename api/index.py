@@ -804,6 +804,9 @@ def api_message():
     if not text:
         return jsonify({"ok": False, "text": "Empty message."}), 400
 
+    # Log user turn
+    log_chat_message("user", text)
+
     # Command handling
     if text.startswith("/"):
         parts = text.split()
@@ -813,24 +816,32 @@ def api_message():
         if cmd == "/stats":
             period = args[0].lower() if args else "month"
             html = format_stats_html(period)
+            reply_text = f"Stats for {period} period."
+            log_chat_message("assistant", reply_text)
             return jsonify({"ok": True, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
 
         elif cmd == "/balance":
             html = format_balance_html()
+            log_chat_message("assistant", "Balance summary.")
             return jsonify({"ok": True, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
 
         elif cmd == "/history":
             limit = int(args[0]) if args and args[0].isdigit() else 5
             html = format_history_html(limit)
+            log_chat_message("assistant", f"Last {limit} transactions shown.")
             return jsonify({"ok": True, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
 
         elif cmd == "/undo":
             row = delete_last_transaction()
             if not row:
-                return jsonify({"ok": True, "text": "Nothing to undo.", "balance": float(get_balance()), "today_spent": float(get_today_expense())})
+                reply_text = "Nothing to undo."
+                log_chat_message("assistant", reply_text)
+                return jsonify({"ok": True, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
+            reply_text = f"Reverted #{row['id']}: {row['type']} ${fmt(row['amount'])} ({row['category']})."
+            log_chat_message("assistant", reply_text)
             return jsonify({
                 "ok": True,
-                "text": f"⚔ SPELL: REVERT EXECUTED. Removed #{row['id']}: {row['type']} ${fmt(row['amount'])} ({row['category']}).",
+                "text": f"SPELL: REVERT EXECUTED. Removed #{row['id']}: {row['type']} ${fmt(row['amount'])} ({row['category']}).",
                 "html": f"<p>Reverted <strong>#{row['id']}</strong> (${fmt(row['amount'])}) back to the treasury purse.</p>",
                 "balance": float(get_balance()),
                 "today_spent": float(get_today_expense()),
@@ -841,9 +852,11 @@ def api_message():
                 return jsonify({"ok": False, "text": "Usage: /delete <id>"}), 400
             tx_id = int(args[0])
             ok = delete_transaction(tx_id)
+            reply_text = f"Deleted #{tx_id}." if ok else f"No transaction #{tx_id} found."
+            log_chat_message("assistant", reply_text)
             return jsonify({
                 "ok": True,
-                "text": f"Deleted #{tx_id}." if ok else f"No transaction #{tx_id} found.",
+                "text": reply_text,
                 "balance": float(get_balance()),
                 "today_spent": float(get_today_expense()),
             })
@@ -851,22 +864,29 @@ def api_message():
         elif cmd == "/aliases":
             aliases = get_all_aliases()
             if not aliases:
-                return jsonify({"ok": True, "text": "No aliases learned yet."})
-            lines = [f"• '{k}' → {v['category']} [{v.get('payment_method') or 'any'}]" for k, v in aliases.items()]
-            return jsonify({"ok": True, "text": "Learned Aliases:\n" + "\n".join(lines)})
+                reply_text = "No aliases learned yet."
+                log_chat_message("assistant", reply_text)
+                return jsonify({"ok": True, "text": reply_text})
+            lines = [f"'{k}' -> {v['category']} [{v.get('payment_method') or 'any'}]" for k, v in aliases.items()]
+            reply_text = "Learned Aliases:\n" + "\n".join(lines)
+            log_chat_message("assistant", reply_text)
+            return jsonify({"ok": True, "text": reply_text})
 
         elif cmd == "/reset":
             global _mem_transactions
             _mem_transactions.clear()
+            log_chat_message("assistant", "All local data reset.")
             return jsonify({"ok": True, "text": "All local data reset!", "balance": 0.0, "today_spent": 0.0})
 
     # Freeform text parsing
     aliases = get_all_aliases()
     transactions = parse_multi(text, aliases)
     if not transactions:
+        reply_text = f"Could not parse amount from '{text}'. Hint: type coins first, e.g. 12 notebook cash"
+        log_chat_message("assistant", reply_text)
         return jsonify({
             "ok": True,
-            "text": f"Could not parse amount from '{text}'. Hint: type coins first, e.g. 12 notebook cash",
+            "text": reply_text,
             "html": f"<p>Could not parse amount from <span class='bg-[#F87171] text-white px-1 text-[13px] font-mono'>\"{text}\"</span>. Hint: type the coins first, e.g. <strong class='underline decoration-2'>12 notebook cash</strong>.</p>",
             "balance": float(get_balance()),
             "today_spent": float(get_today_expense()),
@@ -882,7 +902,8 @@ def api_message():
     last_tx = logged[0]
     sign = "+" if last_tx["type"] == "income" else "-"
     badge_bg = "bg-[#10B981]" if last_tx["type"] == "income" else "bg-[#E15554]"
-    
+    reply_text = f"Logged ${fmt(last_tx['amount'])} on {last_tx['category']}"
+    log_chat_message("assistant", reply_text)
     html_res = f"""
     <div class="flex items-center gap-1.5 mb-1 flex-wrap">
       <span class="{badge_bg} text-white px-1.5 py-0.5 font-numeral text-[8px] font-bold border border-[#7F1D1D]">{sign}${fmt(last_tx['amount'])} GP</span>
