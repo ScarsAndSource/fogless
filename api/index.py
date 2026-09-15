@@ -70,7 +70,7 @@ Income categories (pick exactly one per transaction): {", ".join(INCOME_CATEGORI
 Payment methods (pick exactly one if mentioned or clearly implied, else null): {", ".join(PAYMENT_METHODS)}
 
 Rules per transaction:
-- "type" is "expense" or "income". Assume "expense" unless words like salary, got paid, received, refund, credited clearly signal income.
+- "type" is "expense" or "income". Assume "expense" unless words like salary, got, got paid, received, earned, payout, credited, deposited, refund clearly signal money coming IN rather than going out (e.g. "got 424 upi" means ₹424 was received, so type is "income").
 - "amount" is a plain number (no currency symbols, no commas). "1.5k" or "2k" means 1500 / 2000.
 - "category" is exactly one value from the matching list above — pick the closest fit, never invent new categories.
 - "payment_method" is exactly one of the listed methods, or null if not mentioned.
@@ -119,6 +119,23 @@ def fmt(amount) -> str:
         return f"{val:,.2f}"
     except Exception:
         return str(amount)
+
+
+def send_telegram_message(chat_id, text: str) -> None:
+    """Send a plain-text reply back to a Telegram chat. Non-fatal: logs on error rather than crashing."""
+    if not TG_API:
+        print("[telegram] BOT_TOKEN not configured, cannot send message")
+        return
+    try:
+        r = requests.post(
+            f"{TG_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=10,
+        )
+        if r.status_code >= 300:
+            print(f"[telegram] sendMessage failed: {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"[telegram] sendMessage exception: {e}")
 
 
 # ---------------------------------------------------------------- data layer
@@ -497,7 +514,7 @@ def _parse_single_fallback_item(text):
         return None
 
     tx_type = "expense"
-    if any(w in text.lower() for w in ["income", "salary", "got paid", "received", "payout", "refund"]):
+    if any(w in text.lower() for w in ["income", "salary", "got paid", "got", "received", "earned", "payout", "refund", "credited", "deposited"]):
         tx_type = "income"
 
     amount = None
@@ -1168,14 +1185,29 @@ def api_history():
     return jsonify(get_chat_history(limit=limit))
 
 
-# --------------------------------------------------------------------- Legacy Telegram Webhook Handler
+# --------------------------------------------------------------------- Telegram Webhook Handler
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if TELEGRAM_SECRET_TOKEN and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_SECRET_TOKEN:
         return jsonify({"ok": False}), 401
-    return jsonify({"ok": True, "notice": "Telegram connection dropped in favor of web app."})
+
+    data = request.get_json(silent=True) or {}
+    msg = data.get("message") or data.get("edited_message") or {}
+    if not msg:
+        return jsonify({"ok": True})
+
+    chat_id = msg.get("chat", {}).get("id")
+    text = msg.get("text", "").strip()
+
+    if text and chat_id:
+        res = _process_text(text)
+        reply = res.get("text", "")
+        if reply:
+            send_telegram_message(chat_id, reply)
+
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
