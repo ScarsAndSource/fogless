@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&display=swap');
+
 /* ── Reset: smooth rendering, no forced pixel-art ── */
 *, *::before, *::after {
   box-sizing: border-box;
@@ -31,9 +33,12 @@ html, body {
   overflow: hidden;
 }
 
+body, input, textarea, button {
+  font-family: 'Space Mono', monospace;
+}
+
 body {
-  font-family: 'Pixelify Sans', system-ui, sans-serif;
-  font-size: 15px;
+  font-size: 14px;
   background: var(--linen);
   color: var(--ink);
   -webkit-font-smoothing: antialiased;
@@ -501,7 +506,7 @@ body {
   background: white;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  font-family: 'Pixelify Sans', sans-serif;
+  font-family: inherit;
   font-size: 13px;
   font-weight: 600;
   color: var(--ink);
