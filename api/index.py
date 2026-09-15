@@ -616,6 +616,45 @@ def transcribe_voice(audio_bytes, filename="voice.ogg"):
         return None
 
 
+# --------------------------------------------------------------------- chat log helpers
+
+
+def log_chat_message(role: str, content: str) -> None:
+    """Insert one chat turn into chat_log. Non-fatal: logs on error rather than crashing."""
+    if not (SUPABASE_URL and SUPABASE_KEY):
+        return
+    try:
+        resp = requests.post(
+            _sb_url("chat_log"),
+            headers={**SB_HEADERS, "Prefer": "return=minimal"},
+            json={"role": role, "content": content},
+            timeout=SB_TIMEOUT,
+        )
+        if resp.status_code >= 300:
+            print(f"[chat_log] insert failed: {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"[chat_log] insert exception: {e}")
+
+
+def get_chat_history(limit: int = 50) -> list:
+    """Return chat_log rows oldest-first, ready for chat-display order."""
+    if not (SUPABASE_URL and SUPABASE_KEY):
+        return []
+    try:
+        resp = requests.get(
+            _sb_url("chat_log"),
+            headers=SB_HEADERS,
+            params={"select": "*", "order": "created_at.desc", "limit": limit},
+            timeout=SB_TIMEOUT,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        return list(reversed(rows))  # oldest first for display
+    except Exception as e:
+        print(f"[chat_log] read exception: {e}")
+        return []
+
+
 # --------------------------------------------------------------------- HTML / Web Formatters
 
 
@@ -1051,6 +1090,13 @@ def api_aliases_list():
         for k, v in aliases.items()
     ]
     return jsonify(result)
+
+
+@app.route("/api/history", methods=["GET"])
+def api_history():
+    """Return persisted chat history (user + assistant turns) oldest-first."""
+    limit = request.args.get("limit", default=50, type=int)
+    return jsonify(get_chat_history(limit=limit))
 
 
 # --------------------------------------------------------------------- Legacy Telegram Webhook Handler

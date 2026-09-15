@@ -73,3 +73,17 @@ alter table aliases add column if not exists candidate_count integer not null de
 -- in as confirmed rather than silently disabling every alias you'd already
 -- taught the bot before today.
 update aliases set confirmed = true where confirmed = false;
+
+-- ============================================================================
+-- Migration: chat_log table.
+-- Persists every user message and assistant reply so the web frontend can
+-- restore full conversation history on page load via GET /api/history.
+-- ============================================================================
+create table if not exists chat_log (
+  id         bigint generated always as identity primary key,
+  role       text not null check (role in ('user', 'assistant')),
+  content    text not null,
+  created_at timestamptz not null default now()
+);
+alter table chat_log enable row level security;
+
