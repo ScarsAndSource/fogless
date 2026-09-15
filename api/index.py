@@ -966,6 +966,93 @@ def api_backup():
     return send_file(output, mimetype="application/json", as_attachment=True, download_name="expenses_backup.json")
 
 
+# --------------------------------------------------------------------- REST endpoints for web frontend
+
+
+@app.route("/api/transactions", methods=["GET"])
+def api_transactions():
+    """Return recent transactions, optionally filtered by payment_method."""
+    limit = request.args.get("limit", default=50, type=int)
+    payment_method = request.args.get("payment_method")
+
+    rows = _all_transactions(order="id.desc", limit=limit)
+    if payment_method:
+        rows = [r for r in rows if r.get("payment_method") == payment_method]
+
+    serialised = [
+        {
+            "id": r["id"],
+            "type": r["type"],
+            "amount": float(r["amount"]),
+            "category": r["category"],
+            "note": r.get("note"),
+            "payment_method": r.get("payment_method"),
+            "created_at": r.get("created_at"),
+        }
+        for r in rows
+    ]
+    return jsonify(serialised)
+
+
+@app.route("/api/balances", methods=["GET"])
+def api_balances():
+    """Return per-payment-method balances and the grand total."""
+    # Pull starting balances from settings (key = "starting_balance:<method>")
+    balances = {}
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            r = requests.get(
+                _sb_url("settings"),
+                headers=SB_HEADERS,
+                params={"select": "*", "key": "like.starting_balance:%"},
+                timeout=SB_TIMEOUT,
+            )
+            r.raise_for_status()
+            for row in r.json():
+                method = row["key"].split(":", 1)[1]
+                balances[method] = float(row["value"])
+        except Exception as e:
+            print(f"Balances: could not fetch starting balances: {e}")
+    else:
+        balances = {m: float(_mem_starting_balances.get(m, 0)) for m in PAYMENT_METHODS + ["unspecified"]}
+
+    # Apply all transactions
+    rows = _all_transactions()
+    for tx in rows:
+        method = tx.get("payment_method") or "unspecified"
+        amount = float(tx["amount"])
+        if method not in balances:
+            balances[method] = 0.0
+        if tx["type"] == "income":
+            balances[method] += amount
+        else:
+            balances[method] -= amount
+
+    # Remove zero-value untracked methods to keep response clean
+    balances = {k: round(v, 2) for k, v in balances.items()}
+    return jsonify({
+        "balances": balances,
+        "total": round(sum(balances.values()), 2),
+    })
+
+
+@app.route("/api/aliases", methods=["GET"])
+def api_aliases_list():
+    """Return all learned aliases as a list."""
+    aliases = get_all_aliases()
+    result = [
+        {
+            "note_key": k,
+            "type": v["type"],
+            "category": v["category"],
+            "payment_method": v.get("payment_method"),
+            "confirmed": v.get("confirmed", False),
+        }
+        for k, v in aliases.items()
+    ]
+    return jsonify(result)
+
+
 # --------------------------------------------------------------------- Legacy Telegram Webhook Handler
 
 
