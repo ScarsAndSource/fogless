@@ -712,15 +712,30 @@ def format_history_html(limit=5) -> str:
     """
 
 
+FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
+
+
 # ---------------------------------------------------------------------- Web Routes
 
 
 @app.route("/", methods=["GET"])
 def index():
-    index_path = os.path.join(BASE_DIR, "index.html")
+    index_path = os.path.join(FRONTEND_DIR, "index.html")
     if os.path.exists(index_path):
         return send_file(index_path)
+    root_index = os.path.join(BASE_DIR, "index.html")
+    if os.path.exists(root_index):
+        return send_file(root_index)
     return jsonify({"ok": True, "service": "Fogless 16-bit JRPG Finance Companion"})
+
+
+@app.route("/<path:filename>", methods=["GET"])
+def static_files(filename):
+    if not filename.startswith("api/") and not filename.startswith("webhook"):
+        file_path = os.path.join(FRONTEND_DIR, filename)
+        if os.path.exists(file_path):
+            return send_file(file_path)
+    return jsonify({"ok": False, "error": "Not Found"}), 404
 
 
 @app.route("/api/state", methods=["GET"])
