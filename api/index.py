@@ -62,8 +62,8 @@ _CURRENCY_WORDS = {"rs", "rs.", "inr", "rupees", "rupee", "bucks", "$", "gp"}
 
 
 MULTI_SYSTEM_PROMPT = f"""You are a strict JSON-extraction engine for a personal expense tracker.
-A message may describe ONE or SEVERAL transactions (separated by commas, "and", semicolons, or line breaks).
-Extract every transaction you find.
+A message may describe ONE or SEVERAL transactions (separated by line breaks, spaces, commas, "and", semicolons, or listed sequentially like "110 Food upi 100 Juice cash 100 biscuit").
+Extract EVERY transaction you find in the message.
 
 Expense categories (pick exactly one per transaction): {", ".join(EXPENSE_CATEGORIES)}
 Income categories (pick exactly one per transaction): {", ".join(INCOME_CATEGORIES)}
@@ -74,16 +74,16 @@ Rules per transaction:
 - "amount" is a plain number (no currency symbols, no commas). "1.5k" or "2k" means 1500 / 2000.
 - "category" is exactly one value from the matching list above — pick the closest fit, never invent new categories.
 - "payment_method" is exactly one of the listed methods, or null if not mentioned.
-- "note" is the short specific detail (e.g. the item/person/service), or null if there isn't one.
+- "note" is the short specific detail (e.g. item name like "coffee", "juice", "biscuit"), or null if there isn't one.
 
 If NOTHING in the message describes money changing hands, respond with {{"transactions": []}}.
 
-Respond with ONLY a raw JSON object matching this exact shape, nothing else — no markdown fences, no commentary:
+Respond with ONLY a raw JSON object matching this exact shape, nothing else:
 {{"transactions": [{{"type": "expense", "amount": 0, "category": "other", "payment_method": null, "note": null}}]}}
 """
 
 
-_MULTI_HINT_RE = re.compile(r",|;|\band\b|\n", re.IGNORECASE)
+_MULTI_HINT_RE = re.compile(r",|;|\band\b|\n|\b\d+(?:\.\d+)?\b.*?\b\d+(?:\.\d+)?\b", re.IGNORECASE | re.DOTALL)
 
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -491,8 +491,7 @@ def _call_groq_chat(text):
     return _fallback_rule_parse(text)
 
 
-def _fallback_rule_parse(text):
-    """Rule-based regex parser when Groq API key is absent or unavailable."""
+def _parse_single_fallback_item(text):
     tokens = text.lower().replace("₹", " ").replace("$", " ").split()
     if not tokens:
         return None
@@ -531,7 +530,7 @@ def _fallback_rule_parse(text):
 
     if not category:
         note_str = " ".join(note_words)
-        if any(w in note_str for w in ["lunch", "dinner", "food", "cafe", "restaurant", "burger", "pizza"]):
+        if any(w in note_str for w in ["lunch", "dinner", "food", "cafe", "restaurant", "burger", "pizza", "juice", "biscuit", "tea"]):
             category = "food"
         elif any(w in note_str for w in ["milk", "groceries", "veggies", "fruit", "market"]):
             category = "groceries"
@@ -545,7 +544,25 @@ def _fallback_rule_parse(text):
             category = "other"
 
     note = " ".join(note_words).strip() or None
-    return [{"type": tx_type, "amount": _to_decimal(amount), "category": category, "payment_method": payment_method, "note": note}]
+    return {"type": tx_type, "amount": _to_decimal(amount), "category": category, "payment_method": payment_method, "note": note}
+
+
+def _fallback_rule_parse(text):
+    """Rule-based regex parser when Groq API key is absent or unavailable."""
+    chunks = [c.strip() for c in re.split(r"[\n,;]|\band\b", text, flags=re.IGNORECASE) if c.strip()]
+
+    if len(chunks) == 1:
+        sub_chunks = re.findall(r"\d+(?:\.\d+)?\s+.*?(?=\s+\d+(?:\.\d+)?\s+|$)", text)
+        if len(sub_chunks) > 1:
+            chunks = [s.strip() for s in sub_chunks if s.strip()]
+
+    results = []
+    for chunk in chunks:
+        res = _parse_single_fallback_item(chunk)
+        if res:
+            results.append(res)
+
+    return results if results else None
 
 
 def quick_parse_single(text, aliases):
@@ -899,30 +916,61 @@ def api_message():
         learn_alias_auto(note_key, parsed["type"], parsed["category"], parsed["payment_method"])
         logged.append({**parsed, "id": tx_id})
 
-    last_tx = logged[0]
-    sign = "+" if last_tx["type"] == "income" else "-"
-    badge_bg = "bg-[#10B981]" if last_tx["type"] == "income" else "bg-[#E15554]"
-    reply_text = f"Logged ${fmt(last_tx['amount'])} on {last_tx['category']}"
-    log_chat_message("assistant", reply_text)
-    html_res = f"""
-    <div class="flex items-center gap-1.5 mb-1 flex-wrap">
-      <span class="{badge_bg} text-white px-1.5 py-0.5 font-numeral text-[8px] font-bold border border-[#7F1D1D]">{sign}${fmt(last_tx['amount'])} GP</span>
-      <span class="bg-[#10B981] text-white px-1.5 py-0.5 font-numeral text-[8px] font-bold border border-[#065F46]">+15 EXP</span>
-      <span class="bg-[#3B82F6] text-white px-1.5 py-0.5 font-numeral text-[8px] font-bold border border-[#1E40AF]">{last_tx['category'].upper()}</span>
-    </div>
-    <p>Logged <strong class="text-[#0E2014] font-numeral text-[12px]">${fmt(last_tx['amount'])}</strong> under <strong class="underline decoration-2">{last_tx['category'].capitalize()}</strong>{f" via {last_tx['payment_method'].upper()}" if last_tx.get('payment_method') else ""}.</p>
-    """
-
-    return jsonify({
-        "ok": True,
-        "html": html_res,
-        "text": f"Logged ${fmt(last_tx['amount'])} on {last_tx['category']}",
-        "tx_id": last_tx["id"],
-        "category": last_tx["category"],
-        "payment_method": last_tx.get("payment_method"),
-        "balance": float(get_balance()),
-        "today_spent": float(get_today_expense()),
-    })
+    if len(logged) == 1:
+        last_tx = logged[0]
+        sign = "+" if last_tx["type"] == "income" else "-"
+        badge_bg = "bg-[#10B981]" if last_tx["type"] == "income" else "bg-[#E15554]"
+        reply_text = f"Logged ₹{fmt(last_tx['amount'])} on {last_tx['category']}"
+        log_chat_message("assistant", reply_text)
+        html_res = f"""
+        <div class="flex items-center gap-1.5 mb-1 flex-wrap">
+          <span class="{badge_bg} text-white px-1.5 py-0.5 font-bold border border-[#7F1D1D]" style="font-size:10px;">{sign}₹{fmt(last_tx['amount'])} GP</span>
+          <span class="bg-[#10B981] text-white px-1.5 py-0.5 font-bold border border-[#065F46]" style="font-size:10px;">+15 EXP</span>
+          <span class="bg-[#3B82F6] text-white px-1.5 py-0.5 font-bold border border-[#1E40AF]" style="font-size:10px;">{last_tx['category'].upper()}</span>
+        </div>
+        <p>Logged <strong>₹{fmt(last_tx['amount'])}</strong> under <strong>{last_tx['category'].capitalize()}</strong>{f" via {last_tx['payment_method'].upper()}" if last_tx.get('payment_method') else ""}.</p>
+        """
+        return jsonify({
+            "ok": True,
+            "html": html_res,
+            "text": reply_text,
+            "tx_id": last_tx["id"],
+            "category": last_tx["category"],
+            "payment_method": last_tx.get("payment_method"),
+            "balance": float(get_balance()),
+            "today_spent": float(get_today_expense()),
+        })
+    else:
+        total_logged = sum(x["amount"] for x in logged)
+        reply_text = f"Logged {len(logged)} items totaling ₹{fmt(total_logged)}"
+        log_chat_message("assistant", reply_text)
+        items_html = ""
+        for tx in logged:
+            sign = "+" if tx["type"] == "income" else "-"
+            color = "#10B981" if tx["type"] == "income" else "#E15554"
+            items_html += f"""
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px dashed var(--border-light, #E8E0D0);">
+              <span>#{tx['id']} <strong>{tx['category'].capitalize()}</strong>{f" ({tx['note']})" if tx.get('note') else ""}{f" [{tx['payment_method']}]" if tx.get('payment_method') else ""}</span>
+              <span style="font-weight:bold;color:{color};">{sign}₹{fmt(tx['amount'])}</span>
+            </div>
+            """
+        html_res = f"""
+        <div style="margin-bottom:6px;display:flex;gap:6px;align-items:center;">
+          <span style="background:#10B981;color:white;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:bold;">+{len(logged)*15} EXP</span>
+          <span style="background:#8B5CF6;color:white;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:bold;">MULTI-LOG ({len(logged)} ITEMS)</span>
+        </div>
+        <div style="font-weight:bold;font-size:13px;margin-bottom:6px;">Logged {len(logged)} transactions (Total: ₹{fmt(total_logged)})</div>
+        <div style="background:#FAF8F3;border:1px solid var(--border, #D7CDBB);border-radius:6px;padding:8px;font-size:12px;">
+          {items_html}
+        </div>
+        """
+        return jsonify({
+            "ok": True,
+            "html": html_res,
+            "text": reply_text,
+            "balance": float(get_balance()),
+            "today_spent": float(get_today_expense()),
+        })
 
 
 @app.route("/api/action", methods=["POST"])

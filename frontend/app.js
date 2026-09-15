@@ -460,13 +460,22 @@ document.addEventListener('DOMContentLoaded', () => {
     commandHistory.push(text);
     historyIdx = -1;
     input.value = '';
+    input.style.height = 'auto';
     executeCommandText(text);
   }
 
   if (sendBtn) sendBtn.addEventListener('click', executeLog);
   if (input) {
     input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') executeLog();
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        executeLog();
+      }
+    });
+
+    input.addEventListener('input', () => {
+      input.style.height = 'auto';
+      input.style.height = Math.min(input.scrollHeight, 120) + 'px';
     });
   }
 
