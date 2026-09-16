@@ -570,6 +570,35 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   };
 
+  window.quickSetBalance = async function(method) {
+    const label = method.toUpperCase();
+    const raw = prompt(`Enter correct ${label} balance (₹):`);
+    if (raw === null) return;
+    const amt = parseFloat(raw.replace(/[^0-9.]/g, ''));
+    if (isNaN(amt) || amt < 0) {
+      alert('Enter a valid non-negative number.');
+      return;
+    }
+    playBeep(520);
+    try {
+      const res = await fetch('/api/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: `/balance ${amt} ${method}` })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        if (data.balance !== undefined) updateBalanceDisplay(data.balance);
+        if (data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
+        renderCompanionBubble(data.html || data.text || `${label} balance set to ₹${amt.toFixed(2)}.`);
+      } else {
+        renderCompanionBubble(data.text || `Could not set ${label} balance.`);
+      }
+    } catch(e) {
+      renderCompanionBubble(`⚠ Connection error — ${label} balance NOT changed. Try again.`);
+    }
+  };
+
   window.changeCategory = async function(txId) {
     const newCat = prompt("Enter new category (food, groceries, transport, bills, shopping, entertainment, health, rent, other):", "groceries");
     if (!newCat) return;
