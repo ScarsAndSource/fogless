@@ -154,7 +154,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _mem_transactions = []
 _mem_id_counter = 1
 _mem_aliases = {}
-_mem_starting_balances = {b: Decimal("0.00") for b in PAYMENT_METHODS + ["unspecified"]}
+_mem_starting_balances = {b: Decimal("0.00") for b in PAYMENT_METHODS}
 _mem_pool_contributions = []
 _mem_pool_expenses = []
 
@@ -418,7 +418,7 @@ def delete_last_transaction():
     return _delete_transaction_group(rows[0])
 
 
-BALANCE_BUCKETS = PAYMENT_METHODS + ["unspecified"]
+BALANCE_BUCKETS = PAYMENT_METHODS
 
 
 def _settings_key(method: str) -> str:
@@ -475,15 +475,15 @@ def get_balances_by_method() -> dict:
     for r in rows:
         rtype = r.get("type")
         if rtype == "transfer":
-            frm = r.get("from_bucket") or "unspecified"
-            to = r.get("to_bucket") or "unspecified"
+            frm = r.get("from_bucket") or "cash"
+            to = r.get("to_bucket") or "cash"
             result.setdefault(frm, Decimal("0.00"))
             result.setdefault(to, Decimal("0.00"))
             amt = Decimal(str(r["amount"]))
             result[frm] -= amt
             result[to] += amt
             continue
-        method = r.get("payment_method") or "unspecified"
+        method = r.get("payment_method") or "cash"
         if method not in result:
             result[method] = Decimal("0.00")
         if rtype == "income":
@@ -551,7 +551,7 @@ def get_stats(period="month"):
             by_cat[c]["total"] += amt
             by_cat[c]["cnt"] += 1
 
-            p = r.get("payment_method") or "unspecified"
+            p = r.get("payment_method") or "cash"
             by_pay.setdefault(p, {"total": Decimal("0.00"), "cnt": 0})
             by_pay[p]["total"] += amt
             by_pay[p]["cnt"] += 1
@@ -767,7 +767,7 @@ def _validate_debt_item(data):
     if share_type in ("contribution", "pool_expense") and not pool:
         return None
 
-    payment_method = data.get("payment_method") if data.get("payment_method") in PAYMENT_METHODS else "unspecified"
+    payment_method = data.get("payment_method") if data.get("payment_method") in PAYMENT_METHODS else "cash"
     category = data.get("category") if data.get("category") in EXPENSE_CATEGORIES else "other"
     note = data.get("note") or None
     repayment_direction = data.get("repayment_direction") if data.get("repayment_direction") in ("they_paid_me", "i_paid_them") else "they_paid_me"
@@ -784,7 +784,7 @@ def _apply_debt_transaction(item):
     used only for building the reply message — nothing here is re-read from the DB afterwards."""
     share_type = item["share_type"]
     amount = item["amount"]
-    method = item.get("payment_method") or "unspecified"
+    method = item.get("payment_method") or "cash"
     note = item.get("note")
     category = item.get("category") or "other"
     people = item.get("people") or []
@@ -1365,17 +1365,8 @@ def api_state():
     })
 
 
-@app.route("/api/message", methods=["POST"])
-def api_message():
-    data = request.get_json(silent=True) or {}
-    text = data.get("text", "").strip()
-    if not text:
-        return jsonify({"ok": False, "text": "Empty message."}), 400
-
-    # Log user turn
-    log_chat_message("user", text)
-
-    # Command handling
+def _process_text(text: str):
+    """Processes natural language input or slash commands and returns a response dictionary."""
     if text.startswith("/"):
         parts = text.split()
         cmd = parts[0].lower()
@@ -1386,7 +1377,7 @@ def api_message():
             html = format_stats_html(period)
             reply_text = f"Stats for {period} period."
             log_chat_message("assistant", reply_text)
-            return jsonify({"ok": True, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
+            return {"ok": True, "html": html, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
 
         elif cmd in ("/balance", "/setbalance"):
             if args:
@@ -1394,7 +1385,7 @@ def api_message():
                 target_amount = None
                 for a in args:
                     clean_a = a.lower().replace("₹", "").replace("$", "").replace(",", "")
-                    if clean_a in PAYMENT_METHODS or clean_a == "unspecified":
+                    if clean_a in PAYMENT_METHODS:
                         target_method = clean_a
                     else:
                         m = re.match(r"^(\d+(?:\.\d+)?)(k)?$", clean_a)
@@ -1408,74 +1399,115 @@ def api_message():
                     reply_text = f"Set {target_method.capitalize()} starting balance to ₹{fmt(target_amount)}."
                     html = format_balance_html()
                     log_chat_message("assistant", reply_text)
-                    return jsonify({
+                    return {
                         "ok": True,
                         "text": reply_text,
                         "html": html,
                         "balance": float(get_balance()),
                         "today_spent": float(get_today_expense()),
-                    })
+                    }
             html = format_balance_html()
             log_chat_message("assistant", "Balance summary.")
-            return jsonify({"ok": True, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
+            return {"ok": True, "text": "Balance summary.", "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
+
+        elif cmd == "/settle":
+            person = args[0].lower() if len(args) > 0 else ""
+            try:
+                amt = _to_decimal(args[1].replace("₹", "").replace("$", "").replace(",", "")) if len(args) > 1 else Decimal("0.00")
+            except Exception:
+                amt = Decimal("0.00")
+            method = args[2].lower() if len(args) > 2 and args[2].lower() in PAYMENT_METHODS else "cash"
+            if not person or amt <= 0:
+                reply_text = "Usage: /settle <person> <amount> [payment_method]"
+                log_chat_message("assistant", reply_text)
+                return ({"ok": False, "text": reply_text}, 400)
+            item = _validate_debt_item({
+                "share_type": "repayment",
+                "repayment_direction": "they_paid_me",
+                "amount": amt,
+                "people": [person],
+                "payment_method": method,
+            })
+            if item:
+                r = _apply_debt_transaction(item)
+                reply_text = f"{person.capitalize()} paid back ₹{fmt(amt)}."
+                html_res = f"""
+                <div class="space-y-1.5">
+                  <div class="flex items-center gap-1.5 mb-1">
+                    <span class="bg-[#10B981] text-white px-1.5 py-0.5 font-bold border border-[#065F46]" style="font-size:10px;">DEBT SETTLED</span>
+                  </div>
+                  <p class="text-[12px]"><strong>{person.capitalize()}</strong> paid back <strong>₹{fmt(amt)}</strong> via {method.upper()}.</p>
+                </div>
+                """
+            else:
+                reply_text = "Failed to settle debt."
+                html_res = "<p>Invalid settlement parameters.</p>"
+            log_chat_message("assistant", reply_text)
+            return {
+                "ok": True,
+                "text": reply_text,
+                "html": html_res,
+                "balance": float(get_balance()),
+                "today_spent": float(get_today_expense()),
+            }
 
         elif cmd == "/history":
             limit = int(args[0]) if args and args[0].isdigit() else 5
             html = format_history_html(limit)
             log_chat_message("assistant", f"Last {limit} transactions shown.")
-            return jsonify({"ok": True, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
+            return {"ok": True, "text": f"Last {limit} transactions shown.", "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
 
         elif cmd == "/undo":
             row = delete_last_transaction()
             if not row:
                 reply_text = "Nothing to undo."
                 log_chat_message("assistant", reply_text)
-                return jsonify({"ok": True, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
+                return {"ok": True, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
             reply_text = f"Reverted #{row['id']}: {row['type']} ₹{fmt(row['amount'])} ({row['category']})."
             log_chat_message("assistant", reply_text)
-            return jsonify({
+            return {
                 "ok": True,
                 "text": f"SPELL: REVERT EXECUTED. Removed #{row['id']}: {row['type']} ₹{fmt(row['amount'])} ({row['category']}).",
                 "html": f"<p>Reverted <strong>#{row['id']}</strong> (₹{fmt(row['amount'])}) back to the treasury purse.</p>",
                 "balance": float(get_balance()),
                 "today_spent": float(get_today_expense()),
-            })
+            }
 
         elif cmd == "/delete":
             if not args or not args[0].isdigit():
-                return jsonify({"ok": False, "text": "Usage: /delete <id>"}), 400
+                return ({"ok": False, "text": "Usage: /delete <id>"}, 400)
             tx_id = int(args[0])
             ok = delete_transaction(tx_id)
             reply_text = f"Deleted #{tx_id}." if ok else f"No transaction #{tx_id} found."
             log_chat_message("assistant", reply_text)
-            return jsonify({
+            return {
                 "ok": True,
                 "text": reply_text,
                 "balance": float(get_balance()),
                 "today_spent": float(get_today_expense()),
-            })
+            }
 
         elif cmd == "/aliases":
             aliases = get_all_aliases()
             if not aliases:
                 reply_text = "No aliases learned yet."
                 log_chat_message("assistant", reply_text)
-                return jsonify({"ok": True, "text": reply_text})
+                return {"ok": True, "text": reply_text}
             lines = [f"'{k}' -> {v['category']} [{v.get('payment_method') or 'any'}]" for k, v in aliases.items()]
             reply_text = "Learned Aliases:\n" + "\n".join(lines)
             log_chat_message("assistant", reply_text)
-            return jsonify({"ok": True, "text": reply_text})
+            return {"ok": True, "text": reply_text}
 
         elif cmd == "/reset":
             global _mem_transactions
             _mem_transactions.clear()
             log_chat_message("assistant", "All local data reset.")
-            return jsonify({"ok": True, "text": "All local data reset!", "balance": 0.0, "today_spent": 0.0})
+            return {"ok": True, "text": "All local data reset!", "balance": 0.0, "today_spent": 0.0}
 
         elif cmd == "/debts":
             html = format_debts_html()
             log_chat_message("assistant", "IOU ledger shown.")
-            return jsonify({"ok": True, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
+            return {"ok": True, "text": "IOU ledger shown.", "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
 
         elif cmd == "/pool":
             pool_name = args[0].lower().replace(" ", "-") if args else None
@@ -1492,7 +1524,7 @@ def api_message():
                     </div>
                     """
                     log_chat_message("assistant", reply_text)
-                    return jsonify({"ok": True, "text": reply_text, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
+                    return {"ok": True, "text": reply_text, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
 
                 pool_cards = []
                 for p in pools:
@@ -1518,7 +1550,7 @@ def api_message():
                 """
                 reply_text = f"Known pools: {', '.join(pools)}"
                 log_chat_message("assistant", reply_text)
-                return jsonify({"ok": True, "text": reply_text, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
+                return {"ok": True, "text": reply_text, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
             s = get_pool_summary(pool_name)
             contrib_lines = "".join(
                 f"<div class='flex justify-between py-0.5 border-b border-[#E5DFC9]'><span>{p.capitalize()}</span><span class='font-numeral text-[10px] font-bold'>+₹{fmt(a)}</span></div>"
@@ -1552,14 +1584,13 @@ def api_message():
             </div>
             """
             log_chat_message("assistant", f"Pool summary for {pool_name}.")
-            return jsonify({"ok": True, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
-
+            return {"ok": True, "text": f"Pool summary for {pool_name}.", "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
 
     # Check for natural language balance setting intent
     bal_match = re.search(r"\b(?:set|update|my)\s+(?:(\w+)\s+)?balance\s+(?:to|is|=)?\s*(?:₹|\$)?\s*(\d+(?:\.\d+)?k?)\b|\bset\s+balance\s+(?:to|is|=)?\s*(?:₹|\$)?\s*(\d+(?:\.\d+)?k?)(?:\s+in|\s+for|\s+on|\s+to)?(?:\s+(\w+))?\b", text, re.IGNORECASE)
     if bal_match and not text.startswith("/"):
         m_method = (bal_match.group(1) or bal_match.group(4) or "cash").lower()
-        if m_method not in PAYMENT_METHODS and m_method != "unspecified":
+        if m_method not in PAYMENT_METHODS:
             m_method = "cash"
         raw_amt = bal_match.group(2) or bal_match.group(3)
         if raw_amt:
@@ -1574,13 +1605,13 @@ def api_message():
                     reply_text = f"Set {m_method.capitalize()} treasury balance to ₹{fmt(val)}."
                     html = format_balance_html()
                     log_chat_message("assistant", reply_text)
-                    return jsonify({
+                    return {
                         "ok": True,
                         "text": reply_text,
                         "html": html,
                         "balance": float(get_balance()),
                         "today_spent": float(get_today_expense()),
-                    })
+                    }
             except Exception as e:
                 print(f"Error parsing balance setting: {e}")
 
@@ -1589,13 +1620,13 @@ def api_message():
     if not transactions:
         reply_text = f"Could not parse amount from '{text}'. Hint: type coins first, e.g. 12 notebook cash"
         log_chat_message("assistant", reply_text)
-        return jsonify({
+        return {
             "ok": True,
             "text": reply_text,
             "html": f"<p>Could not parse amount from <span class='bg-[#F87171] text-white px-1 text-[13px] font-mono'>\"{text}\"</span>. Hint: type the coins first, e.g. <strong class='underline decoration-2'>12 notebook cash</strong>.</p>",
             "balance": float(get_balance()),
             "today_spent": float(get_today_expense()),
-        })
+        }
 
     # Check if transaction is a debt/shared item
     if len(transactions) == 1 and transactions[0].get("share_type"):
@@ -1697,13 +1728,13 @@ def api_message():
             html_res = "<p>Debt transaction recorded.</p>"
 
         log_chat_message("assistant", reply_text)
-        return jsonify({
+        return {
             "ok": True,
             "html": html_res,
             "text": reply_text,
             "balance": float(get_balance()),
             "today_spent": float(get_today_expense()),
-        })
+        }
 
     logged = []
     for parsed in transactions:
@@ -1730,7 +1761,7 @@ def api_message():
         </div>
         <p>Logged <strong>₹{fmt(last_tx['amount'])}</strong> under <strong>{last_tx['category'].capitalize()}</strong>{f" via {last_tx['payment_method'].upper()}" if last_tx.get('payment_method') else ""}.</p>
         """
-        return jsonify({
+        return {
             "ok": True,
             "html": html_res,
             "text": reply_text,
@@ -1739,7 +1770,7 @@ def api_message():
             "payment_method": last_tx.get("payment_method"),
             "balance": float(get_balance()),
             "today_spent": float(get_today_expense()),
-        })
+        }
     else:
         total_logged = sum(x["amount"] for x in logged)
         reply_text = f"Logged {len(logged)} items totaling ₹{fmt(total_logged)}"
@@ -1764,13 +1795,29 @@ def api_message():
           {items_html}
         </div>
         """
-        return jsonify({
+        return {
             "ok": True,
             "html": html_res,
             "text": reply_text,
             "balance": float(get_balance()),
             "today_spent": float(get_today_expense()),
-        })
+        }
+
+
+@app.route("/api/message", methods=["POST"])
+def api_message():
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "").strip()
+    if not text:
+        return jsonify({"ok": False, "text": "Empty message."}), 400
+
+    # Log user turn
+    log_chat_message("user", text)
+
+    res = _process_text(text)
+    if isinstance(res, tuple):
+        return jsonify(res[0]), res[1]
+    return jsonify(res)
 
 
 @app.route("/api/action", methods=["POST"])
@@ -1922,12 +1969,12 @@ def api_balances():
         except Exception as e:
             print(f"Balances: could not fetch starting balances: {e}")
     else:
-        balances = {m: float(_mem_starting_balances.get(m, 0)) for m in PAYMENT_METHODS + ["unspecified"]}
+        balances = {m: float(_mem_starting_balances.get(m, 0)) for m in PAYMENT_METHODS}
 
     # Apply all transactions
     rows = _all_transactions()
     for tx in rows:
-        method = tx.get("payment_method") or "unspecified"
+        method = tx.get("payment_method") or "cash"
         amount = float(tx["amount"])
         if method not in balances:
             balances[method] = 0.0
