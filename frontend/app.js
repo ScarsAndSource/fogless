@@ -224,25 +224,17 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Command directory chips
+  // Command directory chips & Quick Action panel buttons
   document.querySelectorAll('.cmd-chip').forEach(chip => {
     chip.addEventListener('click', () => {
       playBeep(520);
-      const cmd = chip.textContent.trim();
-      if (cmd === '/stats') {
-        fetchAndDisplayStats();
-      } else if (cmd === '/balance') {
-        fetchAndDisplayBalance();
-      } else if (cmd === '/history') {
-        fetchAndDisplayHistory();
-      } else if (cmd === '/undo') {
-        handleQuickUndo();
-      } else if (cmd === '/aliases') {
-        executeCommandText('/aliases');
-      } else if (cmd === '/export') {
+      const cmd = chip.getAttribute('data-cmd') || chip.textContent.trim();
+      if (cmd === '/export') {
         window.location.href = '/api/export';
       } else if (cmd === '/backup') {
         window.location.href = '/api/backup';
+      } else if (cmd.startsWith('/')) {
+        executeCommandText(cmd);
       } else {
         input.value = cmd + ' ';
         input.focus();

@@ -1481,9 +1481,44 @@ def api_message():
             pool_name = args[0].lower().replace(" ", "-") if args else None
             if not pool_name:
                 pools = list_known_pools()
-                reply_text = "Known pools: " + ", ".join(pools) if pools else "No pools created yet. Try: put 500 into goa pool"
+                if not pools:
+                    reply_text = "No pools created yet. Try: put 500 into goa pool"
+                    html = f"""
+                    <div class="space-y-1.5">
+                      <div class="font-bold text-[13px] text-[#142B1A]">🏊 Shared Pools</div>
+                      <div class="pixel-window-jrpg p-2 text-[12px]">
+                        <p class="text-[#6B7280] italic">No pools created yet. Try: <strong>put 500 into goa pool</strong></p>
+                      </div>
+                    </div>
+                    """
+                    log_chat_message("assistant", reply_text)
+                    return jsonify({"ok": True, "text": reply_text, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
+
+                pool_cards = []
+                for p in pools:
+                    s = get_pool_summary(p)
+                    pool_cards.append(f"""
+                    <div class="border-b border-[#E5DFC9] pb-1 mb-1">
+                      <div class="flex justify-between font-bold text-[12px] text-[#142B1A]">
+                        <span>⚡ {p.upper()} Pool</span>
+                        <span class="font-numeral text-[10px] text-[#059669] font-bold">₹{fmt(s['balance'])} LEFT</span>
+                      </div>
+                      <div class="text-[10px] text-[#6B7280]">In: ₹{fmt(s['total_in'])} | Out: ₹{fmt(s['total_out'])}</div>
+                    </div>
+                    """)
+                html = f"""
+                <div class="space-y-1.5">
+                  <div class="font-bold text-[13px] text-[#142B1A] flex justify-between">
+                    <span>🏊 Shared Pools ({len(pools)})</span>
+                  </div>
+                  <div class="pixel-window-jrpg p-2 text-[12px] space-y-1">
+                    {"".join(pool_cards)}
+                  </div>
+                </div>
+                """
+                reply_text = f"Known pools: {', '.join(pools)}"
                 log_chat_message("assistant", reply_text)
-                return jsonify({"ok": True, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
+                return jsonify({"ok": True, "text": reply_text, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
             s = get_pool_summary(pool_name)
             contrib_lines = "".join(
                 f"<div class='flex justify-between py-0.5 border-b border-[#E5DFC9]'><span>{p.capitalize()}</span><span class='font-numeral text-[10px] font-bold'>+₹{fmt(a)}</span></div>"

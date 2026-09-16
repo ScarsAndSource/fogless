@@ -160,19 +160,19 @@
           <span id="drawer-close-btn">✕ close</span>
         </div>
         <div id="slash-chips">
-          <button class="cmd-chip">/stats</button>
-          <button class="cmd-chip">/balance</button>
-          <button class="cmd-chip">/undo</button>
-          <button class="cmd-chip">/history</button>
-          <button class="cmd-chip">/income</button>
-          <button class="cmd-chip">/add</button>
-          <button class="cmd-chip">/delete</button>
-          <button class="cmd-chip">/alias</button>
-          <button class="cmd-chip">/aliases</button>
-          <button class="cmd-chip">/export</button>
-          <button class="cmd-chip">/backup</button>
-          <button class="cmd-chip">/setbalance</button>
-          <button class="cmd-chip">/reset</button>
+          <button class="cmd-chip" data-cmd="/stats">/stats</button>
+          <button class="cmd-chip" data-cmd="/balance">/balance</button>
+          <button class="cmd-chip" data-cmd="/debts">/debts</button>
+          <button class="cmd-chip" data-cmd="/pool">/pool</button>
+          <button class="cmd-chip" data-cmd="/undo">/undo</button>
+          <button class="cmd-chip" data-cmd="/history">/history</button>
+          <button class="cmd-chip" data-cmd="/aliases">/aliases</button>
+          <button class="cmd-chip" data-cmd="600 dinner upi split with rahul">/split template</button>
+          <button class="cmd-chip" data-cmd="gave rahul 200 cash">/lend template</button>
+          <button class="cmd-chip" data-cmd="put 500 into goa pool">/pool template</button>
+          <button class="cmd-chip" data-cmd="/export">/export</button>
+          <button class="cmd-chip" data-cmd="/backup">/backup</button>
+          <button class="cmd-chip" data-cmd="/reset">/reset</button>
         </div>
       </div>
 
@@ -207,7 +207,13 @@
           <span class="panel-btn-icon">📊</span> Stats
         </button>
         <button class="panel-btn cmd-chip" data-cmd="/balance">
-          <span class="panel-btn-icon">💰</span> Balance
+          <span class="panel-btn-icon">💰</span> Balances
+        </button>
+        <button class="panel-btn cmd-chip" data-cmd="/debts">
+          <span class="panel-btn-icon">⚡</span> Debts & IOUs
+        </button>
+        <button class="panel-btn cmd-chip" data-cmd="/pool">
+          <span class="panel-btn-icon">🏊</span> Shared Pools
         </button>
         <button class="panel-btn cmd-chip" data-cmd="/history">
           <span class="panel-btn-icon">📜</span> History
