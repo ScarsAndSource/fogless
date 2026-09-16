@@ -450,14 +450,36 @@ def get_starting_balances() -> dict:
 
 
 def set_starting_balance(method: str, amount) -> None:
-    amount_dec = _to_decimal(amount)
-    _mem_starting_balances[method] = amount_dec
+    target_dec = _to_decimal(amount)
+    rows = _all_transactions()
+    net_tx = Decimal("0.00")
+    for r in rows:
+        rtype = r.get("type")
+        if rtype == "transfer":
+            frm = r.get("from_bucket") or "cash"
+            to = r.get("to_bucket") or "cash"
+            amt = Decimal(str(r["amount"]))
+            if frm == method:
+                net_tx -= amt
+            if to == method:
+                net_tx += amt
+        else:
+            m = r.get("payment_method") or "cash"
+            if m == method:
+                amt = Decimal(str(r["amount"]))
+                if rtype == "income":
+                    net_tx += amt
+                else:
+                    net_tx -= amt
+
+    start_bal = target_dec - net_tx
+    _mem_starting_balances[method] = start_bal
     if SUPABASE_URL and SUPABASE_KEY:
         try:
             r = requests.post(
                 _sb_url("settings"),
                 headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
-                json={"key": _settings_key(method), "value": str(amount_dec)},
+                json={"key": _settings_key(method), "value": str(start_bal)},
                 timeout=SB_TIMEOUT,
             )
             r.raise_for_status()
@@ -1396,7 +1418,7 @@ def _process_text(text: str):
                             target_amount = val
                 if target_amount is not None:
                     set_starting_balance(target_method, target_amount)
-                    reply_text = f"Set {target_method.capitalize()} starting balance to ₹{fmt(target_amount)}."
+                    reply_text = f"Set {target_method.capitalize()} balance to ₹{fmt(target_amount)}."
                     html = format_balance_html()
                     log_chat_message("assistant", reply_text)
                     return {
