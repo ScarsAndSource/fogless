@@ -547,10 +547,10 @@ document.addEventListener('DOMContentLoaded', () => {
       });
       const data = await res.json();
       if (data.ok && data.balance !== undefined) updateBalanceDisplay(data.balance);
+      if (data.ok && data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
       renderCompanionBubble(data.text || `⚔ SPELL: REVERT EXECUTED. Restored GP to the treasury purse.`);
     } catch(e) {
-      updateBalanceDisplay(currentBalance + 60.00);
-      renderCompanionBubble(`⚔ SPELL: REVERT EXECUTED. Restored ₹60.00 GP back to the treasury purse.`);
+      renderCompanionBubble(`⚠ Connection error — undo did NOT go through. Balance unchanged. Try again.`);
     }
   };
 
