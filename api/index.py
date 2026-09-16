@@ -451,6 +451,7 @@ def get_starting_balances() -> dict:
 
 def set_starting_balance(method: str, amount) -> None:
     amount_dec = _to_decimal(amount)
+    _mem_starting_balances[method] = amount_dec
     if SUPABASE_URL and SUPABASE_KEY:
         try:
             r = requests.post(
@@ -461,9 +462,8 @@ def set_starting_balance(method: str, amount) -> None:
             )
             r.raise_for_status()
             return
-        except Exception:
-            pass
-    _mem_starting_balances[method] = amount_dec
+        except Exception as e:
+            print(f"Supabase write error setting balance: {e}")
 
 
 def get_balances_by_method() -> dict:
@@ -493,10 +493,14 @@ def get_balances_by_method() -> dict:
     return result
 
 
+def get_liquid_balances() -> dict:
+    """Returns only real wallet/bank liquid payment pouches (excluding virtual debt/pool buckets)."""
+    balances = get_balances_by_method()
+    return {k: v for k, v in balances.items() if not k.startswith("iou:") and not k.startswith("pool:")}
+
+
 def get_debt_balances() -> dict:
-    """Positive = that person owes you. Negative = you owe them. A receivable/payable is just
-    money parked in an iou:<person> bucket instead of a real one, so this falls straight out of
-    get_balances_by_method() with no separate accounting to keep in sync."""
+    """Positive = that person owes you. Negative = you owe them."""
     balances = get_balances_by_method()
     result = {}
     for bucket, amt in balances.items():
@@ -506,7 +510,8 @@ def get_debt_balances() -> dict:
 
 
 def get_balance() -> Decimal:
-    return sum(get_balances_by_method().values(), Decimal("0.00"))
+    """Total liquid treasury balance available in liquid pouches."""
+    return sum(get_liquid_balances().values(), Decimal("0.00"))
 
 
 def get_today_expense() -> Decimal:
@@ -1225,16 +1230,25 @@ def format_stats_html(period="month") -> str:
 
 
 def format_balance_html() -> str:
-    balances = get_balances_by_method()
-    total_bal = sum(balances.values(), Decimal("0.00"))
+    liquid = get_liquid_balances()
+    total_bal = sum(liquid.values(), Decimal("0.00"))
     
     rows_html = ""
     for method in PAYMENT_METHODS:
-        amt = balances.get(method, Decimal("0.00"))
+        amt = liquid.get(method, Decimal("0.00"))
         rows_html += f"""
         <div class="flex justify-between py-0.5 border-b border-[#E5DFC9]">
           <span>{method.capitalize()} Pouch</span>
           <span class="font-numeral text-[10px] font-bold text-[#142B1A]">₹{fmt(amt)}</span>
+        </div>
+        """
+
+    unspecified_amt = liquid.get("unspecified", Decimal("0.00"))
+    if unspecified_amt != Decimal("0.00"):
+        rows_html += f"""
+        <div class="flex justify-between py-0.5 border-b border-[#E5DFC9]">
+          <span>General Pouch</span>
+          <span class="font-numeral text-[10px] font-bold text-[#142B1A]">₹{fmt(unspecified_amt)}</span>
         </div>
         """
 
@@ -1374,7 +1388,33 @@ def api_message():
             log_chat_message("assistant", reply_text)
             return jsonify({"ok": True, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
 
-        elif cmd == "/balance":
+        elif cmd in ("/balance", "/setbalance"):
+            if args:
+                target_method = "cash"
+                target_amount = None
+                for a in args:
+                    clean_a = a.lower().replace("₹", "").replace("$", "").replace(",", "")
+                    if clean_a in PAYMENT_METHODS or clean_a == "unspecified":
+                        target_method = clean_a
+                    else:
+                        m = re.match(r"^(\d+(?:\.\d+)?)(k)?$", clean_a)
+                        if m:
+                            val = Decimal(m.group(1))
+                            if m.group(2) == "k":
+                                val *= Decimal("1000")
+                            target_amount = val
+                if target_amount is not None:
+                    set_starting_balance(target_method, target_amount)
+                    reply_text = f"Set {target_method.capitalize()} starting balance to ₹{fmt(target_amount)}."
+                    html = format_balance_html()
+                    log_chat_message("assistant", reply_text)
+                    return jsonify({
+                        "ok": True,
+                        "text": reply_text,
+                        "html": html,
+                        "balance": float(get_balance()),
+                        "today_spent": float(get_today_expense()),
+                    })
             html = format_balance_html()
             log_chat_message("assistant", "Balance summary.")
             return jsonify({"ok": True, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
@@ -1479,6 +1519,35 @@ def api_message():
             log_chat_message("assistant", f"Pool summary for {pool_name}.")
             return jsonify({"ok": True, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
 
+
+    # Check for natural language balance setting intent
+    bal_match = re.search(r"\b(?:set|update|my)\s+(?:(\w+)\s+)?balance\s+(?:to|is|=)?\s*(?:₹|\$)?\s*(\d+(?:\.\d+)?k?)\b|\bset\s+balance\s+(?:to|is|=)?\s*(?:₹|\$)?\s*(\d+(?:\.\d+)?k?)(?:\s+in|\s+for|\s+on|\s+to)?(?:\s+(\w+))?\b", text, re.IGNORECASE)
+    if bal_match and not text.startswith("/"):
+        m_method = (bal_match.group(1) or bal_match.group(4) or "cash").lower()
+        if m_method not in PAYMENT_METHODS and m_method != "unspecified":
+            m_method = "cash"
+        raw_amt = bal_match.group(2) or bal_match.group(3)
+        if raw_amt:
+            try:
+                clean_amt = raw_amt.lower()
+                m_k = re.match(r"^(\d+(?:\.\d+)?)(k)?$", clean_amt)
+                if m_k:
+                    val = Decimal(m_k.group(1))
+                    if m_k.group(2) == "k":
+                        val *= Decimal("1000")
+                    set_starting_balance(m_method, val)
+                    reply_text = f"Set {m_method.capitalize()} treasury balance to ₹{fmt(val)}."
+                    html = format_balance_html()
+                    log_chat_message("assistant", reply_text)
+                    return jsonify({
+                        "ok": True,
+                        "text": reply_text,
+                        "html": html,
+                        "balance": float(get_balance()),
+                        "today_spent": float(get_today_expense()),
+                    })
+            except Exception as e:
+                print(f"Error parsing balance setting: {e}")
 
     aliases = get_all_aliases()
     transactions = parse_multi(text, aliases)
