@@ -87,3 +87,41 @@ create table if not exists chat_log (
 );
 alter table chat_log enable row level security;
 
+-- ============================================================================
+-- Migration: Shared / Debt / Pool money support.
+-- 1. Update transactions type constraint to allow 'transfer'
+-- 2. Add transfer columns: from_bucket, to_bucket, person, pool, linked_tx_id
+-- 3. Create pool_contributions and pool_expenses tables
+-- ============================================================================
+
+-- Drop old check constraint on transactions.type if present and re-add to include 'transfer'
+alter table transactions drop constraint if exists transactions_type_check;
+alter table transactions add constraint transactions_type_check check (type in ('expense', 'income', 'transfer'));
+
+alter table transactions add column if not exists from_bucket text;
+alter table transactions add column if not exists to_bucket text;
+alter table transactions add column if not exists person text;
+alter table transactions add column if not exists pool text;
+alter table transactions add column if not exists linked_tx_id bigint;
+
+create table if not exists pool_contributions (
+  id bigint generated always as identity primary key,
+  pool text not null,
+  person text not null,
+  amount numeric not null,
+  note text,
+  created_at timestamptz not null default now()
+);
+alter table pool_contributions enable row level security;
+
+create table if not exists pool_expenses (
+  id bigint generated always as identity primary key,
+  pool text not null,
+  amount numeric not null,
+  category text not null,
+  note text,
+  created_at timestamptz not null default now()
+);
+alter table pool_expenses enable row level security;
+
+

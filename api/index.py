@@ -58,28 +58,89 @@ INCOME_CATEGORIES = ["salary", "freelance", "gift", "refund", "other"]
 PAYMENT_METHODS = ["cash", "upi", "card", "netbanking", "other"]
 
 
-_CURRENCY_WORDS = {"rs", "rs.", "inr", "rupees", "rupee", "bucks", "$", "gp"}
+_CURRENCY_WORDS = {"rs", "rs.", "inr", "rupees", "rupee", "bucks", "$", "₹", "gp"}
 
 
-MULTI_SYSTEM_PROMPT = f"""You are a strict JSON-extraction engine for a personal expense tracker.
-A message may describe ONE or SEVERAL transactions (separated by line breaks, spaces, commas, "and", semicolons, or listed sequentially like "110 Food upi 100 Juice cash 100 biscuit").
-Extract EVERY transaction you find in the message.
+MULTI_SYSTEM_PROMPT = f"""You are a strict JSON-extraction engine for a personal expense tracker that also tracks
+money shared with other people (splitting bills, lending, borrowing, repayments) and shared pooled funds.
+
+A message may describe ONE or SEVERAL transactions (separated by line breaks, spaces, commas, "and", semicolons,
+or listed sequentially like "110 Food upi 100 Juice cash 100 biscuit"). Extract EVERY transaction you find.
 
 Expense categories (pick exactly one per transaction): {", ".join(EXPENSE_CATEGORIES)}
 Income categories (pick exactly one per transaction): {", ".join(INCOME_CATEGORIES)}
 Payment methods (pick exactly one if mentioned or clearly implied, else null): {", ".join(PAYMENT_METHODS)}
 
-Rules per transaction:
-- "type" is "expense" or "income". Assume "expense" unless words like salary, got, got paid, received, earned, payout, credited, deposited, refund clearly signal money coming IN rather than going out (e.g. "got 424 upi" means ₹424 was received, so type is "income").
+=== NORMAL TRANSACTIONS (no other person or pool involved) ===
+- "type" is "expense" or "income". Assume "expense" unless words like salary, got, got paid, received, earned,
+  payout, credited, deposited, refund clearly signal money coming IN (e.g. "got 424 upi" means income).
+  EXCEPTION: if the message names another person or a shared pool (see below), do NOT apply this rule at all —
+  use the SHARED & DEBT rules instead. "share_type" always overrides "type" when it is set.
 - "amount" is a plain number (no currency symbols, no commas). "1.5k" or "2k" means 1500 / 2000.
 - "category" is exactly one value from the matching list above — pick the closest fit, never invent new categories.
 - "payment_method" is exactly one of the listed methods, or null if not mentioned.
 - "note" is the short specific detail (e.g. item name like "coffee", "juice", "biscuit"), or null if there isn't one.
 
+=== SHARED & DEBT MONEY (another named person or a named pool is involved) ===
+Set "share_type" whenever a message involves another person's money or a shared pool. When set, it OVERRIDES the
+normal type/income logic above entirely. Still fill "type"/"category" with a reasonable placeholder — they are
+only actually used for "split" and "pool_expense", and ignored for the others.
+
+share_type = "split"
+  You paid the FULL amount yourself for something shared. Your own share becomes a normal personal expense; each
+  named person owes an equal share. Set "people" to the list of OTHER people involved (never include yourself).
+  Triggers: "split with X", "X's share", "split N ways with X and Y", "paid for me and X".
+  Example: "600 dinner upi, split with rahul"
+    -> {{"type":"expense","amount":600,"category":"food","payment_method":"upi","note":"dinner","share_type":"split","people":["rahul"],"pool":null,"repayment_direction":null}}
+  Example: "900 cabin split three ways with rahul and priya" -> amount 900, people ["rahul","priya"] (you + 2 others = 3-way split, category "travel" or "other" as fits).
+
+share_type = "lend"
+  You GAVE another person money directly — not a shared purchase, the full amount is now owed to you.
+  Triggers: "gave X ...", "lent X ...", "paid for X" with no split/share language present.
+  Example: "gave rahul 200 cash" -> {{"amount":200,"payment_method":"cash","share_type":"lend","people":["rahul"]}}
+
+share_type = "borrow"
+  Another person gave YOU money as a loan — you now owe them.
+  Triggers: "borrowed ... from X".
+  Example: "borrowed 500 cash from priya" -> {{"amount":500,"payment_method":"cash","share_type":"borrow","people":["priya"]}}
+
+share_type = "repayment"
+  Settles part or all of an EXISTING debt, in either direction. Always set "repayment_direction":
+    "they_paid_me" — someone who owed you paid some/all of it back.
+      Triggers: "X paid me back ...", "X paid back ...", "X returned ...", "X repaid ..." — AND, whenever a
+      person's name follows "from", also: "got ... from X", "received ... from X". A named "from X" always means
+      a debt settlement, never generic income.
+      Example: "rahul paid back 150"
+        -> {{"amount":150,"share_type":"repayment","repayment_direction":"they_paid_me","people":["rahul"]}}
+      Example: "got 150 upi from rahul"
+        -> {{"amount":150,"payment_method":"upi","share_type":"repayment","repayment_direction":"they_paid_me","people":["rahul"]}}
+      These two examples are DIFFERENT WORDS for the SAME EVENT and must produce identical share_type,
+      repayment_direction, amount, and people.
+    "i_paid_them" — you paid back money you had borrowed.
+      Triggers: "paid X back ...", "settled up with X ...", "cleared my debt to X ...".
+      Example: "paid priya back 300 upi"
+        -> {{"amount":300,"payment_method":"upi","share_type":"repayment","repayment_direction":"i_paid_them","people":["priya"]}}
+
+share_type = "contribution"
+  YOU put your own money into a named shared pool/fund. Set "pool" to a short lowercase name (turn spaces into
+  hyphens), no "people" needed.
+  Triggers: "put ... into the X pool/fund", "added ... to X pool", "contributed ... to X".
+  Example: "put 500 into goa pool" -> {{"amount":500,"share_type":"contribution","pool":"goa"}}
+
+share_type = "pool_contribution_other"
+  SOMEONE ELSE put money into a named pool — your own cash does not move. Set "people" to that one person and
+  "pool" to the pool name.
+  Example: "priya put 500 into goa pool" -> {{"amount":500,"share_type":"pool_contribution_other","people":["priya"],"pool":"goa"}}
+
+share_type = "pool_expense"
+  Money was spent FROM a named pool, not your personal cash. Set "pool" and "category".
+  Example: "paid 1200 hotel from goa pool" -> {{"amount":1200,"category":"travel","share_type":"pool_expense","pool":"goa"}}
+
 If NOTHING in the message describes money changing hands, respond with {{"transactions": []}}.
 
 Respond with ONLY a raw JSON object matching this exact shape, nothing else:
-{{"transactions": [{{"type": "expense", "amount": 0, "category": "other", "payment_method": null, "note": null}}]}}
+{{"transactions": [{{"type": "expense", "amount": 0, "category": "other", "payment_method": null, "note": null,
+"share_type": null, "people": [], "pool": null, "repayment_direction": null}}]}}
 """
 
 
@@ -94,6 +155,8 @@ _mem_transactions = []
 _mem_id_counter = 1
 _mem_aliases = {}
 _mem_starting_balances = {b: Decimal("0.00") for b in PAYMENT_METHODS + ["unspecified"]}
+_mem_pool_contributions = []
+_mem_pool_expenses = []
 
 
 app = Flask(__name__)
@@ -179,6 +242,54 @@ def add_transaction(tx_type, amount, category, note, payment_method=None) -> int
         "category": category,
         "note": note,
         "payment_method": payment_method,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return tx_id
+
+
+def add_transfer(amount, from_bucket, to_bucket, note, person=None, pool=None, linked_tx_id=None) -> int:
+    """A zero-sum move of money between two 'buckets'. Buckets can be real payment methods
+    (cash/upi/card/...) or virtual ones: iou:<person> for a debt, pool:<name> for your own stake
+    in a shared pool. Never counted as income or expense — get_stats() ignores type=='transfer'
+    automatically since it only ever checks for 'income'/'expense'."""
+    global _mem_id_counter
+    amount_dec = _to_decimal(amount)
+
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            payload = {
+                "type": "transfer",
+                "amount": str(amount_dec),
+                "from_bucket": from_bucket,
+                "to_bucket": to_bucket,
+                "note": note,
+                "person": person,
+                "pool": pool,
+                "linked_tx_id": linked_tx_id,
+            }
+            r = requests.post(
+                _sb_url("transactions"),
+                headers={**SB_HEADERS, "Prefer": "return=representation"},
+                json=payload,
+                timeout=SB_TIMEOUT,
+            )
+            r.raise_for_status()
+            return r.json()[0]["id"]
+        except Exception as e:
+            print(f"Supabase write error (transfer), falling back to memory: {e}")
+
+    tx_id = _mem_id_counter
+    _mem_id_counter += 1
+    _mem_transactions.append({
+        "id": tx_id,
+        "type": "transfer",
+        "amount": amount_dec,
+        "from_bucket": from_bucket,
+        "to_bucket": to_bucket,
+        "note": note,
+        "person": person,
+        "pool": pool,
+        "linked_tx_id": linked_tx_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
     return tx_id
@@ -288,12 +399,23 @@ def delete_transaction(tx_id) -> bool:
     return len(_mem_transactions) < initial_len
 
 
+def _delete_transaction_group(anchor_row):
+    """Delete a transaction plus any others linked to the same logical action — e.g. a split's
+    personal-expense row and every per-person transfer row that came from it. Without this,
+    /undo right after a split would only remove one friend's share and leave the rest orphaned."""
+    link_id = anchor_row.get("linked_tx_id") or anchor_row["id"]
+    all_rows = _all_transactions()
+    group = [r for r in all_rows if r["id"] == link_id or r.get("linked_tx_id") == link_id]
+    for r in group:
+        delete_transaction(r["id"])
+    return group
+
+
 def delete_last_transaction():
     rows = _all_transactions(limit=1)
     if not rows:
         return None
-    delete_transaction(rows[0]["id"])
-    return rows[0]
+    return _delete_transaction_group(rows[0])
 
 
 BALANCE_BUCKETS = PAYMENT_METHODS + ["unspecified"]
@@ -345,16 +467,41 @@ def set_starting_balance(method: str, amount) -> None:
 
 
 def get_balances_by_method() -> dict:
+    """Grand ledger across every bucket — real payment methods AND virtual iou:*/pool:* buckets.
+    Transfers move money between two buckets with zero net effect on the total; income/expense
+    move it into or out of exactly one bucket, same as before."""
     rows = _all_transactions()
     result = get_starting_balances()
     for r in rows:
+        rtype = r.get("type")
+        if rtype == "transfer":
+            frm = r.get("from_bucket") or "unspecified"
+            to = r.get("to_bucket") or "unspecified"
+            result.setdefault(frm, Decimal("0.00"))
+            result.setdefault(to, Decimal("0.00"))
+            amt = Decimal(str(r["amount"]))
+            result[frm] -= amt
+            result[to] += amt
+            continue
         method = r.get("payment_method") or "unspecified"
         if method not in result:
             result[method] = Decimal("0.00")
-        if r["type"] == "income":
+        if rtype == "income":
             result[method] += Decimal(str(r["amount"]))
         else:
             result[method] -= Decimal(str(r["amount"]))
+    return result
+
+
+def get_debt_balances() -> dict:
+    """Positive = that person owes you. Negative = you owe them. A receivable/payable is just
+    money parked in an iou:<person> bucket instead of a real one, so this falls straight out of
+    get_balances_by_method() with no separate accounting to keep in sync."""
+    balances = get_balances_by_method()
+    result = {}
+    for bucket, amt in balances.items():
+        if bucket.startswith("iou:"):
+            result[bucket[len("iou:"):]] = amt
     return result
 
 
@@ -416,7 +563,12 @@ def get_stats(period="month"):
 
 
 def all_data_dump():
-    return {"transactions": _all_transactions(order="id.asc"), "starting_balances": get_starting_balances()}
+    return {
+        "transactions": _all_transactions(order="id.asc"),
+        "starting_balances": get_starting_balances(),
+        "pool_contributions": get_pool_contributions(),
+        "pool_expenses": get_pool_expenses(),
+    }
 
 
 # --------------------------------------------------------- aliases
@@ -458,8 +610,108 @@ def learn_alias_auto(note_key, tx_type, category, payment_method=None):
         _mem_aliases[note_key]["confirmed"] = True
 
 
-# ------------------------------------------------------------------ nlp layer
+# --------------------------------------------------------- pools
 
+
+def add_pool_contribution(pool_name, person, amount, note=None):
+    amount_dec = _to_decimal(amount)
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            r = requests.post(
+                _sb_url("pool_contributions"),
+                headers={**SB_HEADERS, "Prefer": "return=representation"},
+                json={"pool": pool_name, "person": person, "amount": str(amount_dec), "note": note},
+                timeout=SB_TIMEOUT,
+            )
+            r.raise_for_status()
+            return
+        except Exception as e:
+            print(f"Supabase write error (pool_contribution), falling back to memory: {e}")
+    _mem_pool_contributions.append({
+        "pool": pool_name, "person": person, "amount": amount_dec, "note": note,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+def add_pool_expense(pool_name, amount, category, note=None):
+    amount_dec = _to_decimal(amount)
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            r = requests.post(
+                _sb_url("pool_expenses"),
+                headers={**SB_HEADERS, "Prefer": "return=representation"},
+                json={"pool": pool_name, "amount": str(amount_dec), "category": category, "note": note},
+                timeout=SB_TIMEOUT,
+            )
+            r.raise_for_status()
+            return
+        except Exception as e:
+            print(f"Supabase write error (pool_expense), falling back to memory: {e}")
+    _mem_pool_expenses.append({
+        "pool": pool_name, "amount": amount_dec, "category": category, "note": note,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+def get_pool_contributions(pool_name=None):
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            params = {"select": "*"}
+            if pool_name:
+                params["pool"] = f"eq.{pool_name}"
+            r = requests.get(_sb_url("pool_contributions"), headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
+            r.raise_for_status()
+            return r.json(parse_float=Decimal)
+        except Exception as e:
+            print(f"Supabase read error (pool_contributions), falling back to memory: {e}")
+    rows = _mem_pool_contributions
+    return [r for r in rows if r["pool"] == pool_name] if pool_name else list(rows)
+
+
+def get_pool_expenses(pool_name=None):
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            params = {"select": "*"}
+            if pool_name:
+                params["pool"] = f"eq.{pool_name}"
+            r = requests.get(_sb_url("pool_expenses"), headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
+            r.raise_for_status()
+            return r.json(parse_float=Decimal)
+        except Exception as e:
+            print(f"Supabase read error (pool_expenses), falling back to memory: {e}")
+    rows = _mem_pool_expenses
+    return [r for r in rows if r["pool"] == pool_name] if pool_name else list(rows)
+
+
+def get_pool_summary(pool_name):
+    contributions = get_pool_contributions(pool_name)
+    expenses = get_pool_expenses(pool_name)
+    total_in = sum((Decimal(str(c["amount"])) for c in contributions), Decimal("0.00"))
+    total_out = sum((Decimal(str(e["amount"])) for e in expenses), Decimal("0.00"))
+    balance = total_in - total_out
+
+    by_person = {}
+    for c in contributions:
+        by_person[c["person"]] = by_person.get(c["person"], Decimal("0.00")) + Decimal(str(c["amount"]))
+
+    # v1 simplification: pool spend is assumed split evenly across everyone who has contributed.
+    num_people = max(len(by_person), 1)
+    fair_share = (total_out / num_people) if num_people else Decimal("0.00")
+    net_position = {p: (amt - fair_share) for p, amt in by_person.items()}
+
+    return {
+        "pool": pool_name, "total_in": total_in, "total_out": total_out, "balance": balance,
+        "by_person": by_person, "fair_share": fair_share, "net_position": net_position,
+        "expenses": expenses,
+    }
+
+
+def list_known_pools():
+    names = set(c["pool"] for c in get_pool_contributions()) | set(e["pool"] for e in get_pool_expenses())
+    return sorted(names)
+
+
+# ------------------------------------------------------------------ nlp layer
 
 def _validate_item(data):
     if not data or data.get("type") not in ("expense", "income"):
@@ -475,6 +727,110 @@ def _validate_item(data):
     payment_method = data.get("payment_method") if data.get("payment_method") in PAYMENT_METHODS else None
     note = data.get("note") or None
     return {"type": data["type"], "amount": amount, "category": category, "payment_method": payment_method, "note": note}
+
+
+def _validate_debt_item(data):
+    """Validates the SHARED & DEBT branch (share_type set). Returned dicts always carry a
+    'share_type' key — that's how downstream code tells a debt item apart from a normal one."""
+    if not data or not data.get("share_type"):
+        return None
+    share_type = data["share_type"]
+    if share_type not in ("split", "lend", "borrow", "repayment", "contribution", "pool_contribution_other", "pool_expense"):
+        return None
+    try:
+        amount = _to_decimal(data["amount"])
+    except (TypeError, ValueError, KeyError, InvalidOperation):
+        return None
+    if amount <= 0:
+        return None
+
+    people_raw = data.get("people")
+    if isinstance(people_raw, list) and people_raw:
+        people = [str(p).strip().lower() for p in people_raw if str(p).strip()]
+    elif data.get("person"):
+        people = [str(data["person"]).strip().lower()]
+    else:
+        people = []
+
+    pool = data.get("pool")
+    pool = str(pool).strip().lower().replace(" ", "-") if pool else None
+
+    if share_type in ("split", "lend", "borrow", "repayment") and not people:
+        return None
+    if share_type == "pool_contribution_other" and (not pool or not people):
+        return None
+    if share_type in ("contribution", "pool_expense") and not pool:
+        return None
+
+    payment_method = data.get("payment_method") if data.get("payment_method") in PAYMENT_METHODS else "unspecified"
+    category = data.get("category") if data.get("category") in EXPENSE_CATEGORIES else "other"
+    note = data.get("note") or None
+    repayment_direction = data.get("repayment_direction") if data.get("repayment_direction") in ("they_paid_me", "i_paid_them") else "they_paid_me"
+
+    return {
+        "share_type": share_type, "amount": amount, "people": people, "pool": pool,
+        "payment_method": payment_method, "category": category, "note": note,
+        "repayment_direction": repayment_direction,
+    }
+
+
+def _apply_debt_transaction(item):
+    """Routes a validated debt item into the actual ledger writes and returns a summary dict
+    used only for building the reply message — nothing here is re-read from the DB afterwards."""
+    share_type = item["share_type"]
+    amount = item["amount"]
+    method = item.get("payment_method") or "unspecified"
+    note = item.get("note")
+    category = item.get("category") or "other"
+    people = item.get("people") or []
+    pool = item.get("pool")
+    person = people[0] if people else None
+
+    if share_type == "split":
+        num_people = 1 + len(people)
+        my_share = _to_decimal(amount / num_people)
+        total_others = amount - my_share
+        tx_id = add_transaction("expense", my_share, category, note, method)
+        per_person = _to_decimal(total_others / len(people))
+        running = Decimal("0.00")
+        breakdown = []
+        for i, p in enumerate(people):
+            amt_i = per_person if i < len(people) - 1 else (total_others - running)
+            running += amt_i
+            add_transfer(amt_i, method, f"iou:{p}", note, person=p, linked_tx_id=tx_id)
+            breakdown.append((p, amt_i))
+        return {"kind": "split", "tx_id": tx_id, "my_share": my_share, "people": breakdown, "method": method, "category": category}
+
+    elif share_type == "lend":
+        add_transfer(amount, method, f"iou:{person}", note, person=person)
+        return {"kind": "lend", "amount": amount, "who": person, "method": method}
+
+    elif share_type == "borrow":
+        add_transfer(amount, f"iou:{person}", method, note, person=person)
+        return {"kind": "borrow", "amount": amount, "who": person, "method": method}
+
+    elif share_type == "repayment":
+        direction = item.get("repayment_direction", "they_paid_me")
+        if direction == "they_paid_me":
+            add_transfer(amount, f"iou:{person}", method, note, person=person)
+        else:
+            add_transfer(amount, method, f"iou:{person}", note, person=person)
+        return {"kind": "repayment", "direction": direction, "amount": amount, "who": person, "method": method}
+
+    elif share_type == "contribution":
+        add_transfer(amount, method, f"pool:{pool}", note, pool=pool)
+        add_pool_contribution(pool, "me", amount, note)
+        return {"kind": "contribution", "amount": amount, "who": pool, "method": method}
+
+    elif share_type == "pool_contribution_other":
+        add_pool_contribution(pool, person, amount, note)
+        return {"kind": "pool_contribution_other", "amount": amount, "who": pool, "person": person}
+
+    elif share_type == "pool_expense":
+        add_pool_expense(pool, amount, category, note)
+        return {"kind": "pool_expense", "amount": amount, "who": pool, "category": category}
+
+    return None
 
 
 def _call_groq_chat(text):
@@ -500,7 +856,11 @@ def _call_groq_chat(text):
         data = json.loads(content, parse_float=Decimal)
         raw_items = data.get("transactions") if isinstance(data, dict) else None
         if raw_items:
-            results = [item for item in (_validate_item(x) for x in raw_items) if item is not None]
+            results = []
+            for x in raw_items:
+                v = _validate_debt_item(x) if x.get("share_type") else _validate_item(x)
+                if v is not None:
+                    results.append(v)
             if results:
                 return results
     except Exception as e:
@@ -564,8 +924,137 @@ def _parse_single_fallback_item(text):
     return {"type": tx_type, "amount": _to_decimal(amount), "category": category, "payment_method": payment_method, "note": note}
 
 
+def _guess_category(note_str: str, tx_type="expense") -> str:
+    note_str = note_str or ""
+    if any(w in note_str for w in ["lunch", "dinner", "food", "cafe", "restaurant", "burger", "pizza", "juice", "biscuit", "tea"]):
+        return "food"
+    if any(w in note_str for w in ["milk", "groceries", "veggies", "fruit", "market"]):
+        return "groceries"
+    if any(w in note_str for w in ["uber", "cab", "bus", "train", "flight", "transit", "petrol", "fuel"]):
+        return "transport"
+    if any(w in note_str for w in ["rent", "electricity", "wifi", "bill", "water"]):
+        return "bills" if "rent" not in note_str else "rent"
+    if tx_type == "income":
+        return "freelance" if "freelance" in note_str else "salary"
+    return "other"
+
+
+def _fallback_debt_parse(text):
+    """Best-effort regex recognizer for the most common shared/debt phrasings, used ONLY when the
+    Groq API is unavailable (no key, or the call failed). This is intentionally narrower than the
+    LLM path above — it covers split/lend/borrow/repayment/pool for a single event per message,
+    not every possible phrasing. Treats the WHOLE message as one event rather than chunking it,
+    since chunking on commas (needed for multi-item plain expenses) would break sentences like
+    "600 dinner upi, split with rahul" by cutting the amount away from the split phrase."""
+    tl = text.strip().lower()
+
+    def _num(s):
+        m = re.match(r"^(\d+(?:\.\d+)?)(k)?$", s.replace(" ", ""))
+        if not m:
+            return None
+        val = Decimal(m.group(1))
+        if m.group(2):
+            val *= Decimal("1000")
+        return val
+
+    def _method_in(s):
+        for m in PAYMENT_METHODS:
+            if re.search(rf"\b{m}\b", s):
+                return m
+        return None
+
+    m = re.search(r"(\d+(?:\.\d+)?k?)\b(.*?)\b(?:split|share)(?:\s+\w+)?\s+with\s+([a-z][a-z ]*)", tl)
+    if m:
+        amount = _num(m.group(1))
+        if amount:
+            people = [p.strip() for p in re.split(r"\s+and\s+|,", m.group(3).strip()) if p.strip()]
+            category = _guess_category(m.group(2))
+            return _validate_debt_item({
+                "share_type": "split", "amount": amount, "people": people,
+                "category": category, "payment_method": _method_in(tl), "note": None,
+            })
+
+    m = re.search(r"\b(?:gave|lent)\s+([a-z]+)\s+(\d+(?:\.\d+)?k?)", tl)
+    if m:
+        amount = _num(m.group(2))
+        if amount:
+            return _validate_debt_item({
+                "share_type": "lend", "amount": amount, "people": [m.group(1)],
+                "payment_method": _method_in(tl), "note": None,
+            })
+
+    m = re.search(r"\bborrowed\s+(\d+(?:\.\d+)?k?)\s+from\s+([a-z]+)", tl)
+    if m:
+        amount = _num(m.group(1))
+        if amount:
+            return _validate_debt_item({
+                "share_type": "borrow", "amount": amount, "people": [m.group(2)],
+                "payment_method": _method_in(tl), "note": None,
+            })
+
+    m = re.search(r"\bpaid\s+([a-z]+)\s+back\s+(\d+(?:\.\d+)?k?)", tl)
+    if m:
+        amount = _num(m.group(2))
+        if amount:
+            return _validate_debt_item({
+                "share_type": "repayment", "repayment_direction": "i_paid_them",
+                "amount": amount, "people": [m.group(1)], "payment_method": _method_in(tl), "note": None,
+            })
+
+    m = re.search(r"([a-z]+)\s+(?:paid(?:\s+me)?\s+back|returned|repaid)\s+(\d+(?:\.\d+)?k?)", tl)
+    if m:
+        amount = _num(m.group(2))
+        if amount:
+            return _validate_debt_item({
+                "share_type": "repayment", "repayment_direction": "they_paid_me",
+                "amount": amount, "people": [m.group(1)], "payment_method": _method_in(tl), "note": None,
+            })
+
+    m = re.search(r"\b(?:got|received)\s+(\d+(?:\.\d+)?k?)\b.*?\bfrom\s+([a-z]+)", tl)
+    if m:
+        amount = _num(m.group(1))
+        if amount:
+            return _validate_debt_item({
+                "share_type": "repayment", "repayment_direction": "they_paid_me",
+                "amount": amount, "people": [m.group(2)], "payment_method": _method_in(tl), "note": None,
+            })
+
+    m = re.search(r"([a-z]+)\s+put\s+(\d+(?:\.\d+)?k?)\s+into\s+(?:the\s+)?([a-z0-9\-]+)\s+pool", tl)
+    if m:
+        amount = _num(m.group(2))
+        if amount:
+            return _validate_debt_item({
+                "share_type": "pool_contribution_other", "amount": amount,
+                "people": [m.group(1)], "pool": m.group(3), "note": None,
+            })
+
+    m = re.search(r"\bput\s+(\d+(?:\.\d+)?k?)\s+into\s+(?:the\s+)?([a-z0-9\-]+)\s+pool", tl)
+    if m:
+        amount = _num(m.group(1))
+        if amount:
+            return _validate_debt_item({
+                "share_type": "contribution", "amount": amount, "pool": m.group(2),
+                "payment_method": _method_in(tl), "note": None,
+            })
+
+    m = re.search(r"(\d+(?:\.\d+)?k?)\b.*?\bfrom\s+(?:the\s+)?([a-z0-9\-]+)\s+pool", tl)
+    if m:
+        amount = _num(m.group(1))
+        if amount:
+            return _validate_debt_item({
+                "share_type": "pool_expense", "amount": amount, "pool": m.group(2),
+                "category": "other", "note": None,
+            })
+
+    return None
+
+
 def _fallback_rule_parse(text):
     """Rule-based regex parser when Groq API key is absent or unavailable."""
+    debt_item = _fallback_debt_parse(text)
+    if debt_item:
+        return [debt_item]
+
     chunks = [c.strip() for c in re.split(r"[\n,;]|\band\b", text, flags=re.IGNORECASE) if c.strip()]
 
     if len(chunks) == 1:
@@ -785,6 +1274,37 @@ def format_history_html(limit=5) -> str:
     """
 
 
+def format_debts_html() -> str:
+    debts = get_debt_balances()
+    rows_html = ""
+    for person, amt in sorted(debts.items(), key=lambda x: -abs(x[1])):
+        if amt == 0:
+            continue
+        label = f"{person.capitalize()} owes you" if amt > 0 else f"You owe {person.capitalize()}"
+        color = "text-[#059669]" if amt > 0 else "text-[#E15554]"
+        sign = "+" if amt > 0 else "-"
+        rows_html += f"""
+        <div class="flex justify-between py-0.5 border-b border-[#E5DFC9]">
+          <span class="{color} font-bold">{label}</span>
+          <span class="font-numeral text-[10px] font-bold text-[#142B1A]">{sign}₹{fmt(abs(amt))}</span>
+        </div>
+        """
+    if not rows_html:
+        rows_html = '<p class="text-[12px] text-[#6B7280] italic">No debts or IOUs recorded yet.</p>'
+
+    return f"""
+    <div class="space-y-1.5">
+      <div class="font-bold text-[13px] text-[#142B1A] flex justify-between">
+        <span>⚡ IOU Ledger</span>
+        <span class="font-numeral text-[9px] text-[#065F46]">{len(debts)} people</span>
+      </div>
+      <div class="pixel-window-jrpg p-2 text-[12px] space-y-1">
+        {rows_html}
+      </div>
+    </div>
+    """
+
+
 FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 
 
@@ -912,7 +1432,54 @@ def api_message():
             log_chat_message("assistant", "All local data reset.")
             return jsonify({"ok": True, "text": "All local data reset!", "balance": 0.0, "today_spent": 0.0})
 
-    # Freeform text parsing
+        elif cmd == "/debts":
+            html = format_debts_html()
+            log_chat_message("assistant", "IOU ledger shown.")
+            return jsonify({"ok": True, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
+
+        elif cmd == "/pool":
+            pool_name = args[0].lower().replace(" ", "-") if args else None
+            if not pool_name:
+                pools = list_known_pools()
+                reply_text = "Known pools: " + ", ".join(pools) if pools else "No pools created yet. Try: put 500 into goa pool"
+                log_chat_message("assistant", reply_text)
+                return jsonify({"ok": True, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
+            s = get_pool_summary(pool_name)
+            contrib_lines = "".join(
+                f"<div class='flex justify-between py-0.5 border-b border-[#E5DFC9]'><span>{p.capitalize()}</span><span class='font-numeral text-[10px] font-bold'>+₹{fmt(a)}</span></div>"
+                for p, a in s["by_person"].items()
+            )
+            expense_lines_list = []
+            for e in s["expenses"]:
+                note_str = f" ({e['note']})" if e.get("note") else ""
+                expense_lines_list.append(
+                    f"<div class='flex justify-between py-0.5 border-b border-[#E5DFC9]'><span>{e.get('category','other').capitalize()}{note_str}</span><span class='font-numeral text-[10px] font-bold text-[#E15554]'>-₹{fmt(e['amount'])}</span></div>"
+                )
+            expense_lines = "".join(expense_lines_list)
+            net_lines = "".join(
+                f"<div class='flex justify-between py-0.5'><span class='{'text-[#059669]' if v >= 0 else 'text-[#E15554]'} font-bold'>{p.capitalize()}</span><span class='font-numeral text-[10px]'>{'owes ₹' + fmt(v) if v > 0 else 'gets back ₹' + fmt(abs(v))}</span></div>"
+                for p, v in s["net_position"].items()
+            )
+            html = f"""
+            <div class="space-y-2">
+              <div class="flex justify-between items-center border-b border-[#A6DCB1] pb-1">
+                <span class="font-bold text-[14px] text-[#142B1A]">⚡ {pool_name.upper()} Pool</span>
+                <span class="font-numeral text-[10px] bg-[#142B1A] text-[#FDE047] px-1.5 py-0.5">₹{fmt(s['balance'])} LEFT</span>
+              </div>
+              <div class="pixel-window-jrpg p-2 text-[12px] space-y-0.5">
+                <div class="font-bold text-[11px] text-[#059669] mb-1">Contributions (₹{fmt(s['total_in'])})</div>
+                {contrib_lines or '<p class="text-[#6B7280] italic">None yet.</p>'}
+                <div class="font-bold text-[11px] text-[#E15554] mt-2 mb-1">Expenses (₹{fmt(s['total_out'])})</div>
+                {expense_lines or '<p class="text-[#6B7280] italic">None yet.</p>'}
+                <div class="font-bold text-[11px] text-[#142B1A] mt-2 mb-1">Net Positions (fair share ₹{fmt(s['fair_share'])})</div>
+                {net_lines or '<p class="text-[#6B7280] italic">N/A</p>'}
+              </div>
+            </div>
+            """
+            log_chat_message("assistant", f"Pool summary for {pool_name}.")
+            return jsonify({"ok": True, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())})
+
+
     aliases = get_all_aliases()
     transactions = parse_multi(text, aliases)
     if not transactions:
@@ -926,12 +1493,124 @@ def api_message():
             "today_spent": float(get_today_expense()),
         })
 
+    # Check if transaction is a debt/shared item
+    if len(transactions) == 1 and transactions[0].get("share_type"):
+        parsed = transactions[0]
+        r = _apply_debt_transaction(parsed)
+        kind = r.get("kind") if r else None
+        
+        if kind == "split":
+            people_str = ", ".join(p.capitalize() for p, _ in r["people"])
+            reply_text = f"Split ₹{fmt(parsed['amount'])} ({parsed['category']}) with {people_str}. Your share: ₹{fmt(r['my_share'])}."
+            breakdown_lines = "".join(f"<div class='flex justify-between py-0.5 border-b border-[#E5DFC9]'><span>{p.capitalize()} owes you</span><span class='font-numeral text-[10px] font-bold text-[#059669]'>+₹{fmt(a)}</span></div>" for p, a in r["people"])
+            html_res = f"""
+            <div class="space-y-1.5">
+              <div class="flex items-center gap-1.5 mb-1 flex-wrap">
+                <span class="bg-[#8B5CF6] text-white px-1.5 py-0.5 font-bold border border-[#6D28D9]" style="font-size:10px;">SPLIT BILL</span>
+                <span class="bg-[#10B981] text-white px-1.5 py-0.5 font-bold border border-[#065F46]" style="font-size:10px;">+20 EXP</span>
+              </div>
+              <p class="text-[12px]">Split <strong>₹{fmt(parsed['amount'])}</strong> for <strong>{parsed['category'].capitalize()}</strong> with <strong>{people_str}</strong>.</p>
+              <div class="pixel-window-jrpg p-2 text-[11px] space-y-0.5">
+                <div class="flex justify-between py-0.5 border-b border-[#E5DFC9]"><span>Your share (Expense)</span><span class="font-numeral font-bold text-[#E15554]">-₹{fmt(r['my_share'])}</span></div>
+                {breakdown_lines}
+              </div>
+            </div>
+            """
+        elif kind == "lend":
+            reply_text = f"Lent ₹{fmt(r['amount'])} to {r['who'].capitalize()}."
+            html_res = f"""
+            <div class="space-y-1.5">
+              <div class="flex items-center gap-1.5 mb-1">
+                <span class="bg-[#3B82F6] text-white px-1.5 py-0.5 font-bold border border-[#1D4ED8]" style="font-size:10px;">IOU CREATED</span>
+              </div>
+              <p class="text-[12px]">Lent <strong>₹{fmt(r['amount'])}</strong> to <strong>{r['who'].capitalize()}</strong> via {r['method'].upper()}.</p>
+            </div>
+            """
+        elif kind == "borrow":
+            reply_text = f"Borrowed ₹{fmt(r['amount'])} from {r['who'].capitalize()}."
+            html_res = f"""
+            <div class="space-y-1.5">
+              <div class="flex items-center gap-1.5 mb-1">
+                <span class="bg-[#E15554] text-white px-1.5 py-0.5 font-bold border border-[#991B1B]" style="font-size:10px;">DEBT INCURRED</span>
+              </div>
+              <p class="text-[12px]">Borrowed <strong>₹{fmt(r['amount'])}</strong> from <strong>{r['who'].capitalize()}</strong> into {r['method'].upper()}.</p>
+            </div>
+            """
+        elif kind == "repayment":
+            direction = r.get("direction")
+            if direction == "they_paid_me":
+                reply_text = f"{r['who'].capitalize()} paid back ₹{fmt(r['amount'])}."
+                html_res = f"""
+                <div class="space-y-1.5">
+                  <div class="flex items-center gap-1.5 mb-1">
+                    <span class="bg-[#10B981] text-white px-1.5 py-0.5 font-bold border border-[#065F46]" style="font-size:10px;">DEBT SETTLED</span>
+                  </div>
+                  <p class="text-[12px]"><strong>{r['who'].capitalize()}</strong> paid back <strong>₹{fmt(r['amount'])}</strong> via {r['method'].upper()}.</p>
+                </div>
+                """
+            else:
+                reply_text = f"Paid back ₹{fmt(r['amount'])} to {r['who'].capitalize()}."
+                html_res = f"""
+                <div class="space-y-1.5">
+                  <div class="flex items-center gap-1.5 mb-1">
+                    <span class="bg-[#10B981] text-white px-1.5 py-0.5 font-bold border border-[#065F46]" style="font-size:10px;">DEBT CLEARED</span>
+                  </div>
+                  <p class="text-[12px]">Paid back <strong>₹{fmt(r['amount'])}</strong> to <strong>{r['who'].capitalize()}</strong> via {r['method'].upper()}.</p>
+                </div>
+                """
+        elif kind == "contribution":
+            reply_text = f"Put ₹{fmt(r['amount'])} into {r['who'].upper()} pool."
+            html_res = f"""
+            <div class="space-y-1.5">
+              <div class="flex items-center gap-1.5 mb-1">
+                <span class="bg-[#F59E0B] text-white px-1.5 py-0.5 font-bold border border-[#B45309]" style="font-size:10px;">POOL DEPOSIT</span>
+              </div>
+              <p class="text-[12px]">Deposited <strong>₹{fmt(r['amount'])}</strong> into <strong>{r['who'].upper()}</strong> pool via {r['method'].upper()}.</p>
+            </div>
+            """
+        elif kind == "pool_contribution_other":
+            reply_text = f"{r['person'].capitalize()} put ₹{fmt(r['amount'])} into {r['who'].upper()} pool."
+            html_res = f"""
+            <div class="space-y-1.5">
+              <div class="flex items-center gap-1.5 mb-1">
+                <span class="bg-[#F59E0B] text-white px-1.5 py-0.5 font-bold border border-[#B45309]" style="font-size:10px;">POOL DEPOSIT</span>
+              </div>
+              <p class="text-[12px]"><strong>{r['person'].capitalize()}</strong> deposited <strong>₹{fmt(r['amount'])}</strong> into <strong>{r['who'].upper()}</strong> pool.</p>
+            </div>
+            """
+        elif kind == "pool_expense":
+            reply_text = f"Spent ₹{fmt(r['amount'])} from {r['who'].upper()} pool."
+            html_res = f"""
+            <div class="space-y-1.5">
+              <div class="flex items-center gap-1.5 mb-1">
+                <span class="bg-[#E15554] text-white px-1.5 py-0.5 font-bold border border-[#991B1B]" style="font-size:10px;">POOL EXPENSE</span>
+              </div>
+              <p class="text-[12px]">Spent <strong>₹{fmt(r['amount'])}</strong> ({r['category'].capitalize()}) from <strong>{r['who'].upper()}</strong> pool.</p>
+            </div>
+            """
+        else:
+            reply_text = "Debt item processed."
+            html_res = "<p>Debt transaction recorded.</p>"
+
+        log_chat_message("assistant", reply_text)
+        return jsonify({
+            "ok": True,
+            "html": html_res,
+            "text": reply_text,
+            "balance": float(get_balance()),
+            "today_spent": float(get_today_expense()),
+        })
+
     logged = []
     for parsed in transactions:
-        tx_id = add_transaction(parsed["type"], parsed["amount"], parsed["category"], parsed["note"], parsed["payment_method"])
-        note_key = (parsed.get("note") or "").lower().strip()
-        learn_alias_auto(note_key, parsed["type"], parsed["category"], parsed["payment_method"])
-        logged.append({**parsed, "id": tx_id})
+        if parsed.get("share_type"):
+            r = _apply_debt_transaction(parsed)
+            logged.append({"id": 0, "type": "transfer", "amount": parsed["amount"], "category": parsed.get("category", "other"), "note": parsed.get("note"), "payment_method": parsed.get("payment_method")})
+        else:
+            tx_id = add_transaction(parsed["type"], parsed["amount"], parsed["category"], parsed["note"], parsed["payment_method"])
+            note_key = (parsed.get("note") or "").lower().strip()
+            learn_alias_auto(note_key, parsed["type"], parsed["category"], parsed["payment_method"])
+            logged.append({**parsed, "id": tx_id})
 
     if len(logged) == 1:
         last_tx = logged[0]
