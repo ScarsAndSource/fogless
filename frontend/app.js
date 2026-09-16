@@ -442,7 +442,11 @@ document.addEventListener('DOMContentLoaded', () => {
         renderCompanionBubble(data.text || "Could not execute spell.");
       }
     } catch(e) {
-      simulateLocalLog(text);
+      if (text.startsWith('/')) {
+        renderCompanionBubble(`⚠ Connection error — "${escapeHtml(text)}" was NOT applied. Balance unchanged, nothing logged. Try again.`);
+      } else {
+        simulateLocalLog(text);
+      }
     }
   }
 
