@@ -1547,17 +1547,25 @@ def _process_text(text: str):
             return {"ok": True, "text": f"Last {limit} transactions shown.", "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
 
         elif cmd == "/undo":
-            row = delete_last_transaction()
-            if not row:
+            group = delete_last_transaction()
+            if not group:
                 reply_text = "Nothing to undo."
                 log_chat_message("assistant", reply_text)
                 return {"ok": True, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
-            reply_text = f"Reverted #{row['id']}: {row['type']} ₹{fmt(row['amount'])} ({row['category']})."
+            if len(group) == 1:
+                row = group[0]
+                if row["type"] == "transfer":
+                    reply_text = f"Reverted #{row['id']}: transfer ₹{fmt(row['amount'])} ({row.get('from_bucket')} → {row.get('to_bucket')})."
+                else:
+                    reply_text = f"Reverted #{row['id']}: {row['type']} ₹{fmt(row['amount'])} ({row.get('category')})."
+            else:
+                anchor = next((r for r in group if r["type"] != "transfer"), group[0])
+                reply_text = f"Reverted last action: {len(group)} linked entries (₹{fmt(anchor['amount'])} {anchor['type']})."
             log_chat_message("assistant", reply_text)
             return {
                 "ok": True,
-                "text": f"SPELL: REVERT EXECUTED. Removed #{row['id']}: {row['type']} ₹{fmt(row['amount'])} ({row['category']}).",
-                "html": f"<p>Reverted <strong>#{row['id']}</strong> (₹{fmt(row['amount'])}) back to the treasury purse.</p>",
+                "text": reply_text,
+                "html": f"<p>Reverted <strong>{len(group)}</strong> linked entr{'y' if len(group) == 1 else 'ies'} from the treasury purse.</p>",
                 "balance": float(get_balance()),
                 "today_spent": float(get_today_expense()),
             }
@@ -1916,7 +1924,7 @@ def api_action():
     tx_id = data.get("tx_id")
 
     if action == "undo":
-        row = delete_last_transaction()
+        group = delete_last_transaction()
         return jsonify({
             "ok": True,
             "text": "Last transaction reverted.",
