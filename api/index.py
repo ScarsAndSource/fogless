@@ -50,6 +50,20 @@ SB_PAGE_SIZE = 1000
 IST = timezone(timedelta(hours=5, minutes=30))  # local calendar-day boundary for /stats "today"
 
 
+def _fmt_dt(iso_str) -> str:
+    """Render a stored UTC timestamp as a short IST date/time, e.g. '16 Sep, 03:42 PM'."""
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(IST).strftime("%d %b, %I:%M %p")
+    except Exception:
+        return ""
+
+
+
 EXPENSE_CATEGORIES = [
     "food", "groceries", "transport", "bills", "shopping", "entertainment",
     "health", "subscriptions", "rent", "education", "travel", "fitness", "other",
@@ -1287,18 +1301,59 @@ def format_balance_html() -> str:
     """
 
 
+def format_history_text(limit=5) -> str:
+    rows = get_history(limit=limit)
+    if not rows:
+        return "No history items logged yet."
+    lines = [f"Last {len(rows)} logged items:"]
+    for r in rows:
+        date_str = _fmt_dt(r.get("created_at"))
+        if r["type"] == "transfer":
+            frm = r.get("from_bucket") or "?"
+            to = r.get("to_bucket") or "?"
+            lines.append(f"#{r['id']} [{date_str}] transfer {frm} -> {to}: ₹{fmt(r['amount'])}")
+            continue
+        sign = "+" if r["type"] == "income" else "-"
+        note = f" ({r['note']})" if r.get("note") else ""
+        pay = f" [{r['payment_method']}]" if r.get("payment_method") else ""
+        lines.append(f"#{r['id']} [{date_str}] {r['category']}{note}{pay}: {sign}₹{fmt(r['amount'])}")
+    return "\n".join(lines)
+
+
 def format_history_html(limit=5) -> str:
     rows = get_history(limit=limit)
     if not rows:
         return "<p class='text-[12px] text-[#6B7280]'>No history items logged yet.</p>"
-    
+
     lines = []
     for r in rows:
+        date_str = _fmt_dt(r.get("created_at"))
+        if r["type"] == "transfer":
+            frm = r.get("from_bucket") or "?"
+            to = r.get("to_bucket") or "?"
+            lines.append(f"""
+            <div class='py-1 border-b border-[#E5DFC9]'>
+              <div class='flex justify-between'>
+                <span>#{r['id']} transfer {frm} → {to}</span>
+                <span class='font-numeral font-bold text-[#6B7280]'>₹{fmt(r['amount'])}</span>
+              </div>
+              <div class='text-[9px] text-[#8A8578]'>{date_str}</div>
+            </div>
+            """)
+            continue
         sign = "+" if r["type"] == "income" else "-"
         color = "text-[#059669]" if r["type"] == "income" else "text-[#E15554]"
         note = f" ({r['note']})" if r.get("note") else ""
         pay = f" [{r['payment_method']}]" if r.get("payment_method") else ""
-        lines.append(f"<div class='py-0.5 border-b border-[#E5DFC9] flex justify-between'><span>#{r['id']} {r['category']}{note}{pay}</span><span class='font-numeral font-bold {color}'>{sign}₹{fmt(r['amount'])}</span></div>")
+        lines.append(f"""
+        <div class='py-1 border-b border-[#E5DFC9]'>
+          <div class='flex justify-between'>
+            <span>#{r['id']} {r['category']}{note}{pay}</span>
+            <span class='font-numeral font-bold {color}'>{sign}₹{fmt(r['amount'])}</span>
+          </div>
+          <div class='text-[9px] text-[#8A8578]'>{date_str}</div>
+        </div>
+        """)
 
     return f"""
     <div class="space-y-1">
