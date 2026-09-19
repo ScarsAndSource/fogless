@@ -1438,7 +1438,19 @@ def api_state():
             "net": float(stats["net"]),
             "by_category": [{"category": r["category"], "total": float(r["total"]), "cnt": r["cnt"]} for r in stats["by_category"]],
         },
-        "history": [{"id": r["id"], "type": r["type"], "amount": float(r["amount"]), "category": r["category"], "note": r.get("note"), "payment_method": r.get("payment_method")} for r in history],
+        "history": [
+            {
+                "id": r["id"],
+                "type": r["type"],
+                "amount": float(r["amount"]),
+                "category": r["category"],
+                "note": r.get("note"),
+                "payment_method": r.get("payment_method"),
+                "created_at": r.get("created_at"),
+                "created_at_display": _fmt_dt(r.get("created_at")),
+            }
+            for r in history
+        ],
     })
 
 
@@ -2020,6 +2032,7 @@ def api_transactions():
             "note": r.get("note"),
             "payment_method": r.get("payment_method"),
             "created_at": r.get("created_at"),
+            "created_at_display": _fmt_dt(r.get("created_at")),
         }
         for r in rows
     ]
