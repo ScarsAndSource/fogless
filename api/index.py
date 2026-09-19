@@ -1465,7 +1465,7 @@ def _process_text(text: str):
             period = args[0].lower() if args else "month"
             html = format_stats_html(period)
             reply_text = f"Stats for {period} period."
-            log_chat_message("assistant", reply_text)
+            log_chat_message("assistant", html)
             return {"ok": True, "html": html, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
 
         elif cmd in ("/balance", "/setbalance"):
@@ -1487,7 +1487,7 @@ def _process_text(text: str):
                     set_starting_balance(target_method, target_amount)
                     reply_text = f"Set {target_method.capitalize()} balance to ₹{fmt(target_amount)}."
                     html = format_balance_html()
-                    log_chat_message("assistant", reply_text)
+                    log_chat_message("assistant", html)
                     return {
                         "ok": True,
                         "text": reply_text,
@@ -1496,7 +1496,7 @@ def _process_text(text: str):
                         "today_spent": float(get_today_expense()),
                     }
             html = format_balance_html()
-            log_chat_message("assistant", "Balance summary.")
+            log_chat_message("assistant", html)
             return {"ok": True, "text": "Balance summary.", "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
 
         elif cmd == "/settle":
@@ -1531,7 +1531,7 @@ def _process_text(text: str):
             else:
                 reply_text = "Failed to settle debt."
                 html_res = "<p>Invalid settlement parameters.</p>"
-            log_chat_message("assistant", reply_text)
+            log_chat_message("assistant", html_res)
             return {
                 "ok": True,
                 "text": reply_text,
@@ -1543,7 +1543,7 @@ def _process_text(text: str):
         elif cmd == "/history":
             limit = int(args[0]) if args and args[0].isdigit() else 5
             html = format_history_html(limit)
-            log_chat_message("assistant", f"Last {limit} transactions shown.")
+            log_chat_message("assistant", html)
             return {"ok": True, "text": f"Last {limit} transactions shown.", "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
 
         elif cmd == "/undo":
@@ -1595,7 +1595,7 @@ def _process_text(text: str):
 
         elif cmd == "/debts":
             html = format_debts_html()
-            log_chat_message("assistant", "IOU ledger shown.")
+            log_chat_message("assistant", html)
             return {"ok": True, "text": "IOU ledger shown.", "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
 
         elif cmd == "/pool":
@@ -1612,7 +1612,7 @@ def _process_text(text: str):
                       </div>
                     </div>
                     """
-                    log_chat_message("assistant", reply_text)
+                    log_chat_message("assistant", html)
                     return {"ok": True, "text": reply_text, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
 
                 pool_cards = []
@@ -1638,7 +1638,7 @@ def _process_text(text: str):
                 </div>
                 """
                 reply_text = f"Known pools: {', '.join(pools)}"
-                log_chat_message("assistant", reply_text)
+                log_chat_message("assistant", html)
                 return {"ok": True, "text": reply_text, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
             s = get_pool_summary(pool_name)
             contrib_lines = "".join(
@@ -1672,7 +1672,7 @@ def _process_text(text: str):
               </div>
             </div>
             """
-            log_chat_message("assistant", f"Pool summary for {pool_name}.")
+            log_chat_message("assistant", html)
             return {"ok": True, "text": f"Pool summary for {pool_name}.", "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
 
     # Check for natural language balance setting intent
@@ -1693,7 +1693,7 @@ def _process_text(text: str):
                     set_starting_balance(m_method, val)
                     reply_text = f"Set {m_method.capitalize()} treasury balance to ₹{fmt(val)}."
                     html = format_balance_html()
-                    log_chat_message("assistant", reply_text)
+                    log_chat_message("assistant", html)
                     return {
                         "ok": True,
                         "text": reply_text,
@@ -1816,7 +1816,7 @@ def _process_text(text: str):
             reply_text = "Debt item processed."
             html_res = "<p>Debt transaction recorded.</p>"
 
-        log_chat_message("assistant", reply_text)
+        log_chat_message("assistant", html_res)
         return {
             "ok": True,
             "html": html_res,
@@ -1841,7 +1841,7 @@ def _process_text(text: str):
         sign = "+" if last_tx["type"] == "income" else "-"
         badge_bg = "bg-[#10B981]" if last_tx["type"] == "income" else "bg-[#E15554]"
         reply_text = f"Logged ₹{fmt(last_tx['amount'])} on {last_tx['category']}"
-        log_chat_message("assistant", reply_text)
+        log_chat_message("assistant", html_res)
         html_res = f"""
         <div class="flex items-center gap-1.5 mb-1 flex-wrap">
           <span class="{badge_bg} text-white px-1.5 py-0.5 font-bold border border-[#7F1D1D]" style="font-size:10px;">{sign}₹{fmt(last_tx['amount'])} GP</span>
@@ -1863,7 +1863,7 @@ def _process_text(text: str):
     else:
         total_logged = sum(x["amount"] for x in logged)
         reply_text = f"Logged {len(logged)} items totaling ₹{fmt(total_logged)}"
-        log_chat_message("assistant", reply_text)
+        log_chat_message("assistant", html_res)
         items_html = ""
         for tx in logged:
             sign = "+" if tx["type"] == "income" else "-"

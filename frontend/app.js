@@ -377,7 +377,7 @@ document.addEventListener('DOMContentLoaded', () => {
           `;
           chatThread.appendChild(bubble);
         } else {
-          renderCompanionBubble(escapeHtml(msg.content));
+          renderCompanionBubble(msg.content);
         }
       });
 
