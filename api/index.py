@@ -12,29 +12,35 @@ import json
 import requests
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from datetime import datetime, timedelta, timezone
-from flask import Flask, request, jsonify, send_file, Response, render_template_string
-import threading
+from flask import Flask, request, jsonify, send_file, Response, render_template_string, session
+import hashlib
+import hmac
+import time
 import traceback
 from html import escape as _esc, unescape as _unesc
 from werkzeug.exceptions import HTTPException
+from werkzeug.utils import safe_join
 
 
 # --------------------------------------------------------------------- config
 
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-try:
-    OWNER_ID = int((os.getenv("OWNER_ID", "0") or "0").strip())
-except ValueError:
-    # A garbage OWNER_ID must lock the bot (nobody matches -1), never crash the import or open it up.
-    print("[config] OWNER_ID is not a number - bot locked until it is fixed")
-    OWNER_ID = -1
-TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_SECRET_TOKEN", "")
 CRON_SECRET = os.getenv("CRON_SECRET", "")
+
+# Demo login. Override with DEMO_USERNAME / DEMO_PASSWORD env vars if you ever want different ones.
+DEMO_USERNAME = os.getenv("DEMO_USERNAME", "vaibhav10")
+DEMO_PASSWORD = os.getenv("DEMO_PASSWORD", "iwon10")
 
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", os.getenv("SUPABASE_KEY", ""))
+
+# Signs the login cookie. Set SESSION_SECRET in production; without it we derive a stable secret
+# from the Supabase key (so every serverless instance agrees), or a fixed one for local testing.
+SESSION_SECRET = os.getenv("SESSION_SECRET") or (
+    hashlib.sha256(("fogless-session:" + SUPABASE_KEY).encode("utf-8")).hexdigest()
+    if SUPABASE_KEY else "fogless-local-demo-secret"
+)
 
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -42,9 +48,6 @@ GROQ_CHAT_API = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_AUDIO_API = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "openai/gpt-oss-120b"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
-
-
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 
 
 SB_HEADERS = {
@@ -193,6 +196,14 @@ _mem_pool_expenses = []
 
 
 app = Flask(__name__)
+app.secret_key = SESSION_SECRET
+app.config.update(
+    SESSION_COOKIE_NAME="fogless_session",
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(os.getenv("VERCEL")),  # https on Vercel; plain http works locally
+    PERMANENT_SESSION_LIFETIME=timedelta(days=14),
+)
 
 
 # ------------------------------------------------------------------ helpers
@@ -326,7 +337,7 @@ def _with_notice(resp, notes):
 
 
 def _html_to_text(html) -> str:
-    """Plain-text version of one of our HTML cards (Telegram cannot render HTML)."""
+    """Plain-text version of one of our HTML cards."""
     t = re.sub(r"</(?:div|p)>|<br\s*/?>", "\n", html or "")
     t = re.sub(r"</span>\s*<span[^>]*>", "  ", t)
     t = _unesc(re.sub(r"<[^>]+>", "", t))
@@ -389,23 +400,6 @@ def _leftover_note(s):
     return " ".join(words)[:100] or None
 
 
-def send_telegram_message(chat_id, text: str) -> None:
-    """Send a plain-text reply back to a Telegram chat. Non-fatal: logs on error rather than crashing."""
-    if not TG_API:
-        print("[telegram] BOT_TOKEN not configured, cannot send message")
-        return
-    try:
-        r = requests.post(
-            f"{TG_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text[:4000]},  # Telegram rejects > 4096 chars
-            timeout=10,
-        )
-        if r.status_code >= 300:
-            print(f"[telegram] sendMessage failed: {r.status_code} {r.text}")
-    except Exception as e:
-        print(f"[telegram] sendMessage exception: {e}")
-
-
 # ---------------------------------------------------------------- data layer
 
 
@@ -460,32 +454,8 @@ def _first_id(r, what):
     return rows[0]["id"]
 
 
-# In-memory ids / stores that only exist for the no-Supabase (local testing) mode
+# In-memory id counter that only exists for the no-Supabase (local testing) mode
 _mem_pool_id_counter = 1
-_mem_processed = set()
-_mem_msglog = {}
-
-# Per-request collector so the Telegram handler can remember which rows a message created
-_tl = threading.local()
-
-
-def _track(kind, row_id):
-    created = getattr(_tl, "created", None)
-    if created is not None and row_id is not None:
-        created[kind].append(row_id)
-
-
-class _Collect:
-    """with _Collect() as made: ...  ->  made = {"tx": [...], "pc": [...], "pe": [...]}"""
-
-    def __enter__(self):
-        self.made = {"tx": [], "pc": [], "pe": []}
-        _tl.created = self.made
-        return self.made
-
-    def __exit__(self, *exc):
-        _tl.created = None
-        return False
 
 
 def add_transaction(tx_type, amount, category, note, payment_method=None) -> int:
@@ -505,7 +475,6 @@ def add_transaction(tx_type, amount, category, note, payment_method=None) -> int
             prefer="return=representation",
         )
         tx_id = _first_id(r, "transactions")
-        _track("tx", tx_id)
         return tx_id
 
     tx_id = _mem_id_counter
@@ -519,7 +488,6 @@ def add_transaction(tx_type, amount, category, note, payment_method=None) -> int
         "payment_method": payment_method,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
-    _track("tx", tx_id)
     return tx_id
 
 
@@ -548,7 +516,6 @@ def add_transfer(amount, from_bucket, to_bucket, note, person=None, pool=None, l
             prefer="return=representation",
         )
         tx_id = _first_id(r, "transactions")
-        _track("tx", tx_id)
         return tx_id
 
     tx_id = _mem_id_counter
@@ -566,7 +533,6 @@ def add_transfer(amount, from_bucket, to_bucket, note, person=None, pool=None, l
         "linked_tx_id": linked_tx_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
-    _track("tx", tx_id)
     return tx_id
 
 
@@ -1000,7 +966,6 @@ def add_pool_contribution(pool_name, person, amount, note=None, linked_tx_id=Non
                            "note": note, "linked_tx_id": linked_tx_id},
                 prefer="return=representation")
         row_id = _first_id(r, "pool_contributions")
-        _track("pc", row_id)
         return row_id
     row_id = _mem_pool_id_counter
     _mem_pool_id_counter += 1
@@ -1008,7 +973,6 @@ def add_pool_contribution(pool_name, person, amount, note=None, linked_tx_id=Non
         "id": row_id, "pool": pool_name, "person": person, "amount": amount_dec, "note": note,
         "linked_tx_id": linked_tx_id, "created_at": datetime.now(timezone.utc).isoformat(),
     })
-    _track("pc", row_id)
     return row_id
 
 
@@ -1020,7 +984,6 @@ def add_pool_expense(pool_name, amount, category, note=None) -> int:
                 json_body={"pool": pool_name, "amount": str(amount_dec), "category": category, "note": note},
                 prefer="return=representation")
         row_id = _first_id(r, "pool_expenses")
-        _track("pe", row_id)
         return row_id
     row_id = _mem_pool_id_counter
     _mem_pool_id_counter += 1
@@ -1028,7 +991,6 @@ def add_pool_expense(pool_name, amount, category, note=None) -> int:
         "id": row_id, "pool": pool_name, "amount": amount_dec, "category": category, "note": note,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
-    _track("pe", row_id)
     return row_id
 
 
@@ -1080,68 +1042,8 @@ def list_known_pools():
     return sorted(names)
 
 
-# --------------------------------------------------------- telegram idempotency + edit tracking
-
-
-def claim_update(update_id) -> bool:
-    """Atomically mark a Telegram update_id as handled. Returns False if it was already handled
-    (Telegram re-delivers on timeouts / non-200s), so the caller must skip it."""
-    if update_id is None:
-        return True
-    if _use_sb():
-        r = _sb("POST", "processed_updates",
-                json_body={"update_id": int(update_id)},
-                prefer="return=minimal", ok_statuses=(409,))
-        return r.status_code != 409
-    if update_id in _mem_processed:
-        return False
-    _mem_processed.add(update_id)
-    return True
-
-
-def get_message_log(chat_id, message_id):
-    """What rows did this Telegram message create? None if we never recorded it."""
-    if _use_sb():
-        rows = _rows(_sb("GET", "message_log",
-                         params={"select": "*", "chat_id": f"eq.{chat_id}", "message_id": f"eq.{message_id}"}))
-        if not rows:
-            return None
-        row = rows[0]
-        return {
-            "tx": list(row.get("tx_ids") or []),
-            "pc": list(row.get("pool_contribution_ids") or []),
-            "pe": list(row.get("pool_expense_ids") or []),
-        }
-    return _mem_msglog.get((chat_id, message_id))
-
-
-def save_message_log(chat_id, message_id, made) -> None:
-    if _use_sb():
-        _sb("POST", "message_log",
-            params={"on_conflict": "chat_id,message_id"},
-            json_body={
-                "chat_id": chat_id, "message_id": message_id,
-                "tx_ids": made["tx"], "pool_contribution_ids": made["pc"], "pool_expense_ids": made["pe"],
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            },
-            prefer="resolution=merge-duplicates,return=minimal")
-        return
-    _mem_msglog[(chat_id, message_id)] = {"tx": list(made["tx"]), "pc": list(made["pc"]), "pe": list(made["pe"])}
-
-
-def rollback_logged(made) -> None:
-    """Delete every row a previous message created (used when that message is edited)."""
-    for tx_id in made.get("tx", []):
-        delete_transaction_group_by_id(tx_id)
-    for row_id in made.get("pc", []):
-        delete_pool_contribution(row_id)
-    for row_id in made.get("pe", []):
-        delete_pool_expense(row_id)
-
-
 def reset_all_data() -> None:
-    """Really wipes the ledger (Supabase tables too when configured). processed_updates is kept so
-    old Telegram deliveries can never be replayed after a reset."""
+    """Really wipes the ledger (Supabase tables too when configured)."""
     global _mem_id_counter, _mem_pool_id_counter
     if _use_sb():
         _sb("DELETE", "transactions", params={"id": "gt.0"})
@@ -1149,14 +1051,12 @@ def reset_all_data() -> None:
         _sb("DELETE", "pool_expenses", params={"id": "gt.0"})
         _sb("DELETE", "aliases", params={"note_key": "neq.__none__"})
         _sb("DELETE", "settings", params={"key": "like.starting_balance:*"})
-        _sb("DELETE", "message_log", params={"chat_id": "neq.0"})
         _sb("DELETE", "chat_log", params={"id": "gt.0"})
         return
     _mem_transactions.clear()
     _mem_pool_contributions.clear()
     _mem_pool_expenses.clear()
     _mem_aliases.clear()
-    _mem_msglog.clear()
     for b in PAYMENT_METHODS:
         _mem_starting_balances[b] = Decimal("0.00")
     _mem_id_counter = 1
@@ -2011,6 +1911,60 @@ def _unwrap(res):
     return res, 200
 
 
+# ---------------------------------------------------------------------- Demo login (cookie session)
+
+_OPEN_API_PATHS = {"/api/login", "/api/logout", "/api/session"}
+
+
+def _is_logged_in() -> bool:
+    return session.get("user") == DEMO_USERNAME
+
+
+@app.before_request
+def _require_login():
+    """Every /api/* route except login/logout/session needs a valid signed session cookie."""
+    path = request.path
+    if request.method == "OPTIONS" or not path.startswith("/api/") or path in _OPEN_API_PATHS:
+        return None
+    if _is_logged_in():
+        return None
+    return jsonify({"ok": False, "auth": False, "text": "Please sign in first."}), 401
+
+
+def _no_store(resp):
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    # case-insensitive username (phones auto-capitalise), exact password, constant-time compares
+    user_ok = hmac.compare_digest(username.lower().encode("utf-8"), DEMO_USERNAME.lower().encode("utf-8"))
+    pass_ok = hmac.compare_digest(password.encode("utf-8"), DEMO_PASSWORD.encode("utf-8"))
+    if user_ok and pass_ok:
+        session.clear()
+        session["user"] = DEMO_USERNAME
+        session.permanent = True
+        return _no_store(jsonify({"ok": True, "username": DEMO_USERNAME}))
+    time.sleep(0.4)  # blunt the guessing speed a little
+    return _no_store(jsonify({"ok": False, "text": "Wrong username or password."})), 401
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    session.clear()
+    return _no_store(jsonify({"ok": True}))
+
+
+@app.route("/api/session", methods=["GET"])
+def api_session():
+    authed = _is_logged_in()
+    return _no_store(jsonify({"ok": True, "authenticated": authed, "username": DEMO_USERNAME if authed else None}))
+
+
 @app.errorhandler(StorageError)
 def _handle_storage_error(e):
     """Supabase is configured but failed: say so loudly instead of pretending everything is fine."""
@@ -2040,11 +1994,16 @@ def index():
     return jsonify({"ok": True, "service": "Fogless 16-bit JRPG Finance Companion"})
 
 
+@app.route("/login", methods=["GET"])
+def login_page():
+    return send_file(os.path.join(FRONTEND_DIR, "login.html"))
+
+
 @app.route("/<path:filename>", methods=["GET"])
 def static_files(filename):
-    if not filename.startswith("api/") and not filename.startswith("webhook"):
-        file_path = os.path.join(FRONTEND_DIR, filename)
-        if os.path.exists(file_path):
+    if not filename.startswith("api/"):
+        file_path = safe_join(FRONTEND_DIR, filename)  # refuses ../ escapes
+        if file_path and os.path.isfile(file_path):
             return send_file(file_path)
     return jsonify({"ok": False, "error": "Not Found"}), 404
 
@@ -2702,89 +2661,6 @@ def api_history():
     """Return persisted chat history (user + assistant turns) oldest-first."""
     limit = max(1, min(request.args.get("limit", default=50, type=int), 500))
     return jsonify(get_chat_history(limit=limit))
-
-
-# --------------------------------------------------------------------- Telegram Webhook Handler
-
-
-def _handle_telegram_text(chat_id, message_id, text, is_edit):
-    """Returns the plain-text reply for one Telegram message (new or edited)."""
-    is_cmd = text.startswith("/")
-    if is_edit and is_cmd:
-        return "Edits to commands are ignored. Send the command again as a new message."
-
-    previous = None
-    if is_edit and message_id is not None:
-        previous = get_message_log(chat_id, message_id)
-
-    with _Collect() as made:
-        res = _process_text(text)
-    payload, _status = _unwrap(res)
-    reply = payload.get("text") or ""
-    cmd0 = text.split()[0].lower().split("@")[0] if is_cmd else ""
-    if cmd0 in ("/stats", "/balance", "/setbalance", "/history", "/debts", "/pool") and payload.get("html"):
-        # these commands put their real content in the HTML card; Telegram needs it as plain text
-        reply = (reply + "\n\n" + _html_to_text(payload["html"])).strip()
-    created_any = bool(made["tx"] or made["pc"] or made["pe"])
-
-    if previous is not None:
-        if created_any:
-            # Replace, don't duplicate: the new rows exist, now remove what the original message made.
-            rollback_logged(previous)
-            reply = "✏️ Edit applied — your previous entry was replaced.\n" + reply
-        else:
-            reply += "\nNo new entry was created, so your previous entry was left unchanged."
-
-    if not is_cmd and message_id is not None and created_any:
-        try:
-            save_message_log(chat_id, message_id, made)
-        except StorageError as e:
-            print(f"[message_log] could not record message mapping (non-fatal): {e}")
-    return reply
-
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    if TELEGRAM_SECRET_TOKEN and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_SECRET_TOKEN:
-        return jsonify({"ok": False}), 401
-
-    data = request.get_json(silent=True) or {}
-    is_edit = bool(data.get("edited_message")) and not data.get("message")
-    msg = data.get("message") or data.get("edited_message") or {}
-    if not msg:
-        return jsonify({"ok": True})
-
-    chat_id = (msg.get("chat") or {}).get("id")
-    message_id = msg.get("message_id")
-    text = (msg.get("text") or "").strip()
-    if not (text and chat_id):
-        return jsonify({"ok": True})
-
-    # Only the owner may use the bot (OWNER_ID unset/0 = open, e.g. for local testing)
-    if OWNER_ID and (msg.get("from") or {}).get("id") != OWNER_ID:
-        return jsonify({"ok": True})
-
-    # From here on we ALWAYS answer 200, so Telegram never re-delivers and never loops.
-    try:
-        first_time = claim_update(data.get("update_id"))
-    except StorageError:
-        send_telegram_message(chat_id, "⚠ Database unavailable — nothing was logged. Please resend in a minute.")
-        return jsonify({"ok": True})
-    if not first_time:
-        return jsonify({"ok": True})  # duplicate delivery of an update we already handled
-
-    try:
-        reply = _handle_telegram_text(chat_id, message_id, text, is_edit)
-    except StorageError as e:
-        print(f"[webhook] storage error: {e}")
-        reply = "⚠ Database error while saving. Check /history before resending."
-    except Exception:
-        traceback.print_exc()
-        reply = "⚠ Something went wrong. Check /history before resending."
-
-    if reply:
-        send_telegram_message(chat_id, reply)
-    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
