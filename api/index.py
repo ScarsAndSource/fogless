@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, send_file, Response, render_template_string
 import threading
 import traceback
-from html import escape as _esc
+from html import escape as _esc, unescape as _unesc
 from werkzeug.exceptions import HTTPException
 
 
@@ -23,7 +23,12 @@ from werkzeug.exceptions import HTTPException
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+try:
+    OWNER_ID = int((os.getenv("OWNER_ID", "0") or "0").strip())
+except ValueError:
+    # A garbage OWNER_ID must lock the bot (nobody matches -1), never crash the import or open it up.
+    print("[config] OWNER_ID is not a number - bot locked until it is fixed")
+    OWNER_ID = -1
 TELEGRAM_SECRET_TOKEN = os.getenv("TELEGRAM_SECRET_TOKEN", "")
 CRON_SECRET = os.getenv("CRON_SECRET", "")
 
@@ -101,6 +106,13 @@ Payment methods (pick exactly one if mentioned or clearly implied, else null): {
 - "category" is exactly one value from the matching list above — pick the closest fit, never invent new categories.
 - "payment_method" is exactly one of the listed methods, or null if not mentioned.
 - "note" is the short specific detail (e.g. item name like "coffee", "juice", "biscuit"), or null if there isn't one.
+- A person's or place's NAME on its own is just the note of a normal expense. "rohan rahul 800 upi", "taj mahal 800 upi"
+  and "800 for taj mahal upi" are each ONE plain expense of 800 paid by upi (note = the name). Use the SHARED & DEBT rules
+  below ONLY when the message contains one of their trigger phrases (split with, gave/lent, borrowed from, paid back,
+  from <person>, put into <pool> ...). Never guess a debt from a bare name.
+- Keep a multi-word name together as ONE name ("rohan rahul" is one person or place, never "rohan" and "rahul").
+- Several names joined by "and" with a SINGLE amount ("rohan rahul and taj mahal for 800 upi") are ONE expense of 800
+  whose note is those names - not several transactions. Only a separate amount starts a new transaction.
 
 === SHARED & DEBT MONEY (another named person or a named pool is involved) ===
 Set "share_type" whenever a message involves another person's money or a shared pool. When set, it OVERRIDES the
@@ -205,6 +217,178 @@ def fmt(amount) -> str:
         return str(amount)
 
 
+# ------------------------------------------------ amount / name hygiene helpers
+
+MAX_AMOUNT = Decimal("1000000000")  # 100 crore: anything bigger is a typo, not a purchase
+MAX_TEXT_LEN = 1000
+_SELF_WORDS = {"me", "myself", "i", "self", "us", "mine"}
+_NOT_PEOPLE = {"salary", "freelance", "refund", "bonus", "interest", "cashback", "job", "work"}
+_NAME_STOP = {"via", "on", "using", "by", "for", "in", "at", "and", "back", "each", "way", "ways",
+              "please", "today", "yesterday", "paid", "split", "share", "with", "from", "to", "the"}
+_FILLER_WORDS = {"for", "on", "at", "to", "via", "using", "by", "in", "of", "the", "a", "an", "and",
+                 "spent", "paid", "pay", "paying", "bought", "buy", "from", "with", "&",
+                 "got", "received", "earned", "credited", "deposited"}
+_KNOWN_COMMANDS = {"/stats", "/balance", "/setbalance", "/settle", "/history", "/undo", "/delete",
+                   "/aliases", "/reset", "/debts", "/pool"}
+_AMT_TOKEN_RE = re.compile(r"^(\d+(?:\.\d+)?)(k)?$", re.IGNORECASE)
+_SYMBOL_RE = re.compile(r"[₹$]\s*")
+_CUR_PREFIX_RE = re.compile(r"(?<![a-z])(?:rs\.?|inr)\s*(?=[-−–—]?\d)", re.IGNORECASE)
+_CUR_SUFFIX_RE = re.compile(r"(?<=\d)\s*(?:/-|(?:rs\.?|inr|rupees?)(?![a-z]))", re.IGNORECASE)
+_THOUSANDS_RE = re.compile(r"(?<![\d,.])\d{1,3}(?:,\d{2,3})*,\d{3}(?![\d,])(?:\.\d+)?")
+_NEG_RE = re.compile(r"(?<![\w.])[-−–—](\d+(?:\.\d+)?k?)(?!\w)", re.IGNORECASE)
+
+
+def _pn(s) -> str:
+    """Display form of a name, plain text: 'rohan rahul' -> 'Rohan Rahul'."""
+    return " ".join(w.capitalize() for w in str(s).split())
+
+
+def _nm(s) -> str:
+    """Same as _pn but HTML-escaped."""
+    return _esc(_pn(s))
+
+
+def _clean_name(raw, hyphen=False) -> str:
+    """Lower-case, strip anything that is not a name character (this also makes the value safe to
+    print inside HTML), collapse spaces. hyphen=True is for pool names ('goa trip' -> 'goa-trip')."""
+    s = re.sub(r"[^a-z0-9 '.\-_]", "", str(raw or "").lower())
+    s = " ".join(s.split()).strip(" .-_'")[:40]
+    return s.replace(" ", "-") if hyphen else s
+
+
+def _amount_from_str(s):
+    """'1.5k' -> Decimal('1500'); None when s is not a plain amount."""
+    m = _AMT_TOKEN_RE.match((s or "").strip())
+    if not m:
+        return None
+    val = Decimal(m.group(1))
+    if m.group(2):
+        val *= Decimal("1000")
+    return val
+
+
+def _parse_amount_token(tok):
+    """For slash commands. Returns (amount, was_negative); amount is None if tok is not an amount.
+    A leading minus is reported (so the caller can tell the user), never silently applied."""
+    t = (tok or "").strip().replace("₹", "").replace("$", "").replace(",", "")
+    t = re.sub(r"^(?:rs\.?|inr)", "", t, flags=re.IGNORECASE)
+    neg = bool(t) and t[0] in "-−–—"
+    if neg:
+        t = t[1:]
+    return _amount_from_str(t), neg
+
+
+def _normalize_amount_text(text):
+    """Cleans the way people really type money, BEFORE any parser sees it:
+    '₹500' / 'rs500' / '500rs' / '500/-' -> '500';  '1,200' / '1,20,000' -> '1200' / '120000'
+    (otherwise the comma splits it into two fake items);  '-500' -> '500' and the fact that it WAS
+    negative is returned, so the reply can say 'positive value converted'.
+    Returns (clean_text, [Decimal amounts that were typed negative])."""
+    t = _SYMBOL_RE.sub("", text or "")
+    t = _CUR_PREFIX_RE.sub("", t)
+    t = _CUR_SUFFIX_RE.sub("", t)
+    t = _THOUSANDS_RE.sub(lambda m: m.group(0).replace(",", ""), t)
+    negs = []
+
+    def _strip_neg(m):
+        val = _amount_from_str(m.group(1))
+        if val is not None:
+            negs.append(_to_decimal(val))
+        return m.group(1)
+
+    t = _NEG_RE.sub(_strip_neg, t)
+    return re.sub(r"[ \t]+", " ", t).strip(), negs
+
+
+def _flag_negatives(items, negs):
+    """Marks parsed items whose amount was typed with a minus sign. Returns the notice lines."""
+    pending = list(negs)
+    notes = []
+    for it in items or []:
+        if it.get("amount") in pending:
+            pending.remove(it["amount"])
+            it["neg_converted"] = True
+            notes.append(f"Negative amount -₹{fmt(it['amount'])} converted to positive ₹{fmt(it['amount'])}.")
+    if pending and items and not notes:
+        notes.append("A minus sign was ignored: amounts are always logged as positive values.")
+    return notes
+
+
+def _with_notice(resp, notes):
+    """Appends warning lines to both the plain-text and the HTML reply."""
+    if not notes:
+        return resp
+    joined = " ".join(notes)
+    resp["text"] = (resp.get("text") or "") + "\n⚠ " + joined
+    resp["html"] = (resp.get("html") or "") + (
+        "<p style='margin-top:6px;font-size:11px;color:#B45309;'>⚠ " + _esc(joined) + "</p>")
+    return resp
+
+
+def _html_to_text(html) -> str:
+    """Plain-text version of one of our HTML cards (Telegram cannot render HTML)."""
+    t = re.sub(r"</(?:div|p)>|<br\s*/?>", "\n", html or "")
+    t = re.sub(r"</span>\s*<span[^>]*>", "  ", t)
+    t = _unesc(re.sub(r"<[^>]+>", "", t))
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in t.split("\n")]
+    return "\n".join(ln for ln in lines if ln)
+
+
+def _take_name(s, max_words=4):
+    """Leading run of name-like words ('rohan rahul upi' -> 'rohan rahul'). None if there is none."""
+    words = []
+    for tok in (s or "").lower().split():
+        t = tok.strip(".,;:!?")
+        if (not t or t in PAYMENT_METHODS or t in _NAME_STOP or t in _CURRENCY_WORDS
+                or any(c.isdigit() for c in t)):
+            break
+        words.append(t)
+        if len(words) >= max_words:
+            break
+    name = _clean_name(" ".join(words))
+    return name if name and name not in _SELF_WORDS and name not in _NOT_PEOPLE else None
+
+
+def _take_name_tail(s, max_words=3):
+    """Trailing run of name-like words ('yesterday rohan rahul' -> 'rohan rahul')."""
+    words = []
+    for tok in reversed((s or "").lower().split()):
+        t = tok.strip(".,;:!?")
+        if (not t or t in PAYMENT_METHODS or t in _NAME_STOP or t in _CURRENCY_WORDS
+                or any(c.isdigit() for c in t)):
+            break
+        words.insert(0, t)
+        if len(words) >= max_words:
+            break
+    name = _clean_name(" ".join(words))
+    return name if name and name not in _SELF_WORDS and name not in _NOT_PEOPLE else None
+
+
+def _take_people(s):
+    people = []
+    for part in re.split(r"\s+and\s+|\s*,\s*|\s*&\s*", (s or "").strip()):
+        n = _take_name(part)
+        if n and n not in people:
+            people.append(n)
+    return people
+
+
+def _leftover_note(s):
+    """The words of s that are not an amount / payment method / filler -> short note, or None."""
+    words = []
+    for tok in (s or "").lower().split():
+        t = tok.strip(".,;:")
+        if (_amount_from_str(t) is not None or t in PAYMENT_METHODS or t in _CURRENCY_WORDS
+                or not any(c.isalnum() for c in t)):
+            continue
+        words.append(t)
+    while words and words[0] in _FILLER_WORDS:
+        words.pop(0)
+    while words and words[-1] in _FILLER_WORDS:
+        words.pop()
+    return " ".join(words)[:100] or None
+
+
 def send_telegram_message(chat_id, text: str) -> None:
     """Send a plain-text reply back to a Telegram chat. Non-fatal: logs on error rather than crashing."""
     if not TG_API:
@@ -213,7 +397,7 @@ def send_telegram_message(chat_id, text: str) -> None:
     try:
         r = requests.post(
             f"{TG_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
+            json={"chat_id": chat_id, "text": text[:4000]},  # Telegram rejects > 4096 chars
             timeout=10,
         )
         if r.status_code >= 300:
@@ -988,13 +1172,13 @@ def _validate_item(data):
         amount = _to_decimal(data["amount"])
     except (TypeError, ValueError, KeyError, InvalidOperation):
         return None
-    if amount <= 0:
+    if amount <= 0 or amount > MAX_AMOUNT:
         return None
     valid_categories = EXPENSE_CATEGORIES if data["type"] == "expense" else INCOME_CATEGORIES
     category = data.get("category") if data.get("category") in valid_categories else "other"
     payment_method = data.get("payment_method") if data.get("payment_method") in PAYMENT_METHODS else None
-    note = data.get("note") or None
-    return {"type": data["type"], "amount": amount, "category": category, "payment_method": payment_method, "note": note}
+    note = str(data["note"]).strip()[:100] if data.get("note") else ""
+    return {"type": data["type"], "amount": amount, "category": category, "payment_method": payment_method, "note": note or None}
 
 
 def _validate_debt_item(data):
@@ -1009,19 +1193,21 @@ def _validate_debt_item(data):
         amount = _to_decimal(data["amount"])
     except (TypeError, ValueError, KeyError, InvalidOperation):
         return None
-    if amount <= 0:
+    if amount <= 0 or amount > MAX_AMOUNT:
         return None
 
     people_raw = data.get("people")
     if isinstance(people_raw, list) and people_raw:
-        people = [str(p).strip().lower() for p in people_raw if str(p).strip()]
+        people = [_clean_name(p) for p in people_raw]
     elif data.get("person"):
-        people = [str(data["person"]).strip().lower()]
+        people = [_clean_name(data["person"])]
     else:
         people = []
+    # drop empties, "me"/"myself", and duplicates (keeps order)
+    people = [p for p in dict.fromkeys(people) if p and p not in _SELF_WORDS]
 
-    pool = data.get("pool")
-    pool = str(pool).strip().lower().replace(" ", "-") if pool else None
+    pool = _clean_name(data.get("pool"), hyphen=True) if data.get("pool") else None
+    pool = pool or None
 
     if share_type in ("split", "lend", "borrow", "repayment") and not people:
         return None
@@ -1032,12 +1218,12 @@ def _validate_debt_item(data):
 
     payment_method = data.get("payment_method") if data.get("payment_method") in PAYMENT_METHODS else "cash"
     category = data.get("category") if data.get("category") in EXPENSE_CATEGORIES else "other"
-    note = data.get("note") or None
+    note = str(data["note"]).strip()[:100] if data.get("note") else None
     repayment_direction = data.get("repayment_direction") if data.get("repayment_direction") in ("they_paid_me", "i_paid_them") else "they_paid_me"
 
     return {
         "share_type": share_type, "amount": amount, "people": people, "pool": pool,
-        "payment_method": payment_method, "category": category, "note": note,
+        "payment_method": payment_method, "category": category, "note": note or None,
         "repayment_direction": repayment_direction,
     }
 
@@ -1101,6 +1287,29 @@ def _apply_debt_transaction(item):
     return None
 
 
+_DEBT_HINT_RE = re.compile(
+    r"\b(?:split|share|shares|gave|give|lent|lend|loan|borrow\w*|back|return\w*|repa\w*|settle\w*|owe\w*|"
+    r"from|pool|fund|contribut\w*|put|sent|send|transfer\w*|ways|paid\s+(?:for|me|to))\b", re.IGNORECASE)
+
+
+def _demote_unbacked_debt(items, text):
+    """The LLM sometimes reads a bare name ('rohan rahul 800 upi') as a debt. If the message holds no
+    debt/shared wording at all, turn such items back into a plain expense whose note is the name."""
+    if _DEBT_HINT_RE.search(text or ""):
+        return items
+    out = []
+    for it in items:
+        if it.get("share_type"):
+            note = it.get("note") or " ".join(it.get("people") or []) or it.get("pool")
+            plain = _validate_item({"type": "expense", "amount": it["amount"], "category": it.get("category"),
+                                    "payment_method": it.get("payment_method"), "note": note})
+            if plain:
+                out.append(plain)
+                continue
+        out.append(it)
+    return out
+
+
 def _call_groq_chat(text):
     if not GROQ_API_KEY:
         return _fallback_rule_parse(text)
@@ -1130,7 +1339,7 @@ def _call_groq_chat(text):
                 if v is not None:
                     results.append(v)
             if results:
-                return results
+                return _demote_unbacked_debt(results, text)
     except Exception as e:
         print(f"Groq API call error: {e}")
     return _fallback_rule_parse(text)
@@ -1147,6 +1356,13 @@ _CATEGORY_WORDS = (
     ("transport", ["uber", "cab", "bus", "train", "metro", "flight", "transit", "petrol", "fuel"]),
     ("rent", ["rent"]),
     ("bills", ["electricity", "wifi", "bill", "water"]),
+    ("subscriptions", ["netflix", "spotify", "prime", "hotstar", "youtube", "subscription"]),
+    ("entertainment", ["movie", "cinema", "concert", "game", "gaming", "show"]),
+    ("shopping", ["amazon", "flipkart", "myntra", "shirt", "shoes", "clothes", "mall"]),
+    ("health", ["medicine", "doctor", "pharmacy", "hospital", "medical", "clinic"]),
+    ("education", ["course", "tuition", "exam", "notebook", "book", "stationery"]),
+    ("fitness", ["gym", "protein", "yoga"]),
+    ("travel", ["hotel", "hostel", "resort", "trip", "tour", "ticket", "entry", "visit", "monument", "fort", "stay"]),
 )
 
 
@@ -1188,11 +1404,8 @@ def _parse_single_fallback_item(text):
     for tok in tokens:
         clean = tok.strip(".,;")
         if amount is None:
-            m = re.match(r"^(\d+(?:\.\d+)?)(k)?$", clean)
-            if m:
-                val = Decimal(m.group(1))
-                if m.group(2) == "k":
-                    val *= Decimal("1000")
+            val = _amount_from_str(clean)
+            if val is not None:
                 amount = val
                 continue
         if clean in _CURRENCY_WORDS:
@@ -1203,27 +1416,37 @@ def _parse_single_fallback_item(text):
         if clean in (EXPENSE_CATEGORIES if tx_type == "expense" else INCOME_CATEGORIES):
             category = clean
             continue
+        if not any(ch.isalnum() for ch in clean):
+            continue  # stray "-", "=", ":" etc. never belong in a note
         note_words.append(clean)
 
-    if amount is None or amount <= 0:
+    if amount is None:
         return None
+    amount = _to_decimal(amount)  # round FIRST: 0.001 becomes 0.00 and must be rejected
+    if amount <= 0 or amount > MAX_AMOUNT:
+        return None
+
+    while note_words and note_words[0] in _FILLER_WORDS:
+        note_words.pop(0)
+    while note_words and note_words[-1] in _FILLER_WORDS:
+        note_words.pop()
 
     if not category:
         category = _guess_category(" ".join(note_words), tx_type)
 
-    note = " ".join(note_words).strip() or None
-    return {"type": tx_type, "amount": _to_decimal(amount), "category": category,
+    note = " ".join(note_words)[:100].strip() or None
+    return {"type": tx_type, "amount": amount, "category": category,
             "payment_method": payment_method, "note": note}
 
 
 def _debt_reply(parsed, r):
     """(reply_text, html) for one applied debt/shared item. All user-derived text is escaped."""
     kind = r.get("kind") if r else None
-    cap = lambda s: _esc(str(s).capitalize())
+    cap = _nm
 
     if kind == "split":
         people_str = ", ".join(cap(p) for p, _ in r["people"])
-        plain_people = ", ".join(str(p).capitalize() for p, _ in r["people"])
+        plain_people = ", ".join(_pn(p) for p, _ in r["people"])
         reply_text = f"Split ₹{fmt(parsed['amount'])} ({parsed['category']}) with {plain_people}. Your share: ₹{fmt(r['my_share'])}."
         breakdown_lines = "".join(
             f"<div class='flex justify-between py-0.5 border-b border-[#E5DFC9]'><span>{cap(p)} owes you</span>"
@@ -1244,7 +1467,7 @@ def _debt_reply(parsed, r):
             </div>
             """
     elif kind == "lend":
-        reply_text = f"Lent ₹{fmt(r['amount'])} to {str(r['who']).capitalize()}."
+        reply_text = f"Lent ₹{fmt(r['amount'])} to {_pn(r['who'])}."
         html_res = f"""
             <div class="space-y-1.5">
               <div class="flex items-center gap-1.5 mb-1">
@@ -1254,7 +1477,7 @@ def _debt_reply(parsed, r):
             </div>
             """
     elif kind == "borrow":
-        reply_text = f"Borrowed ₹{fmt(r['amount'])} from {str(r['who']).capitalize()}."
+        reply_text = f"Borrowed ₹{fmt(r['amount'])} from {_pn(r['who'])}."
         html_res = f"""
             <div class="space-y-1.5">
               <div class="flex items-center gap-1.5 mb-1">
@@ -1265,7 +1488,7 @@ def _debt_reply(parsed, r):
             """
     elif kind == "repayment":
         if r.get("direction") == "they_paid_me":
-            reply_text = f"{str(r['who']).capitalize()} paid back ₹{fmt(r['amount'])}."
+            reply_text = f"{_pn(r['who'])} paid back ₹{fmt(r['amount'])}."
             html_res = f"""
                 <div class="space-y-1.5">
                   <div class="flex items-center gap-1.5 mb-1">
@@ -1275,7 +1498,7 @@ def _debt_reply(parsed, r):
                 </div>
                 """
         else:
-            reply_text = f"Paid back ₹{fmt(r['amount'])} to {str(r['who']).capitalize()}."
+            reply_text = f"Paid back ₹{fmt(r['amount'])} to {_pn(r['who'])}."
             html_res = f"""
                 <div class="space-y-1.5">
                   <div class="flex items-center gap-1.5 mb-1">
@@ -1295,7 +1518,7 @@ def _debt_reply(parsed, r):
             </div>
             """
     elif kind == "pool_contribution_other":
-        reply_text = f"{str(r['person']).capitalize()} put ₹{fmt(r['amount'])} into {str(r['who']).upper()} pool."
+        reply_text = f"{_pn(r['person'])} put ₹{fmt(r['amount'])} into {str(r['who']).upper()} pool."
         html_res = f"""
             <div class="space-y-1.5">
               <div class="flex items-center gap-1.5 mb-1">
@@ -1322,21 +1545,12 @@ def _debt_reply(parsed, r):
 
 def _fallback_debt_parse(text):
     """Best-effort regex recognizer for the most common shared/debt phrasings, used ONLY when the
-    Groq API is unavailable (no key, or the call failed). This is intentionally narrower than the
-    LLM path above — it covers split/lend/borrow/repayment/pool for a single event per message,
-    not every possible phrasing. Treats the WHOLE message as one event rather than chunking it,
-    since chunking on commas (needed for multi-item plain expenses) would break sentences like
-    "600 dinner upi, split with rahul" by cutting the amount away from the split phrase."""
-    tl = text.strip().lower()
-
-    def _num(s):
-        m = re.match(r"^(\d+(?:\.\d+)?)(k)?$", s.replace(" ", ""))
-        if not m:
-            return None
-        val = Decimal(m.group(1))
-        if m.group(2):
-            val *= Decimal("1000")
-        return val
+    Groq API is unavailable (no key, or the call failed). Narrower than the LLM path: one event per
+    message. Names may have several words ('rohan rahul') and stop at a payment method or amount.
+    Treats the WHOLE message as one event rather than chunking it, since chunking on commas would
+    cut the amount away from phrases like '600 dinner upi, split with rahul'."""
+    tl = " ".join(text.strip().lower().split())
+    N = r"(\d+(?:\.\d+)?k?)"
 
     def _method_in(s):
         for m in PAYMENT_METHODS:
@@ -1344,90 +1558,117 @@ def _fallback_debt_parse(text):
                 return m
         return None
 
-    m = re.search(r"(\d+(?:\.\d+)?k?)\b(.*?)\b(?:split|share)(?:\s+\w+)?\s+with\s+([a-z][a-z ]*)", tl)
+    def _pool_name(s):
+        return _clean_name(re.sub(r"^(?:my|our|the)\s+", "", s.strip()), hyphen=True) or None
+
+    m = re.search(N + r"\b.*?\b(?:split|share)\b(?:\s+\w+){0,3}?\s+with\s+(.+)$", tl)
     if m:
-        amount = _num(m.group(1))
-        if amount:
-            people = [p.strip() for p in re.split(r"\s+and\s+|,", m.group(3).strip()) if p.strip()]
-            category = _guess_category(m.group(2))
+        amount, people = _amount_from_str(m.group(1)), _take_people(m.group(2))
+        if amount and people:
+            pre = re.split(r"\b(?:split|share)\b", tl)[0]
             return _validate_debt_item({
-                "share_type": "split", "amount": amount, "people": people,
-                "category": category, "payment_method": _method_in(tl), "note": None,
+                "share_type": "split", "amount": amount, "people": people, "category": _guess_category(pre),
+                "payment_method": _method_in(tl), "note": _leftover_note(pre),
             })
 
-    m = re.search(r"\b(?:gave|lent)\s+([a-z]+)\s+(\d+(?:\.\d+)?k?)", tl)
+    m = re.search(r"\b(?:gave|lent|lend)\s+(?!\d)(.+?)\s+" + N + r"\b", tl)
     if m:
-        amount = _num(m.group(2))
-        if amount:
-            return _validate_debt_item({
-                "share_type": "lend", "amount": amount, "people": [m.group(1)],
-                "payment_method": _method_in(tl), "note": None,
-            })
+        amount, name = _amount_from_str(m.group(2)), _take_name(m.group(1))
+        if amount and name:
+            return _validate_debt_item({"share_type": "lend", "amount": amount, "people": [name],
+                                        "payment_method": _method_in(tl), "note": None})
 
-    m = re.search(r"\bborrowed\s+(\d+(?:\.\d+)?k?)\s+from\s+([a-z]+)", tl)
+    m = re.search(r"\b(?:gave|lent|lend)\s+" + N + r"\b(?:\s+(?:upi|cash|card|netbanking))?\s+to\s+(.+)$", tl)
     if m:
-        amount = _num(m.group(1))
-        if amount:
-            return _validate_debt_item({
-                "share_type": "borrow", "amount": amount, "people": [m.group(2)],
-                "payment_method": _method_in(tl), "note": None,
-            })
+        amount, name = _amount_from_str(m.group(1)), _take_name(m.group(2))
+        if amount and name:
+            return _validate_debt_item({"share_type": "lend", "amount": amount, "people": [name],
+                                        "payment_method": _method_in(tl), "note": None})
 
-    m = re.search(r"\bpaid\s+([a-z]+)\s+back\s+(\d+(?:\.\d+)?k?)", tl)
+    m = re.search(r"\bborrowed\s+" + N + r"\b.*?\bfrom\s+(.+)$", tl)
     if m:
-        amount = _num(m.group(2))
-        if amount:
-            return _validate_debt_item({
-                "share_type": "repayment", "repayment_direction": "i_paid_them",
-                "amount": amount, "people": [m.group(1)], "payment_method": _method_in(tl), "note": None,
-            })
+        amount, name = _amount_from_str(m.group(1)), _take_name(m.group(2))
+        if amount and name:
+            return _validate_debt_item({"share_type": "borrow", "amount": amount, "people": [name],
+                                        "payment_method": _method_in(tl), "note": None})
 
-    m = re.search(r"([a-z]+)\s+(?:paid(?:\s+me)?\s+back|returned|repaid)\s+(\d+(?:\.\d+)?k?)", tl)
+    m = re.search(r"\bpaid\s+(?!back\b|me\b)(.+?)\s+back\s+" + N + r"\b", tl)
     if m:
-        amount = _num(m.group(2))
-        if amount:
-            return _validate_debt_item({
-                "share_type": "repayment", "repayment_direction": "they_paid_me",
-                "amount": amount, "people": [m.group(1)], "payment_method": _method_in(tl), "note": None,
-            })
+        amount, name = _amount_from_str(m.group(2)), _take_name(m.group(1))
+        if amount and name:
+            return _validate_debt_item({"share_type": "repayment", "repayment_direction": "i_paid_them",
+                                        "amount": amount, "people": [name], "payment_method": _method_in(tl), "note": None})
 
-    m = re.search(r"\b(?:got|received)\s+(\d+(?:\.\d+)?k?)\b.*?\bfrom\s+([a-z]+)", tl)
+    m = re.search(r"\bpaid\s+back\s+" + N + r"\b(?:\s+(?:upi|cash|card|netbanking))?\s+to\s+(.+)$", tl)
     if m:
-        amount = _num(m.group(1))
-        if amount:
-            return _validate_debt_item({
-                "share_type": "repayment", "repayment_direction": "they_paid_me",
-                "amount": amount, "people": [m.group(2)], "payment_method": _method_in(tl), "note": None,
-            })
+        amount, name = _amount_from_str(m.group(1)), _take_name(m.group(2))
+        if amount and name:
+            return _validate_debt_item({"share_type": "repayment", "repayment_direction": "i_paid_them",
+                                        "amount": amount, "people": [name], "payment_method": _method_in(tl), "note": None})
 
-    m = re.search(r"([a-z]+)\s+put\s+(\d+(?:\.\d+)?k?)\s+into\s+(?:the\s+)?([a-z0-9\-]+)\s+pool", tl)
+    m = re.search(r"^(.+?)\s+(?:paid(?:\s+me)?\s+back|paid\s+me|returned(?:\s+me)?|repaid(?:\s+me)?)\s+" + N + r"\b", tl)
     if m:
-        amount = _num(m.group(2))
-        if amount:
-            return _validate_debt_item({
-                "share_type": "pool_contribution_other", "amount": amount,
-                "people": [m.group(1)], "pool": m.group(3), "note": None,
-            })
+        amount, name = _amount_from_str(m.group(2)), _take_name_tail(m.group(1))
+        if amount and name:
+            return _validate_debt_item({"share_type": "repayment", "repayment_direction": "they_paid_me",
+                                        "amount": amount, "people": [name], "payment_method": _method_in(tl), "note": None})
 
-    m = re.search(r"\bput\s+(\d+(?:\.\d+)?k?)\s+into\s+(?:the\s+)?([a-z0-9\-]+)\s+pool", tl)
-    if m:
-        amount = _num(m.group(1))
-        if amount:
-            return _validate_debt_item({
-                "share_type": "contribution", "amount": amount, "pool": m.group(2),
-                "payment_method": _method_in(tl), "note": None,
-            })
+    if not re.search(r"\b(?:pool|fund)\b", tl):
+        m = re.search(r"\b(?:got|received)\s+" + N + r"\b.*?\bfrom\s+(.+)$", tl)
+        if m:
+            amount, name = _amount_from_str(m.group(1)), _take_name(m.group(2))
+            if amount and name:
+                return _validate_debt_item({"share_type": "repayment", "repayment_direction": "they_paid_me",
+                                            "amount": amount, "people": [name], "payment_method": _method_in(tl), "note": None})
 
-    m = re.search(r"(\d+(?:\.\d+)?k?)\b.*?\bfrom\s+(?:the\s+)?([a-z0-9\-]+)\s+pool", tl)
+    m = re.search(r"^(.+?)\s+put\s+" + N + r"\b.*?\b(?:in|into|to)\s+(?:the\s+)?(.+?)\s+(?:pool|fund)\b", tl)
     if m:
-        amount = _num(m.group(1))
-        if amount:
-            return _validate_debt_item({
-                "share_type": "pool_expense", "amount": amount, "pool": m.group(2),
-                "category": "other", "note": None,
-            })
+        amount, who, pool = _amount_from_str(m.group(2)), _take_name_tail(m.group(1)), _pool_name(m.group(3))
+        if amount and who and pool:
+            return _validate_debt_item({"share_type": "pool_contribution_other", "amount": amount,
+                                        "people": [who], "pool": pool, "note": None})
+
+    m = re.search(r"\b(?:put|added|add|contributed)\s+" + N + r"\b.*?\b(?:in|into|to)\s+(?:the\s+)?(.+?)\s+(?:pool|fund)\b", tl)
+    if m:
+        amount, pool = _amount_from_str(m.group(1)), _pool_name(m.group(2))
+        if amount and pool:
+            return _validate_debt_item({"share_type": "contribution", "amount": amount, "pool": pool,
+                                        "payment_method": _method_in(tl), "note": None})
+
+    m = re.search(N + r"\b.*?\bfrom\s+(?:the\s+)?(.+?)\s+(?:pool|fund)\b", tl)
+    if m:
+        amount, pool = _amount_from_str(m.group(1)), _pool_name(m.group(2))
+        if amount and pool:
+            return _validate_debt_item({"share_type": "pool_expense", "amount": amount, "pool": pool,
+                                        "category": "other", "note": None})
 
     return None
+
+
+def _split_chunks(text):
+    """Split on newline / comma / semicolon / 'and', but never leave a piece without a number:
+    an amount-less piece ('rohan rahul') is glued onto its neighbour so no words are silently dropped
+    ('rohan rahul and taj mahal for 800 upi' stays ONE item)."""
+    raw = re.split(r"([\n,;]|\band\b)", text, flags=re.IGNORECASE)
+    pairs = [("", raw[0])] + [(raw[i], raw[i + 1]) for i in range(1, len(raw) - 1, 2)]
+    merged, carry, carry_glue = [], "", " "
+    for sep, chunk in pairs:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        glue = " and " if sep.strip().lower() == "and" else " "
+        had_carry = bool(carry)
+        if carry:
+            chunk, carry = carry + glue + chunk, ""
+        if re.search(r"\d", chunk):
+            merged.append(chunk)
+        else:
+            carry = chunk
+            if not had_carry:
+                carry_glue = glue
+    if carry and merged:
+        merged[-1] += carry_glue + carry
+    return merged
 
 
 def _fallback_rule_parse(text):
@@ -1436,12 +1677,14 @@ def _fallback_rule_parse(text):
     if debt_item:
         return [debt_item]
 
-    chunks = [c.strip() for c in re.split(r"[\n,;]|\band\b", text, flags=re.IGNORECASE) if c.strip()]
+    chunks = _split_chunks(text)
 
     if len(chunks) == 1:
-        sub_chunks = re.findall(r"\d+(?:\.\d+)?\s+.*?(?=\s+\d+(?:\.\d+)?\s+|$)", text)
-        if len(sub_chunks) > 1:
-            chunks = [s.strip() for s in sub_chunks if s.strip()]
+        subs = list(re.finditer(r"\d+(?:\.\d+)?k?\s+.*?(?=\s+\d+(?:\.\d+)?k?\s+|$)", chunks[0], flags=re.IGNORECASE))
+        if len(subs) > 1:
+            pieces = [s.group(0).strip() for s in subs]
+            pieces[0] = (chunks[0][:subs[0].start()] + pieces[0]).strip()  # words typed before the first amount
+            chunks = pieces
 
     results = []
     for chunk in chunks:
@@ -1478,10 +1721,12 @@ def quick_parse_single(text, aliases):
             continue
         note_tokens.append(clean)
 
-    if amount is None or amount <= 0 or not note_tokens:
+    if amount is None or not note_tokens:
         return None
 
     amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if amount <= 0 or amount > MAX_AMOUNT:
+        return None
     note_key = " ".join(note_tokens).strip()
     alias = aliases.get(note_key)
     if not alias:
@@ -1542,6 +1787,8 @@ def log_chat_message(role: str, content: str) -> None:
     """Insert one chat turn into chat_log. Non-fatal: logs on error rather than crashing."""
     if not (SUPABASE_URL and SUPABASE_KEY):
         return
+    if role == "assistant" and not content.lstrip().startswith("<"):
+        content = _esc(content)  # plain-text replies echo user input; the page re-renders history as HTML
     try:
         resp = requests.post(
             _sb_url("chat_log"),
@@ -1698,8 +1945,8 @@ def format_history_html(limit=5) -> str:
             continue
         sign = "+" if r["type"] == "income" else "-"
         color = "text-[#059669]" if r["type"] == "income" else "text-[#E15554]"
-        note = f" ({r['note']})" if r.get("note") else ""
-        pay = f" [{r['payment_method']}]" if r.get("payment_method") else ""
+        note = f" ({_esc(r['note'])})" if r.get("note") else ""
+        pay = f" [{_esc(r['payment_method'])}]" if r.get("payment_method") else ""
         lines.append(f"""
         <div class='py-1 border-b border-[#E5DFC9]'>
           <div class='flex justify-between'>
@@ -1726,7 +1973,7 @@ def format_debts_html() -> str:
     for person, amt in sorted(debts.items(), key=lambda x: -abs(x[1])):
         if amt == 0:
             continue
-        label = f"{person.capitalize()} owes you" if amt > 0 else f"You owe {person.capitalize()}"
+        label = f"{_nm(person)} owes you" if amt > 0 else f"You owe {_nm(person)}"
         color = "text-[#059669]" if amt > 0 else "text-[#E15554]"
         sign = "+" if amt > 0 else "-"
         rows_html += f"""
@@ -1835,15 +2082,38 @@ def api_state():
 
 
 def _process_text(text: str, allow_commands: bool = True):
+    """Entry point for web, voice and Telegram. Cleans the amounts first (₹ / rs / 1,200 / minus signs),
+    runs the real handler, then appends the 'negative value converted to positive' notice to the reply."""
+    text = (text or "").strip()
+    if len(text) > MAX_TEXT_LEN:
+        return ({"ok": False, "text": f"Message too long (max {MAX_TEXT_LEN} characters)."}, 400)
+    _tl.notices = []
+    if allow_commands and text.startswith("/"):
+        clean, _tl.negs = text, []
+    else:
+        clean, _tl.negs = _normalize_amount_text(text)
+    payload, status = _unwrap(_process_text_core(clean, allow_commands))
+    payload = _with_notice(dict(payload), _tl.notices)
+    return payload if status == 200 else (payload, status)
+
+
+def _process_text_core(text: str, allow_commands: bool = True):
     """Processes natural language input or slash commands and returns a response dictionary
     (or a (dict, http_status) tuple for usage errors). allow_commands=False is used for voice."""
     if allow_commands and text.startswith("/"):
         parts = text.split()
-        cmd = parts[0].lower()
+        cmd = parts[0].lower().split("@")[0]  # Telegram groups send /stats@YourBot
+        if cmd not in _KNOWN_COMMANDS:
+            reply_text = ("Unknown command. Try /stats, /balance, /history, /debts, /pool, /settle, /undo, "
+                          "/delete, /aliases - or just type what you spent, e.g. 24 coffee upi")
+            log_chat_message("assistant", reply_text)
+            return {"ok": True, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
         args = parts[1:]
 
         if cmd == "/stats":
             period = args[0].lower() if args else "month"
+            if period not in ("today", "week", "month", "all"):
+                return ({"ok": False, "text": "Usage: /stats [today|week|month|all]"}, 400)
             html = format_stats_html(period)
             reply_text = f"Stats for {period} period."
             log_chat_message("assistant", html)
@@ -1853,18 +2123,20 @@ def _process_text(text: str, allow_commands: bool = True):
             if args:
                 target_method = "cash"
                 target_amount = None
+                target_neg = False
                 for a in args:
                     clean_a = a.lower().replace("₹", "").replace("$", "").replace(",", "")
                     if clean_a in PAYMENT_METHODS:
                         target_method = clean_a
                     else:
-                        m = re.match(r"^(\d+(?:\.\d+)?)(k)?$", clean_a)
-                        if m:
-                            val = Decimal(m.group(1))
-                            if m.group(2) == "k":
-                                val *= Decimal("1000")
-                            target_amount = val
+                        val, was_neg = _parse_amount_token(clean_a)
+                        if val is not None:
+                            target_amount, target_neg = val, was_neg
+                if target_amount is not None and target_amount > MAX_AMOUNT:
+                    return ({"ok": False, "text": "That balance is too large to be real."}, 400)
                 if target_amount is not None:
+                    if target_neg:
+                        _tl.notices.append(f"Negative balance -₹{fmt(target_amount)} converted to positive ₹{fmt(target_amount)}.")
                     set_starting_balance(target_method, target_amount)
                     reply_text = f"Set {target_method.capitalize()} balance to ₹{fmt(target_amount)}."
                     html = format_balance_html()
@@ -1881,16 +2153,24 @@ def _process_text(text: str, allow_commands: bool = True):
             return {"ok": True, "text": "Balance summary.", "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
 
         elif cmd == "/settle":
-            person = args[0].lower() if len(args) > 0 else ""
-            try:
-                amt = _to_decimal(args[1].replace("₹", "").replace("$", "").replace(",", "")) if len(args) > 1 else Decimal("0.00")
-            except Exception:
-                amt = Decimal("0.00")
-            method = args[2].lower() if len(args) > 2 and args[2].lower() in PAYMENT_METHODS else "cash"
-            if not person or amt <= 0:
+            # order-free: /settle rohan rahul 500 upi   |   /settle 500 upi rohan rahul
+            amt, was_neg, method, name_tokens = None, False, "cash", []
+            for a in args:
+                low = a.lower()
+                val, neg = _parse_amount_token(low)
+                if val is not None and amt is None:
+                    amt, was_neg = _to_decimal(val), neg
+                elif low in PAYMENT_METHODS:
+                    method = low
+                else:
+                    name_tokens.append(low)
+            person = _clean_name(" ".join(name_tokens))
+            if not person or person in _SELF_WORDS or amt is None or amt <= 0 or amt > MAX_AMOUNT:
                 reply_text = "Usage: /settle <person> <amount> [payment_method]"
                 log_chat_message("assistant", reply_text)
                 return ({"ok": False, "text": reply_text}, 400)
+            if was_neg:
+                _tl.notices.append(f"Negative amount -₹{fmt(amt)} converted to positive ₹{fmt(amt)}.")
             item = _validate_debt_item({
                 "share_type": "repayment",
                 "repayment_direction": "they_paid_me",
@@ -1900,13 +2180,13 @@ def _process_text(text: str, allow_commands: bool = True):
             })
             if item:
                 r = _apply_debt_transaction(item)
-                reply_text = f"{person.capitalize()} paid back ₹{fmt(amt)}."
+                reply_text = f"{_pn(person)} paid back ₹{fmt(amt)}."
                 html_res = f"""
                 <div class="space-y-1.5">
                   <div class="flex items-center gap-1.5 mb-1">
                     <span class="bg-[#10B981] text-white px-1.5 py-0.5 font-bold border border-[#065F46]" style="font-size:10px;">DEBT SETTLED</span>
                   </div>
-                  <p class="text-[12px]"><strong>{person.capitalize()}</strong> paid back <strong>₹{fmt(amt)}</strong> via {method.upper()}.</p>
+                  <p class="text-[12px]"><strong>{_nm(person)}</strong> paid back <strong>₹{fmt(amt)}</strong> via {_esc(method.upper())}.</p>
                 </div>
                 """
             else:
@@ -1920,9 +2200,8 @@ def _process_text(text: str, allow_commands: bool = True):
                 "balance": float(get_balance()),
                 "today_spent": float(get_today_expense()),
             }
-
         elif cmd == "/history":
-            limit = int(args[0]) if args and args[0].isdigit() else 5
+            limit = max(1, min(int(args[0]), 50)) if args and re.fullmatch(r"[0-9]{1,6}", args[0]) else 5
             html = format_history_html(limit)
             log_chat_message("assistant", html)
             return {"ok": True, "text": f"Last {limit} transactions shown.", "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
@@ -1952,7 +2231,7 @@ def _process_text(text: str, allow_commands: bool = True):
             }
 
         elif cmd == "/delete":
-            if not args or not args[0].isdigit():
+            if not args or not re.fullmatch(r"[0-9]{1,15}", args[0]):
                 return ({"ok": False, "text": "Usage: /delete <id>"}, 400)
             tx_id = int(args[0])
             group = delete_transaction_group_by_id(tx_id)
@@ -2000,7 +2279,7 @@ def _process_text(text: str, allow_commands: bool = True):
             return {"ok": True, "text": "IOU ledger shown.", "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
 
         elif cmd == "/pool":
-            pool_name = args[0].lower().replace(" ", "-") if args else None
+            pool_name = (_clean_name(" ".join(args), hyphen=True) or None) if args else None
             if not pool_name:
                 pools = list_known_pools()
                 if not pools:
@@ -2043,18 +2322,18 @@ def _process_text(text: str, allow_commands: bool = True):
                 return {"ok": True, "text": reply_text, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
             s = get_pool_summary(pool_name)
             contrib_lines = "".join(
-                f"<div class='flex justify-between py-0.5 border-b border-[#E5DFC9]'><span>{p.capitalize()}</span><span class='font-numeral text-[10px] font-bold'>+₹{fmt(a)}</span></div>"
+                f"<div class='flex justify-between py-0.5 border-b border-[#E5DFC9]'><span>{_nm(p)}</span><span class='font-numeral text-[10px] font-bold'>+₹{fmt(a)}</span></div>"
                 for p, a in s["by_person"].items()
             )
             expense_lines_list = []
             for e in s["expenses"]:
-                note_str = f" ({e['note']})" if e.get("note") else ""
+                note_str = f" ({_esc(e['note'])})" if e.get("note") else ""
                 expense_lines_list.append(
                     f"<div class='flex justify-between py-0.5 border-b border-[#E5DFC9]'><span>{e.get('category','other').capitalize()}{note_str}</span><span class='font-numeral text-[10px] font-bold text-[#E15554]'>-₹{fmt(e['amount'])}</span></div>"
                 )
             expense_lines = "".join(expense_lines_list)
             net_lines = "".join(
-                f"<div class='flex justify-between py-0.5'><span class='{'text-[#059669]' if v >= 0 else 'text-[#E15554]'} font-bold'>{p.capitalize()}</span><span class='font-numeral text-[10px]'>{'owes ₹' + fmt(v) if v > 0 else 'gets back ₹' + fmt(abs(v))}</span></div>"
+                f"<div class='flex justify-between py-0.5'><span class='{'text-[#059669]' if v >= 0 else 'text-[#E15554]'} font-bold'>{_nm(p)}</span><span class='font-numeral text-[10px]'>{'gets back ₹' + fmt(v) if v >= 0 else 'owes ₹' + fmt(abs(v))}</span></div>"
                 for p, v in s["net_position"].items()
             )
             html = f"""
@@ -2091,6 +2370,8 @@ def _process_text(text: str, allow_commands: bool = True):
                     val = Decimal(m_k.group(1))
                     if m_k.group(2) == "k":
                         val *= Decimal("1000")
+                    if _tl.negs:
+                        _tl.notices.append(f"Negative balance -₹{fmt(val)} converted to positive ₹{fmt(val)}.")
                     set_starting_balance(m_method, val)
                     reply_text = f"Set {m_method.capitalize()} treasury balance to ₹{fmt(val)}."
                     html = format_balance_html()
@@ -2107,6 +2388,7 @@ def _process_text(text: str, allow_commands: bool = True):
 
     aliases = _soft_aliases()
     transactions = parse_multi(text, aliases)
+    _tl.notices.extend(_flag_negatives(transactions or [], _tl.negs))
     if not transactions:
         reply_text = f"Could not parse amount from '{text}'. Hint: type coins first, e.g. 12 notebook cash"
         log_chat_message("assistant", reply_text)
@@ -2172,8 +2454,10 @@ def _process_text(text: str, allow_commands: bool = True):
         }
 
     has_debt = any(x["debt"] for x in logged)
+    mixed = len({x["type"] for x in logged if not x["debt"]}) > 1  # income + expense must not be added together
     plain_total = sum((x["amount"] for x in logged if not x["debt"]), Decimal("0.00"))
-    reply_text = f"Logged {len(logged)} items" + ("" if has_debt else f" totaling ₹{fmt(plain_total)}")
+    show_total = not (has_debt or mixed)
+    reply_text = f"Logged {len(logged)} items" + (f" totaling ₹{fmt(plain_total)}" if show_total else "")
     items_html = ""
     for tx in logged:
         if tx["debt"]:
@@ -2193,7 +2477,7 @@ def _process_text(text: str, allow_commands: bool = True):
               <span style="font-weight:bold;color:{color};">{sign}₹{fmt(tx['amount'])}</span>
             </div>
             """
-    total_html = "" if has_debt else f" (Total: ₹{fmt(plain_total)})"
+    total_html = f" (Total: ₹{fmt(plain_total)})" if show_total else ""
     html_res = f"""
         <div style="margin-bottom:6px;display:flex;gap:6px;align-items:center;">
           <span style="background:#10B981;color:white;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:bold;">+{len(logged)*15} EXP</span>
@@ -2217,7 +2501,7 @@ def _process_text(text: str, allow_commands: bool = True):
 @app.route("/api/message", methods=["POST"])
 def api_message():
     data = request.get_json(silent=True) or {}
-    text = data.get("text", "").strip()
+    text = str(data.get("text") or "").strip()
     if not text:
         return jsonify({"ok": False, "text": "Empty message."}), 400
 
@@ -2356,7 +2640,7 @@ def api_backup():
 @app.route("/api/transactions", methods=["GET"])
 def api_transactions():
     """Return recent transactions, optionally filtered by payment_method."""
-    limit = request.args.get("limit", default=50, type=int)
+    limit = max(1, min(request.args.get("limit", default=50, type=int), 1000))
     payment_method = request.args.get("payment_method")
 
     if payment_method:
@@ -2416,7 +2700,7 @@ def api_aliases_list():
 @app.route("/api/history", methods=["GET"])
 def api_history():
     """Return persisted chat history (user + assistant turns) oldest-first."""
-    limit = request.args.get("limit", default=50, type=int)
+    limit = max(1, min(request.args.get("limit", default=50, type=int), 500))
     return jsonify(get_chat_history(limit=limit))
 
 
@@ -2437,6 +2721,10 @@ def _handle_telegram_text(chat_id, message_id, text, is_edit):
         res = _process_text(text)
     payload, _status = _unwrap(res)
     reply = payload.get("text") or ""
+    cmd0 = text.split()[0].lower().split("@")[0] if is_cmd else ""
+    if cmd0 in ("/stats", "/balance", "/setbalance", "/history", "/debts", "/pool") and payload.get("html"):
+        # these commands put their real content in the HTML card; Telegram needs it as plain text
+        reply = (reply + "\n\n" + _html_to_text(payload["html"])).strip()
     created_any = bool(made["tx"] or made["pc"] or made["pe"])
 
     if previous is not None:

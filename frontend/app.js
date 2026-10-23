@@ -459,7 +459,7 @@ document.addEventListener('DOMContentLoaded', () => {
         playCoin();
         if (data.balance !== undefined) updateBalanceDisplay(data.balance);
         if (data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
-        renderCompanionBubble(data.html || data.text, data.tx_id, data.category, data.payment_method);
+        renderCompanionBubble(data.html || escapeHtml(data.text || ''), data.tx_id, data.category, data.payment_method);
       } else {
         renderCompanionBubble(escapeHtml(data.text || "Could not execute spell."));
       }
