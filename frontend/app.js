@@ -126,8 +126,8 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  let currentBalance = 2418.50;
-  let todaySpent = 60.00;
+  let currentBalance = 0;
+  let todaySpent = 0;
   const todayLimit = 120.00;
   let commandHistory = [];
   let historyIdx = -1;
@@ -277,8 +277,11 @@ document.addEventListener('DOMContentLoaded', () => {
           audioChunks = [];
           mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
           mediaRecorder.onstop = async () => {
-            const audioBlob = new Blob(audioChunks, { type: 'audio/ogg; codecs=opus' });
-            uploadVoiceRecording(audioBlob);
+            // Label the file with what the browser REALLY recorded (Chrome=webm, Firefox=ogg, Safari=mp4)
+            const mime = (mediaRecorder && mediaRecorder.mimeType) || 'audio/webm';
+            const ext = mime.includes('ogg') ? 'ogg' : (mime.includes('mp4') ? 'm4a' : 'webm');
+            const audioBlob = new Blob(audioChunks, { type: mime });
+            uploadVoiceRecording(audioBlob, ext);
           };
           mediaRecorder.start();
           isRecording = true;
@@ -301,7 +304,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  async function uploadVoiceRecording(blob) {
+  async function uploadVoiceRecording(blob, ext = 'webm') {
     const cassetteBubble = document.createElement('div');
     cassetteBubble.className = 'msg-user';
     cassetteBubble.innerHTML = `
@@ -329,18 +332,25 @@ document.addEventListener('DOMContentLoaded', () => {
     chatThread.scrollTop = chatThread.scrollHeight;
 
     const formData = new FormData();
-    formData.append('audio', blob, 'voice.ogg');
+    formData.append('audio', blob, `voice.${ext}`);
     try {
       const res = await fetch('/api/voice', { method: 'POST', body: formData });
-      const data = await res.json();
+      let data = null;
+      try { data = await res.json(); } catch (_) { data = null; }
+      if (!data) {
+        renderCompanionBubble(`⚠ Voice upload failed (HTTP ${res.status}). Nothing was logged.`);
+        return;
+      }
       if (data.ok) {
         playCoin();
         if (data.balance !== undefined) updateBalanceDisplay(data.balance);
         if (data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
-        renderCompanionBubble(data.message_html || data.text);
+        renderCompanionBubble(data.message_html || escapeHtml(data.text || ''), data.tx_id, data.category, data.payment_method);
+      } else {
+        renderCompanionBubble(`⚠ ${escapeHtml(data.text || 'Voice note could not be processed.')}`);
       }
     } catch(e) {
-      renderCompanionBubble("<p>Logged audio note! Pouch updated.</p>");
+      renderCompanionBubble(`⚠ Connection error — the voice note may not have been processed. Check /history before retrying.`);
     }
   }
 
@@ -392,12 +402,18 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       const res = await fetch('/api/state');
       const data = await res.json();
-      if (data.ok) {
+      if (res.ok && data.ok) {
         if (data.balance !== undefined) updateBalanceDisplay(data.balance);
         if (data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
+        return;
       }
+      throw new Error((data && data.text) || `HTTP ${res.status}`);
     } catch(e) {
-      console.log("Using local offline state.");
+      console.error('Could not load state:', e);
+      // Never show made-up numbers: show that we don't know.
+      if (balanceVal) balanceVal.textContent = '—';
+      if (todayLoggedVal) todayLoggedVal.textContent = '—';
+      if (todayPctVal) todayPctVal.textContent = '–';
     }
   }
   fetchInitialState();
@@ -432,21 +448,24 @@ document.addEventListener('DOMContentLoaded', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text })
       });
-      const data = await res.json();
+      let data = null;
+      try { data = await res.json(); } catch (_) { data = null; }
+      if (!data) {
+        // The server answered with something that is not JSON (crash / gateway error). Say so; never fake success.
+        renderCompanionBubble(`⚠ Server error (HTTP ${res.status}). I can't confirm "${escapeHtml(text)}" was saved — check /history before retrying, or you may log it twice.`);
+        return;
+      }
       if (data.ok) {
         playCoin();
         if (data.balance !== undefined) updateBalanceDisplay(data.balance);
         if (data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
         renderCompanionBubble(data.html || data.text, data.tx_id, data.category, data.payment_method);
       } else {
-        renderCompanionBubble(data.text || "Could not execute spell.");
+        renderCompanionBubble(escapeHtml(data.text || "Could not execute spell."));
       }
     } catch(e) {
-      if (text.startsWith('/')) {
-        renderCompanionBubble(`⚠ Connection error — "${escapeHtml(text)}" was NOT applied. Balance unchanged, nothing logged. Try again.`);
-      } else {
-        simulateLocalLog(text);
-      }
+      // Network failure: the request may or may not have reached the server.
+      renderCompanionBubble(`⚠ Connection error — "${escapeHtml(text)}" may or may not have been saved. Check /history before retrying.`);
     }
   }
 
@@ -562,43 +581,19 @@ document.addEventListener('DOMContentLoaded', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'delete', tx_id: txId })
       });
-      const data = await res.json();
-      if (data.ok && data.balance !== undefined) updateBalanceDisplay(data.balance);
-      renderCompanionBubble(`🗑 Removed transaction #${txId}. Treasury updated.`);
-    } catch(e) {
-      renderCompanionBubble(`🗑 Reverted record #${txId}.`);
-    }
-  };
-
-  window.quickSetBalance = async function(method) {
-    const label = method.toUpperCase();
-    const raw = prompt(`Enter correct ${label} balance (₹):`);
-    if (raw === null) return;
-    const amt = parseFloat(raw.replace(/[^0-9.]/g, ''));
-    if (isNaN(amt) || amt < 0) {
-      alert('Enter a valid non-negative number.');
-      return;
-    }
-    playBeep(520);
-    try {
-      const res = await fetch('/api/message', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: `/balance ${amt} ${method}` })
-      });
-      const data = await res.json();
-      if (data.ok) {
-        if (data.balance !== undefined) updateBalanceDisplay(data.balance);
-        if (data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
-        renderCompanionBubble(data.html || data.text || `${label} balance set to ₹${amt.toFixed(2)}.`);
-      } else {
-        renderCompanionBubble(data.text || `Could not set ${label} balance.`);
+      let data = null;
+      try { data = await res.json(); } catch (_) { data = null; }
+      if (!data) {
+        renderCompanionBubble(`⚠ Server error (HTTP ${res.status}) — #${txId} was NOT confirmed removed. Check /history.`);
+        return;
       }
+      if (data.ok && data.balance !== undefined) updateBalanceDisplay(data.balance);
+      if (data.ok && data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
+      renderCompanionBubble(escapeHtml(data.text || (data.ok ? `Removed transaction #${txId}.` : `Could not remove #${txId}.`)));
     } catch(e) {
-      renderCompanionBubble(`⚠ Connection error — ${label} balance NOT changed. Try again.`);
+      renderCompanionBubble(`⚠ Connection error — #${txId} was NOT confirmed removed. Check /history.`);
     }
   };
-
   window.changeCategory = async function(txId) {
     const newCat = prompt("Enter new category (food, groceries, transport, bills, shopping, entertainment, health, rent, other):", "groceries");
     if (!newCat) return;
@@ -608,10 +603,15 @@ document.addEventListener('DOMContentLoaded', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'set_category', tx_id: txId, category: newCat })
       });
-      const data = await res.json();
-      renderCompanionBubble(`Updated category for #${txId} to <strong>${newCat}</strong>.`);
+      let data = null;
+      try { data = await res.json(); } catch (_) { data = null; }
+      if (!data) {
+        renderCompanionBubble(`⚠ Server error (HTTP ${res.status}) — category for #${txId} NOT confirmed changed.`);
+        return;
+      }
+      renderCompanionBubble(data.ok ? `Updated category for #${txId} to <strong>${escapeHtml(data.category || newCat)}</strong>.` : `⚠ ${escapeHtml(data.text || 'Category not changed.')}`);
     } catch(e) {
-      renderCompanionBubble(`Category updated to <strong>${newCat}</strong>.`);
+      renderCompanionBubble(`⚠ Connection error — category for #${txId} NOT confirmed changed.`);
     }
   };
 
@@ -624,69 +624,39 @@ document.addEventListener('DOMContentLoaded', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'set_payment', tx_id: txId, payment_method: newPay })
       });
-      const data = await res.json();
-      renderCompanionBubble(`Updated payment method for #${txId} to <strong>${newPay}</strong>.`);
+      let data = null;
+      try { data = await res.json(); } catch (_) { data = null; }
+      if (!data) {
+        renderCompanionBubble(`⚠ Server error (HTTP ${res.status}) — payment method for #${txId} NOT confirmed changed.`);
+        return;
+      }
+      renderCompanionBubble(data.ok ? `Updated payment method for #${txId} to <strong>${escapeHtml(data.payment_method || newPay)}</strong>.` : `⚠ ${escapeHtml(data.text || 'Payment method not changed.')}`);
     } catch(e) {
-      renderCompanionBubble(`Payment method updated to <strong>${newPay}</strong>.`);
+      renderCompanionBubble(`⚠ Connection error — payment method for #${txId} NOT confirmed changed.`);
     }
   };
-
-  async function fetchAndDisplayStats() {
+  async function _runReadOnlyCommand(cmd, label) {
     try {
       const res = await fetch('/api/message', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: '/stats' })
+        body: JSON.stringify({ text: cmd })
       });
-      const data = await res.json();
-      renderCompanionBubble(data.html || data.text);
+      let data = null;
+      try { data = await res.json(); } catch (_) { data = null; }
+      if (!data) {
+        renderCompanionBubble(`⚠ Server error (HTTP ${res.status}) while loading ${label}.`);
+        return;
+      }
+      renderCompanionBubble(data.ok ? (data.html || escapeHtml(data.text || '')) : escapeHtml(data.text || `Could not load ${label}.`));
     } catch(e) {
-      renderCompanionBubble(`
-        <div style="font-weight:700;font-size:13px;color:var(--ink);display:flex;justify-content:space-between;margin-bottom:4px;">
-          <span>⚔ Dungeon Expense Report</span>
-          <span style="font-family:'Press Start 2P',monospace;font-size:8px;color:#059669;">STATUS: ON TRACK</span>
-        </div>
-        <p style="font-size:13px;color:var(--ink);">Pace is currently 22% under the safe ceiling. Remaining safe pouch: <strong>₹558.00</strong>.</p>
-      `);
+      renderCompanionBubble(`⚠ Connection error — could not load ${label}.`);
     }
   }
 
-  async function fetchAndDisplayBalance() {
-    try {
-      const res = await fetch('/api/message', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: '/balance' })
-      });
-      const data = await res.json();
-      renderCompanionBubble(data.html || data.text);
-    } catch(e) {
-      renderCompanionBubble(`Treasury Total: ₹${currentBalance.toFixed(2)} GP.`);
-    }
-  }
-
-  async function fetchAndDisplayHistory() {
-    try {
-      const res = await fetch('/api/message', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: '/history' })
-      });
-      const data = await res.json();
-      renderCompanionBubble(data.html || data.text);
-    } catch(e) {
-      renderCompanionBubble(`Recent history fetched.`);
-    }
-  }
-
-  function simulateLocalLog(text) {
-    const matchNum = text.match(/\d+(\.\d+)?/);
-    const amt = matchNum ? parseFloat(matchNum[0]) : 20.00;
-    updateBalanceDisplay(currentBalance - amt);
-    updateTodayPaceDisplay(todaySpent + amt);
-    renderCompanionBubble(`Logged <strong style="font-weight:700;">₹${amt.toFixed(2)}</strong>! Vault updated successfully.`, Math.floor(Math.random()*100)+1, 'dining', 'upi');
-  }
-
+  async function fetchAndDisplayStats() { return _runReadOnlyCommand('/stats', 'stats'); }
+  async function fetchAndDisplayBalance() { return _runReadOnlyCommand('/balance', 'balances'); }
+  async function fetchAndDisplayHistory() { return _runReadOnlyCommand('/history', 'history'); }
   function escapeHtml(str) {
     return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   }

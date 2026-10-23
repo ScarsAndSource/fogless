@@ -13,6 +13,10 @@ import requests
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, send_file, Response, render_template_string
+import threading
+import traceback
+from html import escape as _esc
+from werkzeug.exceptions import HTTPException
 
 
 # --------------------------------------------------------------------- config
@@ -48,6 +52,9 @@ SB_PAGE_SIZE = 1000
 
 
 IST = timezone(timedelta(hours=5, minutes=30))  # local calendar-day boundary for /stats "today"
+
+# Wiping the live database through /reset must be explicitly enabled (ALLOW_RESET=1).
+ALLOW_RESET = os.getenv("ALLOW_RESET", "") == "1"
 
 
 def _fmt_dt(iso_str) -> str:
@@ -218,35 +225,105 @@ def send_telegram_message(chat_id, text: str) -> None:
 # ---------------------------------------------------------------- data layer
 
 
+class StorageError(Exception):
+    """Supabase is configured but a call to it failed. We NEVER fall back to memory in that case:
+    a silent fallback loses writes on serverless and shows an empty ledger on reads."""
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+def _use_sb() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_KEY)
+
+
 def _sb_url(path: str) -> str:
     return f"{SUPABASE_URL}/rest/v1/{path}" if SUPABASE_URL else ""
+
+
+def _sb(method, path, params=None, json_body=None, prefer=None, ok_statuses=()):
+    """One place for every Supabase call. Raises StorageError on network errors and on any
+    non-2xx/3xx status (except those listed in ok_statuses)."""
+    headers = dict(SB_HEADERS)
+    if prefer:
+        headers["Prefer"] = prefer
+    try:
+        r = requests.request(
+            method, _sb_url(path), headers=headers, params=params, json=json_body, timeout=SB_TIMEOUT
+        )
+    except requests.RequestException as e:
+        print(f"[supabase] {method} {path} network error: {e}")
+        raise StorageError(f"{method} {path}: {type(e).__name__}") from e
+    if r.status_code >= 300 and r.status_code not in ok_statuses:
+        print(f"[supabase] {method} {path} -> {r.status_code} {r.text[:300]}")
+        raise StorageError(f"{method} {path} failed (HTTP {r.status_code})", r.status_code)
+    return r
+
+
+def _rows(r):
+    try:
+        data = r.json(parse_float=Decimal)
+    except ValueError as e:
+        raise StorageError("Supabase returned a non-JSON response") from e
+    return data if isinstance(data, list) else []
+
+
+def _first_id(r, what):
+    rows = _rows(r)
+    if not rows or "id" not in rows[0]:
+        raise StorageError(f"Supabase insert into {what} returned no row")
+    return rows[0]["id"]
+
+
+# In-memory ids / stores that only exist for the no-Supabase (local testing) mode
+_mem_pool_id_counter = 1
+_mem_processed = set()
+_mem_msglog = {}
+
+# Per-request collector so the Telegram handler can remember which rows a message created
+_tl = threading.local()
+
+
+def _track(kind, row_id):
+    created = getattr(_tl, "created", None)
+    if created is not None and row_id is not None:
+        created[kind].append(row_id)
+
+
+class _Collect:
+    """with _Collect() as made: ...  ->  made = {"tx": [...], "pc": [...], "pe": [...]}"""
+
+    def __enter__(self):
+        self.made = {"tx": [], "pc": [], "pe": []}
+        _tl.created = self.made
+        return self.made
+
+    def __exit__(self, *exc):
+        _tl.created = None
+        return False
 
 
 def add_transaction(tx_type, amount, category, note, payment_method=None) -> int:
     global _mem_id_counter
     amount_dec = _to_decimal(amount)
-    
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            payload = {
+
+    if _use_sb():
+        r = _sb(
+            "POST", "transactions",
+            json_body={
                 "type": tx_type,
                 "amount": str(amount_dec),
                 "category": category,
                 "note": note,
                 "payment_method": payment_method,
-            }
-            r = requests.post(
-                _sb_url("transactions"),
-                headers={**SB_HEADERS, "Prefer": "return=representation"},
-                json=payload,
-                timeout=SB_TIMEOUT,
-            )
-            r.raise_for_status()
-            return r.json()[0]["id"]
-        except Exception as e:
-            print(f"Supabase write error, falling back to memory: {e}")
+            },
+            prefer="return=representation",
+        )
+        tx_id = _first_id(r, "transactions")
+        _track("tx", tx_id)
+        return tx_id
 
-    # Fallback in-memory store
     tx_id = _mem_id_counter
     _mem_id_counter += 1
     _mem_transactions.append({
@@ -258,39 +335,37 @@ def add_transaction(tx_type, amount, category, note, payment_method=None) -> int
         "payment_method": payment_method,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
+    _track("tx", tx_id)
     return tx_id
 
 
 def add_transfer(amount, from_bucket, to_bucket, note, person=None, pool=None, linked_tx_id=None) -> int:
     """A zero-sum move of money between two 'buckets'. Buckets can be real payment methods
-    (cash/upi/card/...) or virtual ones: iou:<person> for a debt, pool:<name> for your own stake
-    in a shared pool. Never counted as income or expense — get_stats() ignores type=='transfer'
-    automatically since it only ever checks for 'income'/'expense'."""
+    (cash/upi/card/...) or virtual ones: iou:<person> for a debt, pool:<n> for your own stake
+    in a shared pool. Never counted as income or expense. category is always 'transfer' so the
+    NOT NULL constraint on transactions.category can never reject the row."""
     global _mem_id_counter
     amount_dec = _to_decimal(amount)
 
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            payload = {
+    if _use_sb():
+        r = _sb(
+            "POST", "transactions",
+            json_body={
                 "type": "transfer",
                 "amount": str(amount_dec),
+                "category": "transfer",
                 "from_bucket": from_bucket,
                 "to_bucket": to_bucket,
                 "note": note,
                 "person": person,
                 "pool": pool,
                 "linked_tx_id": linked_tx_id,
-            }
-            r = requests.post(
-                _sb_url("transactions"),
-                headers={**SB_HEADERS, "Prefer": "return=representation"},
-                json=payload,
-                timeout=SB_TIMEOUT,
-            )
-            r.raise_for_status()
-            return r.json()[0]["id"]
-        except Exception as e:
-            print(f"Supabase write error (transfer), falling back to memory: {e}")
+            },
+            prefer="return=representation",
+        )
+        tx_id = _first_id(r, "transactions")
+        _track("tx", tx_id)
+        return tx_id
 
     tx_id = _mem_id_counter
     _mem_id_counter += 1
@@ -298,6 +373,7 @@ def add_transfer(amount, from_bucket, to_bucket, note, person=None, pool=None, l
         "id": tx_id,
         "type": "transfer",
         "amount": amount_dec,
+        "category": "transfer",
         "from_bucket": from_bucket,
         "to_bucket": to_bucket,
         "note": note,
@@ -306,43 +382,34 @@ def add_transfer(amount, from_bucket, to_bucket, note, person=None, pool=None, l
         "linked_tx_id": linked_tx_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
+    _track("tx", tx_id)
     return tx_id
 
 
 def _all_transactions(order="id.desc", limit=None, since=None):
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            if limit:
-                params = {"select": "*", "order": order, "limit": limit}
-                if since:
-                    params["created_at"] = f"gte.{since}"
-                r = requests.get(_sb_url("transactions"), headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
-                r.raise_for_status()
-                return r.json(parse_float=Decimal)
+    """Paginates through PostgREST's max-rows cap, so limit=100000 really returns up to 100000 rows.
+    SB_PAGE_SIZE must be <= your project's 'Max rows' setting (Supabase default is 1000)."""
+    if _use_sb():
+        out = []
+        offset = 0
+        while True:
+            page = SB_PAGE_SIZE if limit is None else min(SB_PAGE_SIZE, limit - len(out))
+            if page <= 0:
+                break
+            params = {"select": "*", "order": order, "limit": page, "offset": offset}
+            if since:
+                params["created_at"] = f"gte.{since}"
+            chunk = _rows(_sb("GET", "transactions", params=params))
+            out.extend(chunk)
+            if len(chunk) < page:
+                break
+            offset += page
+        return out
 
-            all_rows = []
-            offset = 0
-            while True:
-                params = {"select": "*", "order": order, "limit": SB_PAGE_SIZE, "offset": offset}
-                if since:
-                    params["created_at"] = f"gte.{since}"
-                r = requests.get(_sb_url("transactions"), headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
-                r.raise_for_status()
-                page = r.json(parse_float=Decimal)
-                all_rows.extend(page)
-                if len(page) < SB_PAGE_SIZE:
-                    break
-                offset += SB_PAGE_SIZE
-            return all_rows
-        except Exception as e:
-            print(f"Supabase read error, falling back to memory: {e}")
-
-    # Fallback memory query
     rows = list(_mem_transactions)
     if since:
         rows = [r for r in rows if r["created_at"] >= since]
-    reverse = ("desc" in order)
-    rows.sort(key=lambda x: x["id"], reverse=reverse)
+    rows.sort(key=lambda x: x["id"], reverse=("desc" in order))
     if limit:
         rows = rows[:limit]
     return rows
@@ -353,19 +420,9 @@ def get_history(limit=10):
 
 
 def get_transaction(tx_id):
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            r = requests.get(
-                _sb_url("transactions"),
-                headers=SB_HEADERS,
-                params={"select": "*", "id": f"eq.{tx_id}"},
-                timeout=SB_TIMEOUT,
-            )
-            r.raise_for_status()
-            rows = r.json(parse_float=Decimal)
-            return rows[0] if rows else None
-        except Exception:
-            pass
+    if _use_sb():
+        rows = _rows(_sb("GET", "transactions", params={"select": "*", "id": f"eq.{tx_id}"}))
+        return rows[0] if rows else None
     for r in _mem_transactions:
         if r["id"] == tx_id:
             return r
@@ -375,61 +432,110 @@ def get_transaction(tx_id):
 def update_transaction(tx_id, **fields) -> bool:
     if not fields:
         return False
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            r = requests.patch(
-                _sb_url(f"transactions?id=eq.{tx_id}"),
-                headers={**SB_HEADERS, "Prefer": "return=representation"},
-                json=fields,
-                timeout=SB_TIMEOUT,
-            )
-            r.raise_for_status()
-            return len(r.json()) > 0
-        except Exception:
-            pass
+    if _use_sb():
+        r = _sb(
+            "PATCH", "transactions",
+            params={"id": f"eq.{tx_id}"},
+            json_body=fields,
+            prefer="return=representation",
+        )
+        return len(_rows(r)) > 0
     tx = get_transaction(tx_id)
     if tx:
-        for k, v in fields.items():
-            tx[k] = v
+        tx.update(fields)
         return True
     return False
 
 
 def delete_transaction(tx_id) -> bool:
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            r = requests.delete(
-                _sb_url(f"transactions?id=eq.{tx_id}"),
-                headers={**SB_HEADERS, "Prefer": "return=representation"},
-                timeout=SB_TIMEOUT,
-            )
-            r.raise_for_status()
-            return len(r.json()) > 0
-        except Exception:
-            pass
+    """Deletes exactly one row. True only if a row was really deleted."""
+    if _use_sb():
+        r = _sb(
+            "DELETE", "transactions",
+            params={"id": f"eq.{tx_id}"},
+            prefer="return=representation",
+        )
+        return len(_rows(r)) > 0
     global _mem_transactions
-    initial_len = len(_mem_transactions)
+    before = len(_mem_transactions)
     _mem_transactions = [r for r in _mem_transactions if r["id"] != tx_id]
-    return len(_mem_transactions) < initial_len
+    return len(_mem_transactions) < before
 
 
-def _delete_transaction_group(anchor_row):
-    """Delete a transaction plus any others linked to the same logical action — e.g. a split's
-    personal-expense row and every per-person transfer row that came from it. Without this,
-    /undo right after a split would only remove one friend's share and leave the rest orphaned."""
+def _group_rows(anchor_row):
+    """The anchor plus every row that belongs to the same logical action (a split's personal
+    expense and all its per-person IOU transfers share one linked_tx_id)."""
     link_id = anchor_row.get("linked_tx_id") or anchor_row["id"]
-    all_rows = _all_transactions()
-    group = [r for r in all_rows if r["id"] == link_id or r.get("linked_tx_id") == link_id]
-    for r in group:
-        delete_transaction(r["id"])
+    if _use_sb():
+        head = _rows(_sb("GET", "transactions", params={"select": "*", "id": f"eq.{link_id}"}))
+        kids = _rows(_sb("GET", "transactions",
+                         params={"select": "*", "linked_tx_id": f"eq.{link_id}", "order": "id.asc"}))
+        found = head + kids
+    else:
+        found = [r for r in _mem_transactions if r["id"] == link_id or r.get("linked_tx_id") == link_id]
+    seen, group = set(), []
+    for r in found:
+        if r["id"] not in seen:
+            seen.add(r["id"])
+            group.append(r)
+    if anchor_row["id"] not in seen:
+        group.append(anchor_row)
     return group
+
+
+def delete_pool_contributions_linked(tx_ids) -> None:
+    """Pool contributions made by 'put N into X pool' carry the id of their transfer row."""
+    ids = [int(i) for i in tx_ids]
+    if not ids:
+        return
+    if _use_sb():
+        _sb("DELETE", "pool_contributions",
+            params={"linked_tx_id": "in.(" + ",".join(str(i) for i in ids) + ")"})
+        return
+    global _mem_pool_contributions
+    _mem_pool_contributions = [c for c in _mem_pool_contributions if c.get("linked_tx_id") not in ids]
+
+
+def delete_transaction_group(anchor_row):
+    """Delete a transaction and everything linked to it. Returns the rows actually deleted."""
+    group = _group_rows(anchor_row)
+    deleted = [r for r in group if delete_transaction(r["id"])]
+    delete_pool_contributions_linked([r["id"] for r in group])
+    return deleted
+
+
+def delete_transaction_group_by_id(tx_id):
+    tx = get_transaction(tx_id)
+    if not tx:
+        return []
+    return delete_transaction_group(tx)
 
 
 def delete_last_transaction():
     rows = _all_transactions(limit=1)
     if not rows:
         return None
-    return _delete_transaction_group(rows[0])
+    return delete_transaction_group(rows[0])
+
+
+def delete_pool_contribution(row_id) -> bool:
+    if _use_sb():
+        r = _sb("DELETE", "pool_contributions", params={"id": f"eq.{row_id}"}, prefer="return=representation")
+        return len(_rows(r)) > 0
+    global _mem_pool_contributions
+    before = len(_mem_pool_contributions)
+    _mem_pool_contributions = [c for c in _mem_pool_contributions if c.get("id") != row_id]
+    return len(_mem_pool_contributions) < before
+
+
+def delete_pool_expense(row_id) -> bool:
+    if _use_sb():
+        r = _sb("DELETE", "pool_expenses", params={"id": f"eq.{row_id}"}, prefer="return=representation")
+        return len(_rows(r)) > 0
+    global _mem_pool_expenses
+    before = len(_mem_pool_expenses)
+    _mem_pool_expenses = [e for e in _mem_pool_expenses if e.get("id") != row_id]
+    return len(_mem_pool_expenses) < before
 
 
 BALANCE_BUCKETS = PAYMENT_METHODS
@@ -440,27 +546,20 @@ def _settings_key(method: str) -> str:
 
 
 def get_starting_balances() -> dict:
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            r = requests.get(
-                _sb_url("settings"),
-                headers=SB_HEADERS,
-                params={"select": "key,value", "key": "like.starting_balance:*"},
-                timeout=SB_TIMEOUT,
-            )
-            r.raise_for_status()
-            result = {b: Decimal("0.00") for b in BALANCE_BUCKETS}
-            for row in r.json():
-                method = row["key"].split(":", 1)[1]
-                if method in result:
-                    try:
-                        result[method] = Decimal(row["value"])
-                    except InvalidOperation:
-                        result[method] = Decimal("0.00")
-            return result
-        except Exception:
-            pass
-    return dict(_mem_starting_balances)
+    result = {b: Decimal("0.00") for b in BALANCE_BUCKETS}
+    if _use_sb():
+        rows = _rows(_sb("GET", "settings",
+                         params={"select": "key,value", "key": "like.starting_balance:*"}))
+        for row in rows:
+            method = row["key"].split(":", 1)[1]
+            if method in result:
+                try:
+                    result[method] = Decimal(str(row["value"]))
+                except InvalidOperation:
+                    result[method] = Decimal("0.00")
+        return result
+    result.update(_mem_starting_balances)
+    return result
 
 
 def set_starting_balance(method: str, amount) -> None:
@@ -487,19 +586,13 @@ def set_starting_balance(method: str, amount) -> None:
                     net_tx -= amt
 
     start_bal = target_dec - net_tx
+    if _use_sb():
+        _sb("POST", "settings",
+            params={"on_conflict": "key"},
+            json_body={"key": _settings_key(method), "value": str(start_bal)},
+            prefer="resolution=merge-duplicates,return=minimal")
+        return
     _mem_starting_balances[method] = start_bal
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            r = requests.post(
-                _sb_url("settings"),
-                headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
-                json={"key": _settings_key(method), "value": str(start_bal)},
-                timeout=SB_TIMEOUT,
-            )
-            r.raise_for_status()
-            return
-        except Exception as e:
-            print(f"Supabase write error setting balance: {e}")
 
 
 def get_balances_by_method() -> dict:
@@ -615,111 +708,162 @@ def all_data_dump():
 # --------------------------------------------------------- aliases
 
 
+_ALIAS_TYPES = ("expense", "income")
+
+
 def get_all_aliases() -> dict:
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            r = requests.get(
-                _sb_url("aliases"),
-                headers=SB_HEADERS,
-                params={"select": "*", "confirmed": "eq.true"},
-                timeout=SB_TIMEOUT,
-            )
-            r.raise_for_status()
-            return {
-                row["note_key"]: {
-                    "type": row["type"], "category": row["category"], "payment_method": row.get("payment_method")
-                }
-                for row in r.json()
+    """Confirmed aliases only (the fast path that lets us skip the LLM)."""
+    if _use_sb():
+        rows = _rows(_sb("GET", "aliases", params={"select": "*", "confirmed": "eq.true"}))
+        return {
+            row["note_key"]: {
+                "type": row["type"],
+                "category": row["category"],
+                "payment_method": row.get("payment_method"),
+                "confirmed": True,
             }
-        except Exception:
-            pass
+            for row in rows
+        }
     return {k: v for k, v in _mem_aliases.items() if v.get("confirmed")}
 
 
-def learn_alias_manual(note_key, tx_type, category, payment_method=None):
-    if not note_key:
+def _get_alias_row(note_key):
+    if _use_sb():
+        rows = _rows(_sb("GET", "aliases", params={"select": "*", "note_key": f"eq.{note_key}"}))
+        return rows[0] if rows else None
+    return _mem_aliases.get(note_key)
+
+
+def _put_alias(note_key, tx_type, category, payment_method, confirmed, count):
+    if _use_sb():
+        _sb("POST", "aliases",
+            params={"on_conflict": "note_key"},
+            json_body={
+                "note_key": note_key, "type": tx_type, "category": category,
+                "payment_method": payment_method, "confirmed": confirmed, "candidate_count": count,
+            },
+            prefer="resolution=merge-duplicates,return=minimal")
         return
-    _mem_aliases[note_key] = {"type": tx_type, "category": category, "payment_method": payment_method, "confirmed": True}
+    _mem_aliases[note_key] = {
+        "type": tx_type, "category": category, "payment_method": payment_method,
+        "confirmed": confirmed, "candidate_count": count,
+    }
+
+
+def _alias_ok(note_key, tx_type) -> bool:
+    return bool(note_key) and len(note_key) <= 80 and tx_type in _ALIAS_TYPES
+
+
+def learn_alias_manual(note_key, tx_type, category, payment_method=None):
+    """Explicit human correction: trusted immediately."""
+    if not _alias_ok(note_key, tx_type) or not category:
+        return
+    _put_alias(note_key, tx_type, category, payment_method, True, 1)
 
 
 def learn_alias_auto(note_key, tx_type, category, payment_method=None):
-    if not note_key:
+    """Auto-learned from an LLM guess: needs a SECOND parse that agrees on type + category
+    before it is trusted (confirmed) and allowed to skip the LLM."""
+    if not _alias_ok(note_key, tx_type) or not category:
         return
-    if note_key not in _mem_aliases:
-        _mem_aliases[note_key] = {"type": tx_type, "category": category, "payment_method": payment_method, "confirmed": False}
+    existing = _get_alias_row(note_key)
+    if existing is None:
+        _put_alias(note_key, tx_type, category, payment_method, False, 1)
+        return
+    if existing.get("confirmed"):
+        return
+    if existing.get("type") == tx_type and existing.get("category") == category:
+        count = int(existing.get("candidate_count") or 1) + 1
+        _put_alias(note_key, tx_type, category,
+                   payment_method or existing.get("payment_method"), True, count)
     else:
-        _mem_aliases[note_key]["confirmed"] = True
+        _put_alias(note_key, tx_type, category, payment_method, False, 1)
+
+
+def _soft_aliases() -> dict:
+    """Alias lookup is only an optimisation. If it fails we just call the LLM instead."""
+    try:
+        return get_all_aliases()
+    except StorageError as e:
+        print(f"[aliases] read failed, continuing without aliases: {e}")
+        return {}
+
+
+def _soft_learn_auto(note_key, tx_type, category, payment_method):
+    """The transaction is already saved by the time this runs, so never fail the request over it."""
+    try:
+        learn_alias_auto(note_key, tx_type, category, payment_method)
+    except StorageError as e:
+        print(f"[aliases] auto-learn failed (non-fatal): {e}")
+
+
+def _soft_learn_manual(note_key, tx_type, category, payment_method):
+    try:
+        learn_alias_manual(note_key, tx_type, category, payment_method)
+    except StorageError as e:
+        print(f"[aliases] manual-learn failed (non-fatal): {e}")
 
 
 # --------------------------------------------------------- pools
 
 
-def add_pool_contribution(pool_name, person, amount, note=None):
+def add_pool_contribution(pool_name, person, amount, note=None, linked_tx_id=None) -> int:
+    global _mem_pool_id_counter
     amount_dec = _to_decimal(amount)
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            r = requests.post(
-                _sb_url("pool_contributions"),
-                headers={**SB_HEADERS, "Prefer": "return=representation"},
-                json={"pool": pool_name, "person": person, "amount": str(amount_dec), "note": note},
-                timeout=SB_TIMEOUT,
-            )
-            r.raise_for_status()
-            return
-        except Exception as e:
-            print(f"Supabase write error (pool_contribution), falling back to memory: {e}")
+    if _use_sb():
+        r = _sb("POST", "pool_contributions",
+                json_body={"pool": pool_name, "person": person, "amount": str(amount_dec),
+                           "note": note, "linked_tx_id": linked_tx_id},
+                prefer="return=representation")
+        row_id = _first_id(r, "pool_contributions")
+        _track("pc", row_id)
+        return row_id
+    row_id = _mem_pool_id_counter
+    _mem_pool_id_counter += 1
     _mem_pool_contributions.append({
-        "pool": pool_name, "person": person, "amount": amount_dec, "note": note,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "id": row_id, "pool": pool_name, "person": person, "amount": amount_dec, "note": note,
+        "linked_tx_id": linked_tx_id, "created_at": datetime.now(timezone.utc).isoformat(),
     })
+    _track("pc", row_id)
+    return row_id
 
 
-def add_pool_expense(pool_name, amount, category, note=None):
+def add_pool_expense(pool_name, amount, category, note=None) -> int:
+    global _mem_pool_id_counter
     amount_dec = _to_decimal(amount)
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            r = requests.post(
-                _sb_url("pool_expenses"),
-                headers={**SB_HEADERS, "Prefer": "return=representation"},
-                json={"pool": pool_name, "amount": str(amount_dec), "category": category, "note": note},
-                timeout=SB_TIMEOUT,
-            )
-            r.raise_for_status()
-            return
-        except Exception as e:
-            print(f"Supabase write error (pool_expense), falling back to memory: {e}")
+    if _use_sb():
+        r = _sb("POST", "pool_expenses",
+                json_body={"pool": pool_name, "amount": str(amount_dec), "category": category, "note": note},
+                prefer="return=representation")
+        row_id = _first_id(r, "pool_expenses")
+        _track("pe", row_id)
+        return row_id
+    row_id = _mem_pool_id_counter
+    _mem_pool_id_counter += 1
     _mem_pool_expenses.append({
-        "pool": pool_name, "amount": amount_dec, "category": category, "note": note,
+        "id": row_id, "pool": pool_name, "amount": amount_dec, "category": category, "note": note,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
+    _track("pe", row_id)
+    return row_id
 
 
 def get_pool_contributions(pool_name=None):
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            params = {"select": "*"}
-            if pool_name:
-                params["pool"] = f"eq.{pool_name}"
-            r = requests.get(_sb_url("pool_contributions"), headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
-            r.raise_for_status()
-            return r.json(parse_float=Decimal)
-        except Exception as e:
-            print(f"Supabase read error (pool_contributions), falling back to memory: {e}")
+    if _use_sb():
+        params = {"select": "*"}
+        if pool_name:
+            params["pool"] = f"eq.{pool_name}"
+        return _rows(_sb("GET", "pool_contributions", params=params))
     rows = _mem_pool_contributions
     return [r for r in rows if r["pool"] == pool_name] if pool_name else list(rows)
 
 
 def get_pool_expenses(pool_name=None):
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            params = {"select": "*"}
-            if pool_name:
-                params["pool"] = f"eq.{pool_name}"
-            r = requests.get(_sb_url("pool_expenses"), headers=SB_HEADERS, params=params, timeout=SB_TIMEOUT)
-            r.raise_for_status()
-            return r.json(parse_float=Decimal)
-        except Exception as e:
-            print(f"Supabase read error (pool_expenses), falling back to memory: {e}")
+    if _use_sb():
+        params = {"select": "*"}
+        if pool_name:
+            params["pool"] = f"eq.{pool_name}"
+        return _rows(_sb("GET", "pool_expenses", params=params))
     rows = _mem_pool_expenses
     return [r for r in rows if r["pool"] == pool_name] if pool_name else list(rows)
 
@@ -750,6 +894,89 @@ def get_pool_summary(pool_name):
 def list_known_pools():
     names = set(c["pool"] for c in get_pool_contributions()) | set(e["pool"] for e in get_pool_expenses())
     return sorted(names)
+
+
+# --------------------------------------------------------- telegram idempotency + edit tracking
+
+
+def claim_update(update_id) -> bool:
+    """Atomically mark a Telegram update_id as handled. Returns False if it was already handled
+    (Telegram re-delivers on timeouts / non-200s), so the caller must skip it."""
+    if update_id is None:
+        return True
+    if _use_sb():
+        r = _sb("POST", "processed_updates",
+                json_body={"update_id": int(update_id)},
+                prefer="return=minimal", ok_statuses=(409,))
+        return r.status_code != 409
+    if update_id in _mem_processed:
+        return False
+    _mem_processed.add(update_id)
+    return True
+
+
+def get_message_log(chat_id, message_id):
+    """What rows did this Telegram message create? None if we never recorded it."""
+    if _use_sb():
+        rows = _rows(_sb("GET", "message_log",
+                         params={"select": "*", "chat_id": f"eq.{chat_id}", "message_id": f"eq.{message_id}"}))
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "tx": list(row.get("tx_ids") or []),
+            "pc": list(row.get("pool_contribution_ids") or []),
+            "pe": list(row.get("pool_expense_ids") or []),
+        }
+    return _mem_msglog.get((chat_id, message_id))
+
+
+def save_message_log(chat_id, message_id, made) -> None:
+    if _use_sb():
+        _sb("POST", "message_log",
+            params={"on_conflict": "chat_id,message_id"},
+            json_body={
+                "chat_id": chat_id, "message_id": message_id,
+                "tx_ids": made["tx"], "pool_contribution_ids": made["pc"], "pool_expense_ids": made["pe"],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            prefer="resolution=merge-duplicates,return=minimal")
+        return
+    _mem_msglog[(chat_id, message_id)] = {"tx": list(made["tx"]), "pc": list(made["pc"]), "pe": list(made["pe"])}
+
+
+def rollback_logged(made) -> None:
+    """Delete every row a previous message created (used when that message is edited)."""
+    for tx_id in made.get("tx", []):
+        delete_transaction_group_by_id(tx_id)
+    for row_id in made.get("pc", []):
+        delete_pool_contribution(row_id)
+    for row_id in made.get("pe", []):
+        delete_pool_expense(row_id)
+
+
+def reset_all_data() -> None:
+    """Really wipes the ledger (Supabase tables too when configured). processed_updates is kept so
+    old Telegram deliveries can never be replayed after a reset."""
+    global _mem_id_counter, _mem_pool_id_counter
+    if _use_sb():
+        _sb("DELETE", "transactions", params={"id": "gt.0"})
+        _sb("DELETE", "pool_contributions", params={"id": "gt.0"})
+        _sb("DELETE", "pool_expenses", params={"id": "gt.0"})
+        _sb("DELETE", "aliases", params={"note_key": "neq.__none__"})
+        _sb("DELETE", "settings", params={"key": "like.starting_balance:*"})
+        _sb("DELETE", "message_log", params={"chat_id": "neq.0"})
+        _sb("DELETE", "chat_log", params={"id": "gt.0"})
+        return
+    _mem_transactions.clear()
+    _mem_pool_contributions.clear()
+    _mem_pool_expenses.clear()
+    _mem_aliases.clear()
+    _mem_msglog.clear()
+    for b in PAYMENT_METHODS:
+        _mem_starting_balances[b] = Decimal("0.00")
+    _mem_id_counter = 1
+    _mem_pool_id_counter = 1
 
 
 # ------------------------------------------------------------------ nlp layer
@@ -859,8 +1086,8 @@ def _apply_debt_transaction(item):
         return {"kind": "repayment", "direction": direction, "amount": amount, "who": person, "method": method}
 
     elif share_type == "contribution":
-        add_transfer(amount, method, f"pool:{pool}", note, pool=pool)
-        add_pool_contribution(pool, "me", amount, note)
+        tx_id = add_transfer(amount, method, f"pool:{pool}", note, pool=pool)
+        add_pool_contribution(pool, "me", amount, note, linked_tx_id=tx_id)
         return {"kind": "contribution", "amount": amount, "who": pool, "method": method}
 
     elif share_type == "pool_contribution_other":
@@ -909,14 +1136,49 @@ def _call_groq_chat(text):
     return _fallback_rule_parse(text)
 
 
+_INCOME_RE = re.compile(
+    r"\b(?:income|salary|got paid|got|received|earned|payout|refund|credited|deposited)\b", re.IGNORECASE
+)
+
+_CATEGORY_WORDS = (
+    ("food", ["lunch", "dinner", "breakfast", "food", "cafe", "restaurant", "burger", "pizza", "juice",
+              "biscuit", "tea", "coffee", "snack"]),
+    ("groceries", ["milk", "groceries", "grocery", "veggies", "vegetables", "fruit", "market"]),
+    ("transport", ["uber", "cab", "bus", "train", "metro", "flight", "transit", "petrol", "fuel"]),
+    ("rent", ["rent"]),
+    ("bills", ["electricity", "wifi", "bill", "water"]),
+)
+
+
+def _has_word(text: str, words) -> bool:
+    """Whole-word match (optional plural 's'), so 'tea' does not match 'steak'/'team',
+    'bus' does not match 'business', 'got' does not match 'forgot'/'gotta'."""
+    pattern = r"\b(?:" + "|".join(re.escape(w) for w in words) + r")s?\b"
+    return re.search(pattern, text or "") is not None
+
+
+def _guess_category(note_str: str, tx_type="expense") -> str:
+    s = (note_str or "").lower()
+    if tx_type == "income":
+        if _has_word(s, ["freelance"]):
+            return "freelance"
+        if _has_word(s, ["refund"]):
+            return "refund"
+        if _has_word(s, ["gift"]):
+            return "gift"
+        return "salary"
+    for category, words in _CATEGORY_WORDS:
+        if _has_word(s, words):
+            return category
+    return "other"
+
+
 def _parse_single_fallback_item(text):
     tokens = text.lower().replace("₹", " ").replace("$", " ").split()
     if not tokens:
         return None
 
-    tx_type = "expense"
-    if any(w in text.lower() for w in ["income", "salary", "got paid", "got", "received", "earned", "payout", "refund", "credited", "deposited"]):
-        tx_type = "income"
+    tx_type = "income" if _INCOME_RE.search(text) else "expense"
 
     amount = None
     payment_method = None
@@ -947,37 +1209,115 @@ def _parse_single_fallback_item(text):
         return None
 
     if not category:
-        note_str = " ".join(note_words)
-        if any(w in note_str for w in ["lunch", "dinner", "food", "cafe", "restaurant", "burger", "pizza", "juice", "biscuit", "tea"]):
-            category = "food"
-        elif any(w in note_str for w in ["milk", "groceries", "veggies", "fruit", "market"]):
-            category = "groceries"
-        elif any(w in note_str for w in ["uber", "cab", "bus", "train", "flight", "transit", "petrol", "fuel"]):
-            category = "transport"
-        elif any(w in note_str for w in ["rent", "electricity", "wifi", "bill", "water"]):
-            category = "bills" if "rent" not in note_str else "rent"
-        elif tx_type == "income":
-            category = "freelance" if "freelance" in note_str else "salary"
-        else:
-            category = "other"
+        category = _guess_category(" ".join(note_words), tx_type)
 
     note = " ".join(note_words).strip() or None
-    return {"type": tx_type, "amount": _to_decimal(amount), "category": category, "payment_method": payment_method, "note": note}
+    return {"type": tx_type, "amount": _to_decimal(amount), "category": category,
+            "payment_method": payment_method, "note": note}
 
 
-def _guess_category(note_str: str, tx_type="expense") -> str:
-    note_str = note_str or ""
-    if any(w in note_str for w in ["lunch", "dinner", "food", "cafe", "restaurant", "burger", "pizza", "juice", "biscuit", "tea"]):
-        return "food"
-    if any(w in note_str for w in ["milk", "groceries", "veggies", "fruit", "market"]):
-        return "groceries"
-    if any(w in note_str for w in ["uber", "cab", "bus", "train", "flight", "transit", "petrol", "fuel"]):
-        return "transport"
-    if any(w in note_str for w in ["rent", "electricity", "wifi", "bill", "water"]):
-        return "bills" if "rent" not in note_str else "rent"
-    if tx_type == "income":
-        return "freelance" if "freelance" in note_str else "salary"
-    return "other"
+def _debt_reply(parsed, r):
+    """(reply_text, html) for one applied debt/shared item. All user-derived text is escaped."""
+    kind = r.get("kind") if r else None
+    cap = lambda s: _esc(str(s).capitalize())
+
+    if kind == "split":
+        people_str = ", ".join(cap(p) for p, _ in r["people"])
+        plain_people = ", ".join(str(p).capitalize() for p, _ in r["people"])
+        reply_text = f"Split ₹{fmt(parsed['amount'])} ({parsed['category']}) with {plain_people}. Your share: ₹{fmt(r['my_share'])}."
+        breakdown_lines = "".join(
+            f"<div class='flex justify-between py-0.5 border-b border-[#E5DFC9]'><span>{cap(p)} owes you</span>"
+            f"<span class='font-numeral text-[10px] font-bold text-[#059669]'>+₹{fmt(a)}</span></div>"
+            for p, a in r["people"]
+        )
+        html_res = f"""
+            <div class="space-y-1.5">
+              <div class="flex items-center gap-1.5 mb-1 flex-wrap">
+                <span class="bg-[#8B5CF6] text-white px-1.5 py-0.5 font-bold border border-[#6D28D9]" style="font-size:10px;">SPLIT BILL</span>
+                <span class="bg-[#10B981] text-white px-1.5 py-0.5 font-bold border border-[#065F46]" style="font-size:10px;">+20 EXP</span>
+              </div>
+              <p class="text-[12px]">Split <strong>₹{fmt(parsed['amount'])}</strong> for <strong>{cap(parsed['category'])}</strong> with <strong>{people_str}</strong>.</p>
+              <div class="pixel-window-jrpg p-2 text-[11px] space-y-0.5">
+                <div class="flex justify-between py-0.5 border-b border-[#E5DFC9]"><span>Your share (Expense)</span><span class="font-numeral font-bold text-[#E15554]">-₹{fmt(r['my_share'])}</span></div>
+                {breakdown_lines}
+              </div>
+            </div>
+            """
+    elif kind == "lend":
+        reply_text = f"Lent ₹{fmt(r['amount'])} to {str(r['who']).capitalize()}."
+        html_res = f"""
+            <div class="space-y-1.5">
+              <div class="flex items-center gap-1.5 mb-1">
+                <span class="bg-[#3B82F6] text-white px-1.5 py-0.5 font-bold border border-[#1D4ED8]" style="font-size:10px;">IOU CREATED</span>
+              </div>
+              <p class="text-[12px]">Lent <strong>₹{fmt(r['amount'])}</strong> to <strong>{cap(r['who'])}</strong> via {_esc(r['method'].upper())}.</p>
+            </div>
+            """
+    elif kind == "borrow":
+        reply_text = f"Borrowed ₹{fmt(r['amount'])} from {str(r['who']).capitalize()}."
+        html_res = f"""
+            <div class="space-y-1.5">
+              <div class="flex items-center gap-1.5 mb-1">
+                <span class="bg-[#E15554] text-white px-1.5 py-0.5 font-bold border border-[#991B1B]" style="font-size:10px;">DEBT INCURRED</span>
+              </div>
+              <p class="text-[12px]">Borrowed <strong>₹{fmt(r['amount'])}</strong> from <strong>{cap(r['who'])}</strong> into {_esc(r['method'].upper())}.</p>
+            </div>
+            """
+    elif kind == "repayment":
+        if r.get("direction") == "they_paid_me":
+            reply_text = f"{str(r['who']).capitalize()} paid back ₹{fmt(r['amount'])}."
+            html_res = f"""
+                <div class="space-y-1.5">
+                  <div class="flex items-center gap-1.5 mb-1">
+                    <span class="bg-[#10B981] text-white px-1.5 py-0.5 font-bold border border-[#065F46]" style="font-size:10px;">DEBT SETTLED</span>
+                  </div>
+                  <p class="text-[12px]"><strong>{cap(r['who'])}</strong> paid back <strong>₹{fmt(r['amount'])}</strong> via {_esc(r['method'].upper())}.</p>
+                </div>
+                """
+        else:
+            reply_text = f"Paid back ₹{fmt(r['amount'])} to {str(r['who']).capitalize()}."
+            html_res = f"""
+                <div class="space-y-1.5">
+                  <div class="flex items-center gap-1.5 mb-1">
+                    <span class="bg-[#10B981] text-white px-1.5 py-0.5 font-bold border border-[#065F46]" style="font-size:10px;">DEBT CLEARED</span>
+                  </div>
+                  <p class="text-[12px]">Paid back <strong>₹{fmt(r['amount'])}</strong> to <strong>{cap(r['who'])}</strong> via {_esc(r['method'].upper())}.</p>
+                </div>
+                """
+    elif kind == "contribution":
+        reply_text = f"Put ₹{fmt(r['amount'])} into {str(r['who']).upper()} pool."
+        html_res = f"""
+            <div class="space-y-1.5">
+              <div class="flex items-center gap-1.5 mb-1">
+                <span class="bg-[#F59E0B] text-white px-1.5 py-0.5 font-bold border border-[#B45309]" style="font-size:10px;">POOL DEPOSIT</span>
+              </div>
+              <p class="text-[12px]">Deposited <strong>₹{fmt(r['amount'])}</strong> into <strong>{_esc(str(r['who']).upper())}</strong> pool via {_esc(r['method'].upper())}.</p>
+            </div>
+            """
+    elif kind == "pool_contribution_other":
+        reply_text = f"{str(r['person']).capitalize()} put ₹{fmt(r['amount'])} into {str(r['who']).upper()} pool."
+        html_res = f"""
+            <div class="space-y-1.5">
+              <div class="flex items-center gap-1.5 mb-1">
+                <span class="bg-[#F59E0B] text-white px-1.5 py-0.5 font-bold border border-[#B45309]" style="font-size:10px;">POOL DEPOSIT</span>
+              </div>
+              <p class="text-[12px]"><strong>{cap(r['person'])}</strong> deposited <strong>₹{fmt(r['amount'])}</strong> into <strong>{_esc(str(r['who']).upper())}</strong> pool.</p>
+            </div>
+            """
+    elif kind == "pool_expense":
+        reply_text = f"Spent ₹{fmt(r['amount'])} from {str(r['who']).upper()} pool."
+        html_res = f"""
+            <div class="space-y-1.5">
+              <div class="flex items-center gap-1.5 mb-1">
+                <span class="bg-[#E15554] text-white px-1.5 py-0.5 font-bold border border-[#991B1B]" style="font-size:10px;">POOL EXPENSE</span>
+              </div>
+              <p class="text-[12px]">Spent <strong>₹{fmt(r['amount'])}</strong> ({cap(r['category'])}) from <strong>{_esc(str(r['who']).upper())}</strong> pool.</p>
+            </div>
+            """
+    else:
+        reply_text = "Debt item processed."
+        html_res = "<p>Debt transaction recorded.</p>"
+    return reply_text, html_res
 
 
 def _fallback_debt_parse(text):
@@ -1161,23 +1501,38 @@ def parse_multi(text, aliases):
     return _call_groq_chat(text)
 
 
+_AUDIO_MIME = {
+    "ogg": "audio/ogg", "oga": "audio/ogg", "webm": "audio/webm", "m4a": "audio/mp4", "mp4": "audio/mp4",
+    "mp3": "audio/mpeg", "mpeg": "audio/mpeg", "mpga": "audio/mpeg", "wav": "audio/wav", "flac": "audio/flac",
+}
+
+
 def transcribe_voice(audio_bytes, filename="voice.ogg"):
+    """Returns (text, error). Exactly one of them is None. Never invents a transcript."""
     if not GROQ_API_KEY:
-        return None
+        return None, "Voice input is not configured (GROQ_API_KEY missing)."
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext not in _AUDIO_MIME:
+        ext = "ogg"
+    filename = f"voice.{ext}"
     try:
         r = requests.post(
             GROQ_AUDIO_API,
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            files={"file": (filename, audio_bytes, "audio/ogg")},
+            files={"file": (filename, audio_bytes, _AUDIO_MIME[ext])},
             data={"model": GROQ_WHISPER_MODEL, "response_format": "text"},
             timeout=30,
         )
-        r.raise_for_status()
-        text = r.text.strip()
-        return text or None
-    except Exception as e:
-        print(f"Whisper STT error: {e}")
-        return None
+    except requests.RequestException as e:
+        print(f"Whisper STT network error: {e}")
+        return None, "Could not reach the transcription service. Nothing was logged."
+    if r.status_code >= 300:
+        print(f"Whisper STT error: {r.status_code} {r.text[:300]}")
+        return None, f"Transcription failed (HTTP {r.status_code}). Nothing was logged."
+    text = r.text.strip()
+    if not text:
+        return None, "I couldn't hear anything in that recording. Nothing was logged."
+    return text, None
 
 
 # --------------------------------------------------------------------- chat log helpers
@@ -1402,6 +1757,31 @@ FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 # ---------------------------------------------------------------------- Web Routes
 
 
+def _unwrap(res):
+    """_process_text returns either a dict or a (dict, http_status) tuple (usage errors)."""
+    if isinstance(res, tuple):
+        return res[0], res[1]
+    return res, 200
+
+
+@app.errorhandler(StorageError)
+def _handle_storage_error(e):
+    """Supabase is configured but failed: say so loudly instead of pretending everything is fine."""
+    print(f"[storage] {e}")
+    return jsonify({
+        "ok": False,
+        "text": f"Database error ({e}). Check /history before retrying — the last action may not have been saved.",
+    }), 503
+
+
+@app.errorhandler(Exception)
+def _handle_unexpected(e):
+    if isinstance(e, HTTPException):
+        return e
+    traceback.print_exc()
+    return jsonify({"ok": False, "text": "Internal error. Check /history before retrying."}), 500
+
+
 @app.route("/", methods=["GET"])
 def index():
     index_path = os.path.join(FRONTEND_DIR, "index.html")
@@ -1443,7 +1823,7 @@ def api_state():
                 "id": r["id"],
                 "type": r["type"],
                 "amount": float(r["amount"]),
-                "category": r["category"],
+                "category": r.get("category") or ("transfer" if r.get("type") == "transfer" else "other"),
                 "note": r.get("note"),
                 "payment_method": r.get("payment_method"),
                 "created_at": r.get("created_at"),
@@ -1454,9 +1834,10 @@ def api_state():
     })
 
 
-def _process_text(text: str):
-    """Processes natural language input or slash commands and returns a response dictionary."""
-    if text.startswith("/"):
+def _process_text(text: str, allow_commands: bool = True):
+    """Processes natural language input or slash commands and returns a response dictionary
+    (or a (dict, http_status) tuple for usage errors). allow_commands=False is used for voice."""
+    if allow_commands and text.startswith("/"):
         parts = text.split()
         cmd = parts[0].lower()
         args = parts[1:]
@@ -1574,8 +1955,12 @@ def _process_text(text: str):
             if not args or not args[0].isdigit():
                 return ({"ok": False, "text": "Usage: /delete <id>"}, 400)
             tx_id = int(args[0])
-            ok = delete_transaction(tx_id)
-            reply_text = f"Deleted #{tx_id}." if ok else f"No transaction #{tx_id} found."
+            group = delete_transaction_group_by_id(tx_id)
+            if group:
+                extra = f" and {len(group) - 1} linked entr{'y' if len(group) == 2 else 'ies'}" if len(group) > 1 else ""
+                reply_text = f"Deleted #{tx_id}{extra}."
+            else:
+                reply_text = f"No transaction #{tx_id} found."
             log_chat_message("assistant", reply_text)
             return {
                 "ok": True,
@@ -1596,10 +1981,18 @@ def _process_text(text: str):
             return {"ok": True, "text": reply_text}
 
         elif cmd == "/reset":
-            global _mem_transactions
-            _mem_transactions.clear()
-            log_chat_message("assistant", "All local data reset.")
-            return {"ok": True, "text": "All local data reset!", "balance": 0.0, "today_spent": 0.0}
+            if not args or args[0].lower() != "confirm":
+                reply_text = ("⚠ /reset permanently deletes ALL transactions, pools, aliases, starting balances "
+                              "and chat history. If you really mean it, send: /reset confirm")
+                return {"ok": True, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
+            if _use_sb() and not ALLOW_RESET:
+                reply_text = ("Reset is disabled on the live database. Set ALLOW_RESET=1 in the environment, "
+                              "redeploy, send /reset confirm, then remove it again.")
+                return {"ok": True, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
+            reset_all_data()
+            reply_text = "All data reset (database and chat history wiped)." if _use_sb() else "All local data reset."
+            log_chat_message("assistant", reply_text)
+            return {"ok": True, "text": reply_text, "balance": 0.0, "today_spent": 0.0}
 
         elif cmd == "/debts":
             html = format_debts_html()
@@ -1612,7 +2005,7 @@ def _process_text(text: str):
                 pools = list_known_pools()
                 if not pools:
                     reply_text = "No pools created yet. Try: put 500 into goa pool"
-                    html = f"""
+                    html = """
                     <div class="space-y-1.5">
                       <div class="font-bold text-[13px] text-[#142B1A]">🏊 Shared Pools</div>
                       <div class="pixel-window-jrpg p-2 text-[12px]">
@@ -1712,7 +2105,7 @@ def _process_text(text: str):
             except Exception as e:
                 print(f"Error parsing balance setting: {e}")
 
-    aliases = get_all_aliases()
+    aliases = _soft_aliases()
     transactions = parse_multi(text, aliases)
     if not transactions:
         reply_text = f"Could not parse amount from '{text}'. Hint: type coins first, e.g. 12 notebook cash"
@@ -1720,110 +2113,16 @@ def _process_text(text: str):
         return {
             "ok": True,
             "text": reply_text,
-            "html": f"<p>Could not parse amount from <span class='bg-[#F87171] text-white px-1 text-[13px] font-mono'>\"{text}\"</span>. Hint: type the coins first, e.g. <strong class='underline decoration-2'>12 notebook cash</strong>.</p>",
+            "html": f"<p>Could not parse amount from <span class='bg-[#F87171] text-white px-1 text-[13px] font-mono'>\"{_esc(text)}\"</span>. Hint: type the coins first, e.g. <strong class='underline decoration-2'>12 notebook cash</strong>.</p>",
             "balance": float(get_balance()),
             "today_spent": float(get_today_expense()),
         }
 
-    # Check if transaction is a debt/shared item
+    # A lone debt/shared item
     if len(transactions) == 1 and transactions[0].get("share_type"):
         parsed = transactions[0]
         r = _apply_debt_transaction(parsed)
-        kind = r.get("kind") if r else None
-        
-        if kind == "split":
-            people_str = ", ".join(p.capitalize() for p, _ in r["people"])
-            reply_text = f"Split ₹{fmt(parsed['amount'])} ({parsed['category']}) with {people_str}. Your share: ₹{fmt(r['my_share'])}."
-            breakdown_lines = "".join(f"<div class='flex justify-between py-0.5 border-b border-[#E5DFC9]'><span>{p.capitalize()} owes you</span><span class='font-numeral text-[10px] font-bold text-[#059669]'>+₹{fmt(a)}</span></div>" for p, a in r["people"])
-            html_res = f"""
-            <div class="space-y-1.5">
-              <div class="flex items-center gap-1.5 mb-1 flex-wrap">
-                <span class="bg-[#8B5CF6] text-white px-1.5 py-0.5 font-bold border border-[#6D28D9]" style="font-size:10px;">SPLIT BILL</span>
-                <span class="bg-[#10B981] text-white px-1.5 py-0.5 font-bold border border-[#065F46]" style="font-size:10px;">+20 EXP</span>
-              </div>
-              <p class="text-[12px]">Split <strong>₹{fmt(parsed['amount'])}</strong> for <strong>{parsed['category'].capitalize()}</strong> with <strong>{people_str}</strong>.</p>
-              <div class="pixel-window-jrpg p-2 text-[11px] space-y-0.5">
-                <div class="flex justify-between py-0.5 border-b border-[#E5DFC9]"><span>Your share (Expense)</span><span class="font-numeral font-bold text-[#E15554]">-₹{fmt(r['my_share'])}</span></div>
-                {breakdown_lines}
-              </div>
-            </div>
-            """
-        elif kind == "lend":
-            reply_text = f"Lent ₹{fmt(r['amount'])} to {r['who'].capitalize()}."
-            html_res = f"""
-            <div class="space-y-1.5">
-              <div class="flex items-center gap-1.5 mb-1">
-                <span class="bg-[#3B82F6] text-white px-1.5 py-0.5 font-bold border border-[#1D4ED8]" style="font-size:10px;">IOU CREATED</span>
-              </div>
-              <p class="text-[12px]">Lent <strong>₹{fmt(r['amount'])}</strong> to <strong>{r['who'].capitalize()}</strong> via {r['method'].upper()}.</p>
-            </div>
-            """
-        elif kind == "borrow":
-            reply_text = f"Borrowed ₹{fmt(r['amount'])} from {r['who'].capitalize()}."
-            html_res = f"""
-            <div class="space-y-1.5">
-              <div class="flex items-center gap-1.5 mb-1">
-                <span class="bg-[#E15554] text-white px-1.5 py-0.5 font-bold border border-[#991B1B]" style="font-size:10px;">DEBT INCURRED</span>
-              </div>
-              <p class="text-[12px]">Borrowed <strong>₹{fmt(r['amount'])}</strong> from <strong>{r['who'].capitalize()}</strong> into {r['method'].upper()}.</p>
-            </div>
-            """
-        elif kind == "repayment":
-            direction = r.get("direction")
-            if direction == "they_paid_me":
-                reply_text = f"{r['who'].capitalize()} paid back ₹{fmt(r['amount'])}."
-                html_res = f"""
-                <div class="space-y-1.5">
-                  <div class="flex items-center gap-1.5 mb-1">
-                    <span class="bg-[#10B981] text-white px-1.5 py-0.5 font-bold border border-[#065F46]" style="font-size:10px;">DEBT SETTLED</span>
-                  </div>
-                  <p class="text-[12px]"><strong>{r['who'].capitalize()}</strong> paid back <strong>₹{fmt(r['amount'])}</strong> via {r['method'].upper()}.</p>
-                </div>
-                """
-            else:
-                reply_text = f"Paid back ₹{fmt(r['amount'])} to {r['who'].capitalize()}."
-                html_res = f"""
-                <div class="space-y-1.5">
-                  <div class="flex items-center gap-1.5 mb-1">
-                    <span class="bg-[#10B981] text-white px-1.5 py-0.5 font-bold border border-[#065F46]" style="font-size:10px;">DEBT CLEARED</span>
-                  </div>
-                  <p class="text-[12px]">Paid back <strong>₹{fmt(r['amount'])}</strong> to <strong>{r['who'].capitalize()}</strong> via {r['method'].upper()}.</p>
-                </div>
-                """
-        elif kind == "contribution":
-            reply_text = f"Put ₹{fmt(r['amount'])} into {r['who'].upper()} pool."
-            html_res = f"""
-            <div class="space-y-1.5">
-              <div class="flex items-center gap-1.5 mb-1">
-                <span class="bg-[#F59E0B] text-white px-1.5 py-0.5 font-bold border border-[#B45309]" style="font-size:10px;">POOL DEPOSIT</span>
-              </div>
-              <p class="text-[12px]">Deposited <strong>₹{fmt(r['amount'])}</strong> into <strong>{r['who'].upper()}</strong> pool via {r['method'].upper()}.</p>
-            </div>
-            """
-        elif kind == "pool_contribution_other":
-            reply_text = f"{r['person'].capitalize()} put ₹{fmt(r['amount'])} into {r['who'].upper()} pool."
-            html_res = f"""
-            <div class="space-y-1.5">
-              <div class="flex items-center gap-1.5 mb-1">
-                <span class="bg-[#F59E0B] text-white px-1.5 py-0.5 font-bold border border-[#B45309]" style="font-size:10px;">POOL DEPOSIT</span>
-              </div>
-              <p class="text-[12px]"><strong>{r['person'].capitalize()}</strong> deposited <strong>₹{fmt(r['amount'])}</strong> into <strong>{r['who'].upper()}</strong> pool.</p>
-            </div>
-            """
-        elif kind == "pool_expense":
-            reply_text = f"Spent ₹{fmt(r['amount'])} from {r['who'].upper()} pool."
-            html_res = f"""
-            <div class="space-y-1.5">
-              <div class="flex items-center gap-1.5 mb-1">
-                <span class="bg-[#E15554] text-white px-1.5 py-0.5 font-bold border border-[#991B1B]" style="font-size:10px;">POOL EXPENSE</span>
-              </div>
-              <p class="text-[12px]">Spent <strong>₹{fmt(r['amount'])}</strong> ({r['category'].capitalize()}) from <strong>{r['who'].upper()}</strong> pool.</p>
-            </div>
-            """
-        else:
-            reply_text = "Debt item processed."
-            html_res = "<p>Debt transaction recorded.</p>"
-
+        reply_text, html_res = _debt_reply(parsed, r)
         log_chat_message("assistant", html_res)
         return {
             "ok": True,
@@ -1833,31 +2132,34 @@ def _process_text(text: str):
             "today_spent": float(get_today_expense()),
         }
 
+    # One or more items (plain and/or debt) -- each is applied and reported on its own
     logged = []
     for parsed in transactions:
         if parsed.get("share_type"):
             r = _apply_debt_transaction(parsed)
-            logged.append({"id": 0, "type": "transfer", "amount": parsed["amount"], "category": parsed.get("category", "other"), "note": parsed.get("note"), "payment_method": parsed.get("payment_method")})
+            summary, _ = _debt_reply(parsed, r)
+            logged.append({"debt": True, "summary": summary, "amount": parsed["amount"]})
         else:
             tx_id = add_transaction(parsed["type"], parsed["amount"], parsed["category"], parsed["note"], parsed["payment_method"])
             note_key = (parsed.get("note") or "").lower().strip()
-            learn_alias_auto(note_key, parsed["type"], parsed["category"], parsed["payment_method"])
-            logged.append({**parsed, "id": tx_id})
+            _soft_learn_auto(note_key, parsed["type"], parsed["category"], parsed["payment_method"])
+            logged.append({**parsed, "id": tx_id, "debt": False})
 
     if len(logged) == 1:
         last_tx = logged[0]
         sign = "+" if last_tx["type"] == "income" else "-"
         badge_bg = "bg-[#10B981]" if last_tx["type"] == "income" else "bg-[#E15554]"
         reply_text = f"Logged ₹{fmt(last_tx['amount'])} on {last_tx['category']}"
-        log_chat_message("assistant", html_res)
+        pay_html = f" via {_esc(last_tx['payment_method'].upper())}" if last_tx.get("payment_method") else ""
         html_res = f"""
         <div class="flex items-center gap-1.5 mb-1 flex-wrap">
           <span class="{badge_bg} text-white px-1.5 py-0.5 font-bold border border-[#7F1D1D]" style="font-size:10px;">{sign}₹{fmt(last_tx['amount'])} GP</span>
           <span class="bg-[#10B981] text-white px-1.5 py-0.5 font-bold border border-[#065F46]" style="font-size:10px;">+15 EXP</span>
-          <span class="bg-[#3B82F6] text-white px-1.5 py-0.5 font-bold border border-[#1E40AF]" style="font-size:10px;">{last_tx['category'].upper()}</span>
+          <span class="bg-[#3B82F6] text-white px-1.5 py-0.5 font-bold border border-[#1E40AF]" style="font-size:10px;">{_esc(last_tx['category'].upper())}</span>
         </div>
-        <p>Logged <strong>₹{fmt(last_tx['amount'])}</strong> under <strong>{last_tx['category'].capitalize()}</strong>{f" via {last_tx['payment_method'].upper()}" if last_tx.get('payment_method') else ""}.</p>
+        <p>Logged <strong>₹{fmt(last_tx['amount'])}</strong> under <strong>{_esc(last_tx['category'].capitalize())}</strong>{pay_html}.</p>
         """
+        log_chat_message("assistant", html_res)
         return {
             "ok": True,
             "html": html_res,
@@ -1868,37 +2170,48 @@ def _process_text(text: str):
             "balance": float(get_balance()),
             "today_spent": float(get_today_expense()),
         }
-    else:
-        total_logged = sum(x["amount"] for x in logged)
-        reply_text = f"Logged {len(logged)} items totaling ₹{fmt(total_logged)}"
-        log_chat_message("assistant", html_res)
-        items_html = ""
-        for tx in logged:
-            sign = "+" if tx["type"] == "income" else "-"
-            color = "#10B981" if tx["type"] == "income" else "#E15554"
+
+    has_debt = any(x["debt"] for x in logged)
+    plain_total = sum((x["amount"] for x in logged if not x["debt"]), Decimal("0.00"))
+    reply_text = f"Logged {len(logged)} items" + ("" if has_debt else f" totaling ₹{fmt(plain_total)}")
+    items_html = ""
+    for tx in logged:
+        if tx["debt"]:
             items_html += f"""
             <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px dashed var(--border-light, #E8E0D0);">
-              <span>#{tx['id']} <strong>{tx['category'].capitalize()}</strong>{f" ({tx['note']})" if tx.get('note') else ""}{f" [{tx['payment_method']}]" if tx.get('payment_method') else ""}</span>
+              <span>🤝 {_esc(tx['summary'])}</span>
+            </div>
+            """
+            continue
+        sign = "+" if tx["type"] == "income" else "-"
+        color = "#10B981" if tx["type"] == "income" else "#E15554"
+        note_html = f" ({_esc(tx['note'])})" if tx.get("note") else ""
+        pay_html = f" [{_esc(tx['payment_method'])}]" if tx.get("payment_method") else ""
+        items_html += f"""
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px dashed var(--border-light, #E8E0D0);">
+              <span>#{tx['id']} <strong>{_esc(tx['category'].capitalize())}</strong>{note_html}{pay_html}</span>
               <span style="font-weight:bold;color:{color};">{sign}₹{fmt(tx['amount'])}</span>
             </div>
             """
-        html_res = f"""
+    total_html = "" if has_debt else f" (Total: ₹{fmt(plain_total)})"
+    html_res = f"""
         <div style="margin-bottom:6px;display:flex;gap:6px;align-items:center;">
           <span style="background:#10B981;color:white;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:bold;">+{len(logged)*15} EXP</span>
           <span style="background:#8B5CF6;color:white;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:bold;">MULTI-LOG ({len(logged)} ITEMS)</span>
         </div>
-        <div style="font-weight:bold;font-size:13px;margin-bottom:6px;">Logged {len(logged)} transactions (Total: ₹{fmt(total_logged)})</div>
+        <div style="font-weight:bold;font-size:13px;margin-bottom:6px;">Logged {len(logged)} entries{total_html}</div>
         <div style="background:#FAF8F3;border:1px solid var(--border, #D7CDBB);border-radius:6px;padding:8px;font-size:12px;">
           {items_html}
         </div>
         """
-        return {
-            "ok": True,
-            "html": html_res,
-            "text": reply_text,
-            "balance": float(get_balance()),
-            "today_spent": float(get_today_expense()),
-        }
+    log_chat_message("assistant", html_res)
+    return {
+        "ok": True,
+        "html": html_res,
+        "text": reply_text,
+        "balance": float(get_balance()),
+        "today_spent": float(get_today_expense()),
+    }
 
 
 @app.route("/api/message", methods=["POST"])
@@ -1921,89 +2234,108 @@ def api_message():
 def api_action():
     data = request.get_json(silent=True) or {}
     action = data.get("action")
-    tx_id = data.get("tx_id")
+    tx_id = None
+    if data.get("tx_id") is not None:
+        try:
+            tx_id = int(data.get("tx_id"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "text": "Invalid transaction id."}), 400
+
+    def _totals(extra):
+        out = {"balance": float(get_balance()), "today_spent": float(get_today_expense())}
+        out.update(extra)
+        return jsonify(out)
 
     if action == "undo":
         group = delete_last_transaction()
-        return jsonify({
-            "ok": True,
-            "text": "Last transaction reverted.",
-            "balance": float(get_balance()),
-            "today_spent": float(get_today_expense()),
-        })
+        if not group:
+            return _totals({"ok": True, "text": "Nothing to undo."})
+        n = len(group)
+        return _totals({"ok": True, "text": f"Reverted last action ({n} linked entr{'y' if n == 1 else 'ies'})."})
 
-    elif action == "delete" and tx_id:
-        ok = delete_transaction(int(tx_id))
-        return jsonify({
-            "ok": ok,
-            "balance": float(get_balance()),
-            "today_spent": float(get_today_expense()),
-        })
+    if action == "delete" and tx_id is not None:
+        group = delete_transaction_group_by_id(tx_id)
+        if not group:
+            resp = _totals({"ok": False, "text": f"No transaction #{tx_id} found."})
+            resp.status_code = 404
+            return resp
+        extra = f" and {len(group) - 1} linked entr{'y' if len(group) == 2 else 'ies'}" if len(group) > 1 else ""
+        return _totals({"ok": True, "text": f"Removed #{tx_id}{extra}."})
 
-    elif action == "set_category" and tx_id:
-        cat = data.get("category")
-        update_transaction(int(tx_id), category=cat)
-        return jsonify({"ok": True, "category": cat})
+    if action in ("set_category", "set_payment") and tx_id is not None:
+        tx = get_transaction(tx_id)
+        if not tx:
+            return jsonify({"ok": False, "text": f"No transaction #{tx_id} found."}), 404
+        if tx.get("type") not in ("expense", "income"):
+            return jsonify({"ok": False, "text": "Transfers have no category or payment method. Delete it and re-enter instead."}), 400
 
-    elif action == "set_payment" and tx_id:
-        pay = data.get("payment_method")
-        update_transaction(int(tx_id), payment_method=pay)
-        return jsonify({"ok": True, "payment_method": pay})
+        new_cat = tx.get("category")
+        new_pay = tx.get("payment_method")
+        if action == "set_category":
+            cat = str(data.get("category") or "").strip().lower()
+            valid = EXPENSE_CATEGORIES if tx["type"] == "expense" else INCOME_CATEGORIES
+            if cat not in valid:
+                return jsonify({"ok": False, "text": f"Invalid category. Use one of: {', '.join(valid)}."}), 400
+            if not update_transaction(tx_id, category=cat):
+                return jsonify({"ok": False, "text": f"No transaction #{tx_id} found."}), 404
+            new_cat = cat
+            result = {"ok": True, "category": cat, "text": f"Updated category for #{tx_id} to {cat}."}
+        else:
+            pay = str(data.get("payment_method") or "").strip().lower()
+            if pay not in PAYMENT_METHODS:
+                return jsonify({"ok": False, "text": f"Invalid payment method. Use one of: {', '.join(PAYMENT_METHODS)}."}), 400
+            if not update_transaction(tx_id, payment_method=pay):
+                return jsonify({"ok": False, "text": f"No transaction #{tx_id} found."}), 404
+            new_pay = pay
+            result = {"ok": True, "payment_method": pay, "text": f"Updated payment method for #{tx_id} to {pay}."}
 
-    return jsonify({"ok": False, "error": "Invalid action"}), 400
+        # A manual correction is explicit human input: trust it as an alias immediately.
+        note_key = (tx.get("note") or "").lower().strip()
+        _soft_learn_manual(note_key, tx["type"], new_cat, new_pay)
+        return _totals(result)
+
+    return jsonify({"ok": False, "text": "Invalid action."}), 400
 
 
 @app.route("/api/voice", methods=["POST"])
 def api_voice():
     audio_file = request.files.get("audio")
     if not audio_file:
-        return jsonify({"ok": False, "text": "No audio provided"}), 400
-    
+        return jsonify({"ok": False, "text": "No audio provided."}), 400
+
     audio_bytes = audio_file.read()
-    transcribed = transcribe_voice(audio_bytes, audio_file.filename or "voice.ogg")
-    
-    if not transcribed:
-        # Fallback simulation response if Whisper API key not available
-        transcribed = "60 lunch upi"
+    if not audio_bytes:
+        return jsonify({"ok": False, "text": "The recording was empty. Nothing was logged."}), 400
 
-    aliases = get_all_aliases()
-    transactions = parse_multi(transcribed, aliases)
-    
-    if not transactions:
-        return jsonify({
-            "ok": True,
-            "transcribed": transcribed,
-            "text": f"Transcribed: '{transcribed}' (could not parse expense).",
-            "message_html": f"<p>Deciphered voice memo: <em>\"{transcribed}\"</em>. Pouch updated.</p>",
-            "balance": float(get_balance()),
-            "today_spent": float(get_today_expense()),
-        })
+    transcribed, err = transcribe_voice(audio_bytes, audio_file.filename or "voice.ogg")
+    if err:
+        # Never invent a transcript: a failed transcription logs nothing.
+        return jsonify({"ok": False, "text": err}), 502
 
-    logged = []
-    for parsed in transactions:
-        tx_id = add_transaction(parsed["type"], parsed["amount"], parsed["category"], parsed["note"], parsed["payment_method"])
-        logged.append({**parsed, "id": tx_id})
-
-    last_tx = logged[0]
-    return jsonify({
-        "ok": True,
-        "transcribed": transcribed,
-        "text": f"Logged voice note: ₹{fmt(last_tx['amount'])} on {last_tx['category']}",
-        "message_html": f"<p>Deciphered voice memo: <em>\"{transcribed}\"</em>! Logged <strong>₹{fmt(last_tx['amount'])}</strong> under <strong>{last_tx['category']}</strong>.</p>",
-        "balance": float(get_balance()),
-        "today_spent": float(get_today_expense()),
-    })
+    log_chat_message("user", f"🎙 {transcribed}")
+    res = _process_text(transcribed, allow_commands=False)
+    payload, status = _unwrap(res)
+    payload = dict(payload)
+    payload["transcribed"] = transcribed
+    body_html = payload.get("html") or f"<p>{_esc(payload.get('text', ''))}</p>"
+    payload["message_html"] = f"<p class='text-[11px]'>🎙 <em>{_esc(transcribed)}</em></p>{body_html}"
+    return jsonify(payload), status
 
 
 @app.route("/api/export", methods=["GET"])
 def api_export():
-    rows = get_history(limit=100000)
+    rows = _all_transactions(order="id.asc")  # paginated: every row, not just the first 1000
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["id", "type", "amount", "category", "note", "payment_method", "created_at"])
+    writer.writerow(["id", "type", "amount", "category", "note", "payment_method",
+                     "from_bucket", "to_bucket", "person", "pool", "linked_tx_id", "created_at"])
     for r in rows:
-        writer.writerow([r["id"], r["type"], r["amount"], r["category"], r.get("note"), r.get("payment_method"), r.get("created_at")])
-    
+        writer.writerow([
+            r.get("id"), r.get("type"), r.get("amount"), r.get("category"), r.get("note"),
+            r.get("payment_method"), r.get("from_bucket"), r.get("to_bucket"), r.get("person"),
+            r.get("pool"), r.get("linked_tx_id"), r.get("created_at"),
+        ])
+
     output = io.BytesIO()
     output.write(buf.getvalue().encode('utf-8'))
     output.seek(0)
@@ -2027,18 +2359,22 @@ def api_transactions():
     limit = request.args.get("limit", default=50, type=int)
     payment_method = request.args.get("payment_method")
 
-    rows = _all_transactions(order="id.desc", limit=limit)
     if payment_method:
-        rows = [r for r in rows if r.get("payment_method") == payment_method]
+        # filter first, THEN cut to the limit (otherwise the filter can silently under-return)
+        rows = [r for r in _all_transactions(order="id.desc") if r.get("payment_method") == payment_method][:limit]
+    else:
+        rows = _all_transactions(order="id.desc", limit=limit)
 
     serialised = [
         {
             "id": r["id"],
             "type": r["type"],
             "amount": float(r["amount"]),
-            "category": r["category"],
+            "category": r.get("category") or ("transfer" if r.get("type") == "transfer" else "other"),
             "note": r.get("note"),
             "payment_method": r.get("payment_method"),
+            "from_bucket": r.get("from_bucket"),
+            "to_bucket": r.get("to_bucket"),
             "created_at": r.get("created_at"),
             "created_at_display": _fmt_dt(r.get("created_at")),
         }
@@ -2049,43 +2385,14 @@ def api_transactions():
 
 @app.route("/api/balances", methods=["GET"])
 def api_balances():
-    """Return per-payment-method balances and the grand total."""
-    # Pull starting balances from settings (key = "starting_balance:<method>")
-    balances = {}
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            r = requests.get(
-                _sb_url("settings"),
-                headers=SB_HEADERS,
-                params={"select": "*", "key": "like.starting_balance:%"},
-                timeout=SB_TIMEOUT,
-            )
-            r.raise_for_status()
-            for row in r.json():
-                method = row["key"].split(":", 1)[1]
-                balances[method] = float(row["value"])
-        except Exception as e:
-            print(f"Balances: could not fetch starting balances: {e}")
-    else:
-        balances = {m: float(_mem_starting_balances.get(m, 0)) for m in PAYMENT_METHODS}
-
-    # Apply all transactions
-    rows = _all_transactions()
-    for tx in rows:
-        method = tx.get("payment_method") or "cash"
-        amount = float(tx["amount"])
-        if method not in balances:
-            balances[method] = 0.0
-        if tx["type"] == "income":
-            balances[method] += amount
-        else:
-            balances[method] -= amount
-
-    # Remove zero-value untracked methods to keep response clean
-    balances = {k: round(v, 2) for k, v in balances.items()}
+    """Per-payment-method balances and the grand total. Uses the same ledger maths as /balance
+    (transfers move money between buckets; they are never counted as expenses)."""
+    liquid = get_liquid_balances()
+    debts = get_debt_balances()
     return jsonify({
-        "balances": balances,
-        "total": round(sum(balances.values()), 2),
+        "balances": {k: float(v) for k, v in liquid.items()},
+        "total": float(sum(liquid.values(), Decimal("0.00"))),
+        "debts": {k: float(v) for k, v in debts.items()},
     })
 
 
@@ -2116,25 +2423,79 @@ def api_history():
 # --------------------------------------------------------------------- Telegram Webhook Handler
 
 
+def _handle_telegram_text(chat_id, message_id, text, is_edit):
+    """Returns the plain-text reply for one Telegram message (new or edited)."""
+    is_cmd = text.startswith("/")
+    if is_edit and is_cmd:
+        return "Edits to commands are ignored. Send the command again as a new message."
+
+    previous = None
+    if is_edit and message_id is not None:
+        previous = get_message_log(chat_id, message_id)
+
+    with _Collect() as made:
+        res = _process_text(text)
+    payload, _status = _unwrap(res)
+    reply = payload.get("text") or ""
+    created_any = bool(made["tx"] or made["pc"] or made["pe"])
+
+    if previous is not None:
+        if created_any:
+            # Replace, don't duplicate: the new rows exist, now remove what the original message made.
+            rollback_logged(previous)
+            reply = "✏️ Edit applied — your previous entry was replaced.\n" + reply
+        else:
+            reply += "\nNo new entry was created, so your previous entry was left unchanged."
+
+    if not is_cmd and message_id is not None and created_any:
+        try:
+            save_message_log(chat_id, message_id, made)
+        except StorageError as e:
+            print(f"[message_log] could not record message mapping (non-fatal): {e}")
+    return reply
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if TELEGRAM_SECRET_TOKEN and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_SECRET_TOKEN:
         return jsonify({"ok": False}), 401
 
     data = request.get_json(silent=True) or {}
+    is_edit = bool(data.get("edited_message")) and not data.get("message")
     msg = data.get("message") or data.get("edited_message") or {}
     if not msg:
         return jsonify({"ok": True})
 
-    chat_id = msg.get("chat", {}).get("id")
-    text = msg.get("text", "").strip()
+    chat_id = (msg.get("chat") or {}).get("id")
+    message_id = msg.get("message_id")
+    text = (msg.get("text") or "").strip()
+    if not (text and chat_id):
+        return jsonify({"ok": True})
 
-    if text and chat_id:
-        res = _process_text(text)
-        reply = res.get("text", "")
-        if reply:
-            send_telegram_message(chat_id, reply)
+    # Only the owner may use the bot (OWNER_ID unset/0 = open, e.g. for local testing)
+    if OWNER_ID and (msg.get("from") or {}).get("id") != OWNER_ID:
+        return jsonify({"ok": True})
 
+    # From here on we ALWAYS answer 200, so Telegram never re-delivers and never loops.
+    try:
+        first_time = claim_update(data.get("update_id"))
+    except StorageError:
+        send_telegram_message(chat_id, "⚠ Database unavailable — nothing was logged. Please resend in a minute.")
+        return jsonify({"ok": True})
+    if not first_time:
+        return jsonify({"ok": True})  # duplicate delivery of an update we already handled
+
+    try:
+        reply = _handle_telegram_text(chat_id, message_id, text, is_edit)
+    except StorageError as e:
+        print(f"[webhook] storage error: {e}")
+        reply = "⚠ Database error while saving. Check /history before resending."
+    except Exception:
+        traceback.print_exc()
+        reply = "⚠ Something went wrong. Check /history before resending."
+
+    if reply:
+        send_telegram_message(chat_id, reply)
     return jsonify({"ok": True})
 
 
