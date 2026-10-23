@@ -16,6 +16,7 @@ from flask import Flask, request, jsonify, send_file, Response, render_template_
 import hashlib
 import hmac
 import time
+import threading
 import traceback
 from html import escape as _esc, unescape as _unesc
 from werkzeug.exceptions import HTTPException
@@ -456,6 +457,9 @@ def _first_id(r, what):
 
 # In-memory id counter that only exists for the no-Supabase (local testing) mode
 _mem_pool_id_counter = 1
+
+# Per-request scratch space (amount-normalisation notices / negatives)
+_tl = threading.local()
 
 
 def add_transaction(tx_type, amount, category, note, payment_method=None) -> int:
