@@ -1,121 +1,122 @@
 # Fogless
 
-A personal expense tracker that runs off plain text. You type what you spent
-(or received), and it gets parsed, categorized, and logged — no forms, no
-dropdowns, no required app structure to follow. Built as a Flask serverless
-backend on Vercel with a Supabase (Postgres) database, an optional Telegram
-bot, and a small web frontend.
+A personal expense tracker that runs off plain text. You type what you spent (or received) and it is parsed,
+categorised and logged -- no forms, no dropdowns. Flask on Vercel, Supabase (Postgres + Auth), optional Groq for
+natural-language parsing and voice.
+
+**Multi-user:** every person signs up with their own email + password and gets a completely private ledger.
 
 ## What it does
 
-- **Natural language parsing** — type something like `24 coffee upi` or
-  `got 424 upi` and it extracts the amount, category, payment method, and
-  whether it's income or an expense. Uses Groq (`openai/gpt-oss-120b`) for
-  parsing, with a local regex-based fallback if the API is unavailable or no
-  key is set.
-- **Multiple transactions in one message** — `120 lunch upi, 50 bus cash,
-  200 veggies card` gets split and logged as three separate entries.
-- **Income vs. expense detection** — words like "got," "received," "salary,"
-  "refund," or "credited" are treated as income signals; everything else
-  defaults to expense.
-- **Voice input** — record a short voice memo describing a purchase and it's
-  transcribed via Groq Whisper (`whisper-large-v3-turbo`) and parsed the same
-  way as typed text.
-- **Slash commands** — `/stats`, `/balance`, `/history`, `/undo`, `/delete`,
-  `/aliases`, `/reset` for quick ledger operations without needing full
-  sentences.
-- **Telegram bot** — the same parsing and command logic is available through
-  a Telegram webhook, so you can log expenses by messaging the bot directly
-  instead of opening the web app.
-- **Per-method balances** — tracks running balances separately for cash,
-  UPI, card, and netbanking, plus a combined total.
-- **Works without a database** — if Supabase isn't configured, it falls back
-  to in-memory storage, useful for local testing.
+- **Natural language** -- `24 coffee upi`, `got 424 upi`, `120 lunch upi, 50 bus cash, 200 veggies card`.
+  Groq (`openai/gpt-oss-120b`) parses; a local regex parser takes over if there is no key or the API fails.
+- **Splits, IOUs, pools** -- `600 dinner split with rahul and amit`, `gave rahul 200 cash`, `put 500 into goa pool`.
+- **Voice** -- short voice memos are transcribed with Groq Whisper and logged the same way.
+- **Commands** -- `/stats`, `/balance`, `/setbalance`, `/history`, `/undo`, `/delete`, `/debts`, `/pool`, `/settle`,
+  `/aliases`, `/reset confirm`.
+- **Per-method balances** -- cash / UPI / card / netbanking, plus a total.
+- **Accounts** -- sign up, sign in, sign out, forgot/reset password, delete account (with all data).
 
-## How it works
+## How accounts and privacy work
 
-You send a message — through the web UI or Telegram — and it's routed
-through the same parsing pipeline either way. If it starts with `/`, it's
-treated as a command. Otherwise it goes to Groq (or the fallback parser) to
-extract one or more transactions, which get written to Supabase and reflected
-immediately in your balance totals.
-
-Example:
-
-```
-110 Food upi 100 Juice cash 100 biscuit
-```
-
-gets parsed into three separate transactions, each logged individually.
-
-## Tech stack
-
-| Layer | Technology |
+| Piece | What it does |
 |---|---|
-| Frontend | HTML5, vanilla JS, CSS3, Tailwind |
-| Backend | Python Flask, deployed as a Vercel serverless function |
-| LLM parsing | Groq API (`openai/gpt-oss-120b`), with a rule-based fallback parser |
-| Speech-to-text | Groq Whisper (`whisper-large-v3-turbo`) |
-| Database | Supabase (Postgres) via REST API, with in-memory fallback |
-| Bot | Telegram Bot API (webhook + `sendMessage`) |
+| Identity | Supabase Auth (email + password). The backend proxies sign-in, so the browser only ever holds two **HttpOnly, SameSite=Lax** cookies (`fl_at` access token, `fl_rt` refresh token). No tokens in JavaScript or `localStorage`. |
+| Every API call | Validates the access token with Supabase (cached 20 s), silently refreshes it when expired, then pins the user id. Missing / invalid session -> `401`. |
+| Data isolation | All database access goes through one function, `_sb()`. It forces `user_id = <you>` on every read / update / delete, stamps your id on every row written, and refuses any table that is not on an allow-list. Call sites cannot forget the filter because they never write it. |
+| Database safety net | Row Level Security on every table (`user_id = auth.uid()`), a per-user `bucket_balances(p_user_id)` function callable only with the service key, and `ON DELETE CASCADE` from `auth.users`. |
+| Abuse | Per-user message caps (counted in `chat_log`, so they hold across serverless instances), optional invite code, same-origin check on state-changing requests, `Cache-Control: no-store` on `/api/*`. |
+| Timezones | Each account keeps its own timezone (taken from the browser at sign-up / sign-in). "Today" and displayed times follow it; accounts without one keep IST. |
 
-## API endpoints
+### Trade-offs you should know about
+
+1. **The server uses the service-role key, which bypasses RLS.** Isolation therefore depends on `_sb()` being the only
+   door to the database. The test-suite checks this by construction (and fails loudly if the filter is removed), but a
+   future developer who calls `requests` against Supabase directly would bypass it. RLS policies are the second line of
+   defence for anything that ever uses a user token. The alternative (run every query with the *user's own* JWT so RLS is
+   the primary control) is stronger but needs the anon key on every data call and careful token refresh handling.
+2. **Sign-in is proxied through your backend**, so Supabase sees your server's IP for every login and applies its
+   per-IP rate limits to *all* users together. Fine for a friends-and-family app; if you grow, move sign-in to the browser
+   (supabase-js) and have the API accept the Bearer token.
+3. **A signed-out token can keep working for up to ~20 s on a warm serverless instance** (the verification cache).
+   Logout also revokes the session at Supabase, so it cannot be refreshed.
+4. **Static files bypass Flask on Vercel**, so security headers (`X-Frame-Options` etc.) are only set on `/api/*` and
+   on pages Flask serves itself. Add a `headers` block to `vercel.json` if you want them everywhere. No CSP is set
+   because the pages use inline scripts.
+
+## Supabase setup (one time)
+
+1. **Authentication -> Providers -> Email**: enable. Set the minimum password length to **8** or more.
+2. **Authentication -> URL Configuration**: set *Site URL* to your deployment and add `https://YOUR-APP/reset.html`
+   to *Redirect URLs*.
+3. **Email delivery -- choose one:**
+   - *Email confirmation ON (recommended for public use)*: you **must** configure **custom SMTP** (Authentication ->
+     Emails -> SMTP Settings; Brevo, Resend, etc.). Supabase's built-in sender only delivers to addresses on your
+     Supabase team and is capped at roughly 2 emails/hour, so real users would never receive their confirmation or
+     reset emails. Raise the auth email rate limit after enabling SMTP.
+   - *Email confirmation OFF (friends-only apps)*: users are signed in immediately. Anyone can register with any
+     address, so set `SIGNUP_CODE`. Password reset still needs working email delivery.
+4. Copy the **Project URL**, **anon key** and **service_role key** into your environment (see `.env.example`).
+
+## Database
+
+**New project:** run `supabase_schema.sql` once. Done.
+
+**Already running the single-user version (your data is kept):**
+
+1. Run `003_multiuser_1_prepare.sql` (adds a nullable `user_id`; the old app keeps working).
+2. Deploy this version and **create your own account** (sign up in the app, or Dashboard -> Authentication -> Users).
+3. Edit the `owner_email` line in `003_multiuser_2_finalize.sql` to that email and run it. It assigns every existing
+   row to you, makes `user_id` mandatory, fixes the keys, adds indexes and turns on RLS. It runs in one transaction
+   and refuses to do anything if the account does not exist.
+4. Run `004_safety_and_speed.sql` (per-user balances function + no-zero-amount guards). Optional: without it balances
+   are computed by downloading the ledger, which is slower.
+
+Until step 3 you will see an empty ledger (your rows are not lost, just not yet attached to your account).
+`message_log` and `processed_updates` are leftovers from the removed Telegram bot; nothing uses them and they can be dropped.
+
+## Environment variables
+
+See `.env.example`. `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_KEY` are required; without them every
+sign-in attempt returns `503` (it fails closed). `ALLOW_RESET`, `DEMO_USERNAME`, `DEMO_PASSWORD`, `SESSION_SECRET`
+and `CRON_SECRET` no longer exist -- remove them from Vercel.
+
+## Run locally
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env      # fill it in (a .env in the project root is loaded automatically; real env vars win)
+python api/index.py       # http://127.0.0.1:5000
+```
+
+No Supabase? `FOGLESS_DEV_MODE=1 python api/index.py` gives you in-memory accounts and data (lost on restart, ignored
+on Vercel and whenever Supabase is configured). A password-reset "email" is printed to the console.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+No network and no real keys needed (`.env` is never read under test). The suite runs the real Flask app against a small
+fake Supabase (Auth + PostgREST semantics) and covers: sign-up / sign-in / refresh / logout / reset / delete, email
+confirmation, invite codes, CSRF, outage handling, and -- most importantly -- that user A can never read, edit, delete,
+undo, export, reset or rate-limit user B. It also covers the parsing and ledger fixes and the Supabase-only code paths.
+
+## API
+
+All routes except the public auth ones require a signed-in session.
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/` | GET | Serves the web app |
-| `/api/message` | POST | Parses freeform text or slash commands |
-| `/api/state` | GET | Current balance, today's spend, monthly stats, recent history |
-| `/api/action` | POST | Inline edits — undo, delete, change category/payment method |
-| `/api/voice` | POST | Accepts an audio file for transcription + logging |
-| `/api/transactions` | GET | Lists transactions, filterable by payment method |
-| `/api/balances` | GET | Balances broken down by payment method |
-| `/api/aliases` | GET | Learned shorthand aliases (e.g. "biscuit" → food/UPI) |
-| `/api/history` | GET | Persisted chat log (user + assistant turns) |
-| `/api/export` | GET | CSV export of all transactions |
-| `/api/backup` | GET | Full JSON dump of transactions + starting balances |
-| `/webhook` | POST | Telegram webhook receiver |
-
-## Setup
-
-### Requirements
-
-- Python 3.9+
-- A Groq API key (optional — enables LLM parsing and voice transcription;
-  without it, a local rule-based parser is used instead)
-- A Supabase project (optional — enables persistent storage; without it,
-  data lives in memory and resets on restart)
-- A Telegram bot token (optional — enables the Telegram integration)
-
-### Install
-
-```bash
-git clone https://github.com/ScarsAndSource/fogless.git
-cd fogless
-pip install -r requirements.txt
-```
-
-### Environment variables
-
-Create a `.env` file in the project root:
-
-```
-BOT_TOKEN=your_telegram_bot_token
-OWNER_ID=your_telegram_chat_id
-TELEGRAM_SECRET_TOKEN=your_optional_secret_token
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_KEY=your_supabase_service_role_key
-GROQ_API_KEY=gsk_your_groq_api_key
-```
-
-All of these are optional — the app degrades gracefully without them, though
-you'll lose the corresponding feature (LLM parsing, persistence, or the
-Telegram bot).
-
-### Run locally
-
-```bash
-python api/index.py
-```
-
-Open `http://localhost:5000`.
+| `/api/config` | GET | Public: whether sign-up is open / needs an invite code |
+| `/api/signup` `/api/login` `/api/logout` | POST | Create account / sign in / sign out |
+| `/api/session` | GET | Public: `{authenticated, email}` |
+| `/api/forgot` `/api/reset-password` | POST | Request a reset email / set a new password from the emailed link |
+| `/api/account/delete` | POST | Erase your data and your account (needs your password) |
+| `/api/message` | POST | Freeform text or slash commands (rate-limited) |
+| `/api/voice` | POST | Audio -> transcription -> log (rate-limited) |
+| `/api/state` `/api/balances` `/api/transactions` `/api/aliases` `/api/history` | GET | Your data |
+| `/api/action` | POST | undo / delete / change category or payment method |
+| `/api/export` `/api/backup` | GET | CSV / JSON of **your** data |

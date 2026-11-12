@@ -1,41 +1,71 @@
 """
-Regression tests for Fogless. Run from the project root:   pip install pytest && pytest -q
-Runs entirely in the in-memory mode: Supabase/Groq env vars are removed and .env is NOT loaded,
-so these tests can never touch your real database.
+Regression tests for Fogless behaviour (parsing, ledger maths, hardening). Run from the project root:  pytest -q
+
+Runs entirely in the in-memory dev mode: Supabase/Groq env vars are removed and .env is NOT loaded, so these
+tests can never touch your real database. Each test gets a fresh app and one signed-in account.
 """
 import importlib.util
+import inspect
 import io
 import json
 import os
-import sys
 import unittest.mock as mock
 from decimal import Decimal as D
 
 import pytest
+from flask import g
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-USER, PW = "tester", "correct horse battery staple"
+EMAIL, PW = "tester@example.com", "correct horse battery staple"
+
+
+class Scoped:
+    """Facade over the app module: plain functions run inside a request context pinned to one user (as they do
+    in a real request); everything else (the Flask app, constants, modules) passes straight through."""
+
+    def __init__(self, mod, uid):
+        object.__setattr__(self, "_m", mod)
+        object.__setattr__(self, "_uid", uid)
+
+    def __getattr__(self, name):
+        v = getattr(self._m, name)
+        if inspect.isfunction(v):
+            def call(*a, **k):
+                with self._m.app.test_request_context():
+                    g.uid = self._uid
+                    return v(*a, **k)
+            return call
+        return v
+
+    def __setattr__(self, name, value):
+        setattr(self._m, name, value)
 
 
 @pytest.fixture()
-def fog(monkeypatch):
-    for k in ("SUPABASE_URL", "SUPABASE_SERVICE_KEY", "SUPABASE_KEY", "GROQ_API_KEY", "SESSION_SECRET", "VERCEL"):
+def raw(monkeypatch):
+    for k in ("SUPABASE_URL", "SUPABASE_SERVICE_KEY", "SUPABASE_KEY", "SUPABASE_ANON_KEY", "GROQ_API_KEY",
+              "VERCEL", "SIGNUP_CODE", "SIGNUPS_OPEN"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("FOGLESS_NO_DOTENV", "1")
-    monkeypatch.setenv("DEMO_USERNAME", USER)
-    monkeypatch.setenv("DEMO_PASSWORD", PW)
+    monkeypatch.setenv("FOGLESS_DEV_MODE", "1")
     spec = importlib.util.spec_from_file_location("fogless_under_test", os.path.join(ROOT, "api", "index.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    mod.app.config["TESTING"] = False  # keep real error handlers
+    mod.app.config["TESTING"] = False  # keep the real error handlers
     return mod
 
 
 @pytest.fixture()
-def c(fog):
-    cl = fog.app.test_client()
-    assert cl.post("/api/login", json={"username": USER, "password": PW}).status_code == 200
+def c(raw):
+    cl = raw.app.test_client()
+    r = cl.post("/api/signup", json={"email": EMAIL, "password": PW})
+    assert r.status_code == 200 and r.get_json()["signed_in"]
     return cl
+
+
+@pytest.fixture()
+def fog(raw, c):
+    return Scoped(raw, raw._DEV_USERS[EMAIL]["id"])
 
 
 def say(c, text):
@@ -48,33 +78,20 @@ def txs(fog):
 
 
 # ------------------------------------------------------------------ security
-def test_no_default_credentials(fog, monkeypatch):
-    monkeypatch.delenv("DEMO_USERNAME")
-    monkeypatch.delenv("DEMO_PASSWORD")
-    spec = importlib.util.spec_from_file_location("fog2", os.path.join(ROOT, "api", "index.py"))
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-    r = m.app.test_client().post("/api/login", json={"username": "vaibhav10", "password": "iwon10"})
-    assert r.status_code in (401, 503)
-
-
 def test_api_requires_login(fog):
     anon = fog.app.test_client()
     for ep in ("/api/state", "/api/backup", "/api/export", "/api/history", "/api/balances"):
         assert anon.get(ep).status_code == 401
 
 
-def test_login_throttle(fog):
-    cl = fog.app.test_client()
-    fog.time.sleep = lambda s: None
-    codes = [cl.post("/api/login", json={"username": USER, "password": "bad"}).status_code for _ in range(12)]
-    assert 429 in codes
-
-
 @pytest.mark.parametrize("body", [[1, 2], "str", 5, None])
 def test_non_object_json_never_500(fog, c, body):
-    for ep in ("/api/message", "/api/action", "/api/login"):
-        assert c.post(ep, data=json.dumps(body), content_type="application/json").status_code < 500
+    anon = fog.app.test_client()
+    for client in (c, anon):
+        for ep in ("/api/message", "/api/action", "/api/login", "/api/signup", "/api/forgot",
+                   "/api/reset-password", "/api/account/delete"):
+            r = client.post(ep, data=json.dumps(body), content_type="application/json")
+            assert r.status_code < 500, (ep, r.status_code)
 
 
 def test_text_must_be_string(fog, c):
@@ -104,11 +121,9 @@ def test_api_responses_not_cacheable(fog, c):
     ("24 coffee upi", "24.00"), ("1,200 rent", "1200.00"), ("₹500 petrol", "500.00"), ("coffee 1k upi", "1000.00"),
     ("30₹ chai", "30.00"), ("450 dinner on 12 nov", "450.00"), ("uber 250 on 5th", "250.00"),
     ("paid 450 on nov 12 for dinner", "450.00"), ("bought 3 shirts for 1500", "1500.00"),
-    ("spent 20 on 2 samosas", "20.00"), ("pay 600 market 20", None),
+    ("spent 20 on 2 samosas", "20.00"),
 ])
 def test_single_amount(fog, c, text, amount):
-    if amount is None:
-        return
     status, _ = say(c, text)
     assert status == 200
     assert txs(fog) == [("expense", amount)], text
@@ -183,7 +198,7 @@ def test_set_balance_then_spend(fog, c):
 
 
 # ------------------------------------------------------------------ LLM output hardening
-def _groq(fog, items):
+def _groq(items):
     class R:
         def raise_for_status(self):
             pass
@@ -195,13 +210,13 @@ def _groq(fog, items):
 
 def run_llm(fog, c, text, items):
     fog.GROQ_API_KEY = "x"
-    with mock.patch.object(fog.requests, "post", return_value=_groq(fog, items)):
+    with mock.patch.object(fog.requests, "post", return_value=_groq(items)):
         return c.post("/api/message", json={"text": text}).get_json()
 
 
 def test_llm_comma_amount_is_accepted(fog, c):
     run_llm(fog, c, "a 100, b 1200", [{"type": "expense", "amount": 100, "category": "food"},
-                                        {"type": "expense", "amount": "1,200", "category": "food"}])
+                                       {"type": "expense", "amount": "1,200", "category": "food"}])
     assert [a for _, a in txs(fog)] == ["100.00", "1200.00"]
 
 
@@ -216,7 +231,8 @@ def test_llm_case_and_nan(fog, c):
     assert fog._all_transactions()[0]["category"] == "food"
     assert fog._all_transactions()[0]["payment_method"] == "upi"
     fog.reset_all_data()
-    r = run_llm(fog, c, "100 a, 200 b", [{"type": "expense", "amount": "NaN"}, {"type": "expense", "amount": 200, "category": "food"}])
+    r = run_llm(fog, c, "100 a, 200 b", [{"type": "expense", "amount": "NaN"},
+                                          {"type": "expense", "amount": 200, "category": "food"}])
     assert [a for _, a in txs(fog)] == ["200.00"] and "NOT logged" in r["text"]
 
 
@@ -251,4 +267,5 @@ def test_static_path_traversal_blocked(fog, c):
 
 
 def test_big_body_rejected(fog, c):
-    assert c.post("/api/message", data=b"{" + b"a" * (5 * 1024 * 1024), content_type="application/json").status_code in (400, 413)
+    assert c.post("/api/message", data=b"{" + b"a" * (5 * 1024 * 1024),
+                  content_type="application/json").status_code in (400, 413)

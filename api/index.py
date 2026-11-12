@@ -12,14 +12,17 @@ import json
 import requests
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from datetime import datetime, timedelta, timezone
-from flask import Flask, request, jsonify, send_file, session
+from flask import Flask, request, jsonify, send_file, Response, render_template_string, g, has_request_context
 import hashlib
-import secrets
 import hmac
+import secrets
 import time
 import threading
 import traceback
+import uuid
 from html import escape as _esc, unescape as _unesc
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 from werkzeug.exceptions import HTTPException
 from werkzeug.utils import safe_join
 
@@ -29,12 +32,13 @@ from werkzeug.utils import safe_join
 
 def _load_dotenv(path=None):
     """Tiny .env reader (no dependency) so the README's local setup really works. Real environment
-    variables always win; it never runs on Vercel or when FOGLESS_NO_DOTENV=1 (used by the tests)."""
+    variables always win; it never runs on Vercel or when FOGLESS_NO_DOTENV=1 (the tests set that, so
+    they can never pick up your real keys)."""
     if os.getenv("VERCEL") or os.getenv("FOGLESS_NO_DOTENV"):
         return
     path = path or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             for line in fh:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
@@ -49,21 +53,35 @@ def _load_dotenv(path=None):
 
 _load_dotenv()
 
-# Login credentials come ONLY from the environment. No defaults: if they are missing, login is
-# refused (fails closed) instead of silently accepting a password that is public in the repo.
-DEMO_USERNAME = os.getenv("DEMO_USERNAME", "").strip()
-DEMO_PASSWORD = os.getenv("DEMO_PASSWORD", "")
-
-
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+# Service-role key: used server-side ONLY for database access (every query is scoped to the signed-in
+# user inside _sb()) and for deleting an account. It is never sent to the browser.
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", os.getenv("SUPABASE_KEY", ""))
+# Anon / publishable key: used for the Supabase Auth endpoints (sign-up, sign-in, refresh, ...).
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 
-# Signs the login cookie. Set SESSION_SECRET in production; without it we derive a stable secret
-# from the Supabase key (so every serverless instance agrees), or a fixed one for local testing.
-SESSION_SECRET = os.getenv("SESSION_SECRET") or (
-    hashlib.sha256(("fogless-session:" + SUPABASE_KEY).encode("utf-8")).hexdigest()
-    if SUPABASE_KEY else secrets.token_hex(32)  # random per process: never a secret that is public in the repo
-)
+# Public URL of the deployed site; the password-reset email links back to SITE_URL/reset.html.
+# It must be listed under Supabase -> Authentication -> URL Configuration -> Redirect URLs.
+SITE_URL = os.getenv("SITE_URL", "").rstrip("/")
+
+# Registration controls. SIGNUPS_OPEN=0 closes registration; SIGNUP_CODE (if set) is an invite code.
+SIGNUPS_OPEN = os.getenv("SIGNUPS_OPEN", "1") != "0"
+SIGNUP_CODE = os.getenv("SIGNUP_CODE", "")
+
+
+def _env_int(name, default):
+    try:
+        return int(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+
+
+# Per-user message caps (every message can cost a Groq call on YOUR key). 0 disables a cap.
+RATE_LIMIT_PER_MIN = _env_int("RATE_LIMIT_PER_MIN", 20)
+RATE_LIMIT_PER_DAY = _env_int("RATE_LIMIT_PER_DAY", 300)
+
+# Local-only mode: in-memory users and data, no Supabase. Ignored when Supabase is configured or on Vercel.
+DEV_MODE = os.getenv("FOGLESS_DEV_MODE", "") == "1"
 
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -84,19 +102,37 @@ SB_PAGE_SIZE = 1000
 
 IST = timezone(timedelta(hours=5, minutes=30))  # local calendar-day boundary for /stats "today"
 
-# Wiping the live database through /reset must be explicitly enabled (ALLOW_RESET=1).
-ALLOW_RESET = os.getenv("ALLOW_RESET", "") == "1"
+# Fallback calendar for users who have no timezone stored (also the original single-user behaviour).
+_TZ_NAME_RE = re.compile(r"^[A-Za-z_]+(?:/[A-Za-z0-9_+\-]+){0,2}$")
+
+
+def _valid_tz(name) -> bool:
+    if not isinstance(name, str) or not name or len(name) > 64 or not _TZ_NAME_RE.match(name):
+        return False
+    try:
+        ZoneInfo(name)
+        return True
+    except Exception:
+        return False
+
+
+def _user_tz():
+    """The signed-in user's timezone (IANA name from their account), else IST."""
+    name = getattr(g, "tz", None) if has_request_context() else None
+    if name and _valid_tz(name):
+        return ZoneInfo(name)
+    return IST
 
 
 def _fmt_dt(iso_str) -> str:
-    """Render a stored UTC timestamp as a short IST date/time, e.g. '16 Sep, 03:42 PM'."""
+    """Render a stored UTC timestamp as a short date/time in the user's timezone, e.g. '16 Sep, 03:42 PM'."""
     if not iso_str:
         return ""
     try:
         dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(IST).strftime("%d %b, %I:%M %p")
+        return dt.astimezone(_user_tz()).strftime("%d %b, %I:%M %p")
     except Exception:
         return ""
 
@@ -209,39 +245,17 @@ _MULTI_HINT_RE = re.compile(r",|;|\band\b|\n|\b\d+(?:\.\d+)?\b.*?\b\d+(?:\.\d+)?
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-# In-memory storage fallback when Supabase is not configured
-_mem_transactions = []
+# In-memory storage fallback (FOGLESS_DEV_MODE only): one private store per user id, see _mem().
+_MEM = {}
 _mem_id_counter = 1
-_mem_aliases = {}
-_mem_starting_balances = {b: Decimal("0.00") for b in PAYMENT_METHODS}
-_mem_pool_contributions = []
-_mem_pool_expenses = []
 
 
 app = Flask(__name__)
-app.secret_key = SESSION_SECRET
-app.config.update(
-    SESSION_COOKIE_NAME="fogless_session",
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=bool(os.getenv("VERCEL")),  # https on Vercel; plain http works locally
-    PERMANENT_SESSION_LIFETIME=timedelta(days=14),
-    MAX_CONTENT_LENGTH=4 * 1024 * 1024,  # Vercel rejects bigger bodies anyway; stops giant uploads locally
-)
-
-
-@app.after_request
-def _security_headers(resp):
-    if request.path.startswith("/api/"):
-        resp.headers["Cache-Control"] = "no-store"  # balances/ledger must never be cached
-    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
-    resp.headers.setdefault("X-Frame-Options", "DENY")
-    resp.headers.setdefault("Referrer-Policy", "same-origin")
-    return resp
+app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024  # Vercel rejects bigger bodies anyway; stops giant uploads locally
 
 
 def _json_body() -> dict:
-    """request JSON as a dict, always. A list/str/number body used to crash with AttributeError (HTTP 500)."""
+    """The request's JSON as a dict, always. A list / string / number body used to crash with AttributeError (HTTP 500)."""
     data = request.get_json(silent=True)
     return data if isinstance(data, dict) else {}
 
@@ -452,17 +466,50 @@ class StorageError(Exception):
         self.status = status
 
 
+class AuthError(Exception):
+    """No signed-in user for something that needs one (including any attempt to touch user data without one)."""
+
+
+class AuthServiceError(Exception):
+    """Supabase Auth is unreachable, not configured, or answered with a 5xx."""
+
+
+# Every table that holds a user's data. _sb() refuses any other table and scopes these to the signed-in user.
+_USER_TABLES = frozenset({"transactions", "aliases", "settings", "pool_contributions", "pool_expenses", "chat_log"})
+
+
 def _use_sb() -> bool:
     return bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+def _dev_auth() -> bool:
+    """In-memory accounts for local testing. Fails closed: never with Supabase configured, never on Vercel."""
+    return DEV_MODE and not _use_sb() and not os.getenv("VERCEL")
+
+
+def _scope_uid() -> str:
+    uid = getattr(g, "uid", None) if has_request_context() else None
+    if not uid:
+        raise AuthError("no signed-in user")
+    return uid
+
+
+def _mem() -> dict:
+    """The signed-in user's private in-memory store (dev mode only)."""
+    uid = _scope_uid()
+    st = _MEM.get(uid)
+    if st is None:
+        st = _MEM[uid] = {"tx": [], "aliases": {}, "start": {b: Decimal("0.00") for b in PAYMENT_METHODS},
+                          "pc": [], "pe": []}
+    return st
 
 
 def _sb_url(path: str) -> str:
     return f"{SUPABASE_URL}/rest/v1/{path}" if SUPABASE_URL else ""
 
 
-def _sb(method, path, params=None, json_body=None, prefer=None, ok_statuses=()):
-    """One place for every Supabase call. Raises StorageError on network errors and on any
-    non-2xx/3xx status (except those listed in ok_statuses)."""
+def _sb_raw(method, path, params=None, json_body=None, prefer=None, ok_statuses=()):
+    """The HTTP call to Supabase. Never call this directly: go through _sb() / _sb_rpc(), which scope it."""
     headers = dict(SB_HEADERS)
     if prefer:
         headers["Prefer"] = prefer
@@ -477,6 +524,43 @@ def _sb(method, path, params=None, json_body=None, prefer=None, ok_statuses=()):
         print(f"[supabase] {method} {path} -> {r.status_code} {r.text[:300]}")
         raise StorageError(f"{method} {path} failed (HTTP {r.status_code})", r.status_code)
     return r
+
+
+def _sb(method, path, params=None, json_body=None, prefer=None, ok_statuses=()):
+    """One place for every Supabase table call -- and the place that enforces tenant isolation.
+
+    The server uses the service-role key, which bypasses Row Level Security, so isolation has to be
+    enforced here: every read / update / delete is forced to `user_id = <signed-in user>`, every written
+    row is stamped with that user id (overriding anything the caller passed), and a table that is not on
+    the allow-list is refused outright. Call sites cannot forget the filter because they never write it.
+
+    Raises StorageError on network errors and on any non-2xx/3xx status (except those in ok_statuses)."""
+    table = path.split("?", 1)[0].strip("/").split("/", 1)[0]
+    if table not in _USER_TABLES:
+        raise StorageError(f"refusing to touch unscoped table {table!r}")
+    uid = _scope_uid()
+    params = dict(params or {})
+    if method.upper() != "POST":  # reads / updates / deletes are filtered; inserts are stamped (below)
+        params["user_id"] = f"eq.{uid}"
+    if isinstance(json_body, list):
+        json_body = [dict(row, user_id=uid) for row in json_body]
+    elif isinstance(json_body, dict):
+        json_body = dict(json_body, user_id=uid)
+    elif json_body is not None:
+        raise StorageError("unexpected request body")
+    return _sb_raw(method, path, params=params, json_body=json_body, prefer=prefer, ok_statuses=ok_statuses)
+
+
+# Database functions the app may call. Each takes the user id as p_user_id and only ever totals that user's rows.
+_RPC_FUNCS = frozenset({"bucket_balances"})
+
+
+def _sb_rpc(name):
+    """Call one of the allow-listed per-user database functions for the SIGNED-IN user. The user id is
+    always injected here; callers cannot pass (or override) it."""
+    if name not in _RPC_FUNCS:
+        raise StorageError(f"refusing to call unknown function {name!r}")
+    return _sb_raw("POST", f"rpc/{name}", json_body={"p_user_id": _scope_uid()})
 
 
 def _rows(r):
@@ -522,7 +606,7 @@ def add_transaction(tx_type, amount, category, note, payment_method=None) -> int
 
     tx_id = _mem_id_counter
     _mem_id_counter += 1
-    _mem_transactions.append({
+    _mem()["tx"].append({
         "id": tx_id,
         "type": tx_type,
         "amount": amount_dec,
@@ -563,7 +647,7 @@ def add_transfer(amount, from_bucket, to_bucket, note, person=None, pool=None, l
 
     tx_id = _mem_id_counter
     _mem_id_counter += 1
-    _mem_transactions.append({
+    _mem()["tx"].append({
         "id": tx_id,
         "type": "transfer",
         "amount": amount_dec,
@@ -632,7 +716,7 @@ def _all_transactions(order="id.desc", limit=None, since=None, tx_type=None):
             last_id = chunk[-1]["id"]
         return out
 
-    rows = list(_mem_transactions)
+    rows = list(_mem()["tx"])
     if tx_type:
         rows = [r for r in rows if r["type"] == tx_type]
     if since:
@@ -651,7 +735,7 @@ def get_transaction(tx_id):
     if _use_sb():
         rows = _rows(_sb("GET", "transactions", params={"select": "*", "id": f"eq.{tx_id}"}))
         return rows[0] if rows else None
-    for r in _mem_transactions:
+    for r in _mem()["tx"]:
         if r["id"] == tx_id:
             return r
     return None
@@ -684,10 +768,10 @@ def delete_transaction(tx_id) -> bool:
             prefer="return=representation",
         )
         return len(_rows(r)) > 0
-    global _mem_transactions
-    before = len(_mem_transactions)
-    _mem_transactions = [r for r in _mem_transactions if r["id"] != tx_id]
-    return len(_mem_transactions) < before
+    st = _mem()
+    before = len(st["tx"])
+    st["tx"] = [r for r in st["tx"] if r["id"] != tx_id]
+    return len(st["tx"]) < before
 
 
 def _group_rows(anchor_row):
@@ -700,7 +784,7 @@ def _group_rows(anchor_row):
                          params={"select": "*", "linked_tx_id": f"eq.{link_id}", "order": "id.asc"}))
         found = head + kids
     else:
-        found = [r for r in _mem_transactions if r["id"] == link_id or r.get("linked_tx_id") == link_id]
+        found = [r for r in _mem()["tx"] if r["id"] == link_id or r.get("linked_tx_id") == link_id]
     seen, group = set(), []
     for r in found:
         if r["id"] not in seen:
@@ -720,8 +804,8 @@ def delete_pool_contributions_linked(tx_ids) -> None:
         _sb("DELETE", "pool_contributions",
             params={"linked_tx_id": "in.(" + ",".join(str(i) for i in ids) + ")"})
         return
-    global _mem_pool_contributions
-    _mem_pool_contributions = [c for c in _mem_pool_contributions if c.get("linked_tx_id") not in ids]
+    st = _mem()
+    st["pc"] = [c for c in st["pc"] if c.get("linked_tx_id") not in ids]
 
 
 def delete_transaction_group(anchor_row):
@@ -762,7 +846,8 @@ def _last_pool_row(table):
             params["linked_tx_id"] = "is.null"
         rows = _rows(_sb("GET", table, params=params))
         return rows[0] if rows else None
-    src = _mem_pool_contributions if table == "pool_contributions" else _mem_pool_expenses
+    st = _mem()
+    src = st["pc"] if table == "pool_contributions" else st["pe"]
     cand = [r for r in src if not (table == "pool_contributions" and r.get("linked_tx_id"))]
     return max(cand, key=_ts) if cand else None
 
@@ -801,20 +886,20 @@ def delete_pool_contribution(row_id) -> bool:
     if _use_sb():
         r = _sb("DELETE", "pool_contributions", params={"id": f"eq.{row_id}"}, prefer="return=representation")
         return len(_rows(r)) > 0
-    global _mem_pool_contributions
-    before = len(_mem_pool_contributions)
-    _mem_pool_contributions = [c for c in _mem_pool_contributions if c.get("id") != row_id]
-    return len(_mem_pool_contributions) < before
+    st = _mem()
+    before = len(st["pc"])
+    st["pc"] = [c for c in st["pc"] if c.get("id") != row_id]
+    return len(st["pc"]) < before
 
 
 def delete_pool_expense(row_id) -> bool:
     if _use_sb():
         r = _sb("DELETE", "pool_expenses", params={"id": f"eq.{row_id}"}, prefer="return=representation")
         return len(_rows(r)) > 0
-    global _mem_pool_expenses
-    before = len(_mem_pool_expenses)
-    _mem_pool_expenses = [e for e in _mem_pool_expenses if e.get("id") != row_id]
-    return len(_mem_pool_expenses) < before
+    st = _mem()
+    before = len(st["pe"])
+    st["pe"] = [e for e in st["pe"] if e.get("id") != row_id]
+    return len(st["pe"]) < before
 
 
 BALANCE_BUCKETS = PAYMENT_METHODS
@@ -837,7 +922,7 @@ def get_starting_balances() -> dict:
                 except InvalidOperation:
                     result[method] = Decimal("0.00")
         return result
-    result.update(_mem_starting_balances)
+    result.update(_mem()["start"])
     return result
 
 
@@ -867,25 +952,26 @@ def set_starting_balance(method: str, amount) -> None:
     start_bal = target_dec - net_tx
     if _use_sb():
         _sb("POST", "settings",
-            params={"on_conflict": "key"},
+            params={"on_conflict": "user_id,key"},
             json_body={"key": _settings_key(method), "value": str(start_bal)},
             prefer="resolution=merge-duplicates,return=minimal")
         return
-    _mem_starting_balances[method] = start_bal
+    _mem()["start"][method] = start_bal
 
 
 _RPC = {"ok": None}  # None = not tried yet, False = function not installed (use the slow path)
 
 
 def _rpc_bucket_balances():
+    """Per-user bucket totals from the database (the user id is injected by _sb_rpc, never by the caller)."""
     if not _use_sb() or _RPC["ok"] is False:
         return None
     try:
-        rows = _rows(_sb("POST", "rpc/bucket_balances", json_body={}))
+        rows = _rows(_sb_rpc("bucket_balances"))
     except StorageError as e:
         if e.status in (400, 404):
             _RPC["ok"] = False
-            print("[balances] rpc/bucket_balances not installed - run 003_safety_and_speed.sql for faster balances")
+            print("[balances] rpc/bucket_balances not installed - run 004_safety_and_speed.sql for faster balances")
             return None
         raise
     _RPC["ok"] = True
@@ -897,7 +983,7 @@ def get_balances_by_method() -> dict:
     Transfers move money between two buckets with zero net effect on the total; income/expense
     move it into or out of exactly one bucket, same as before."""
     result = get_starting_balances()
-    totals = _rpc_bucket_balances()  # one round trip instead of downloading every row (migration 003)
+    totals = _rpc_bucket_balances()  # one round trip instead of downloading every row (migration 004)
     if totals is not None:
         for bucket, amt in totals.items():
             result[bucket] = result.get(bucket, Decimal("0.00")) + amt
@@ -954,7 +1040,7 @@ def get_today_expense() -> Decimal:
 def _since(period):
     now_utc = datetime.now(timezone.utc)
     if period == "today":
-        now_ist = now_utc.astimezone(IST)
+        now_ist = now_utc.astimezone(_user_tz())
         start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
         start_utc = start_ist.astimezone(timezone.utc)
         return start_utc.isoformat()
@@ -998,12 +1084,17 @@ def get_stats(period="month"):
     }
 
 
+def _strip_uid(rows):
+    return [{k: v for k, v in r.items() if k != "user_id"} for r in rows]
+
+
 def all_data_dump():
+    """The signed-in user's own data, without the internal user_id column."""
     return {
-        "transactions": _all_transactions(order="id.asc"),
+        "transactions": _strip_uid(_all_transactions(order="id.asc")),
         "starting_balances": get_starting_balances(),
-        "pool_contributions": get_pool_contributions(),
-        "pool_expenses": get_pool_expenses(),
+        "pool_contributions": _strip_uid(get_pool_contributions()),
+        "pool_expenses": _strip_uid(get_pool_expenses()),
     }
 
 
@@ -1026,27 +1117,27 @@ def get_all_aliases() -> dict:
             }
             for row in rows
         }
-    return {k: v for k, v in _mem_aliases.items() if v.get("confirmed")}
+    return {k: v for k, v in _mem()["aliases"].items() if v.get("confirmed")}
 
 
 def _get_alias_row(note_key):
     if _use_sb():
         rows = _rows(_sb("GET", "aliases", params={"select": "*", "note_key": f"eq.{note_key}"}))
         return rows[0] if rows else None
-    return _mem_aliases.get(note_key)
+    return _mem()["aliases"].get(note_key)
 
 
 def _put_alias(note_key, tx_type, category, payment_method, confirmed, count):
     if _use_sb():
         _sb("POST", "aliases",
-            params={"on_conflict": "note_key"},
+            params={"on_conflict": "user_id,note_key"},
             json_body={
                 "note_key": note_key, "type": tx_type, "category": category,
                 "payment_method": payment_method, "confirmed": confirmed, "candidate_count": count,
             },
             prefer="resolution=merge-duplicates,return=minimal")
         return
-    _mem_aliases[note_key] = {
+    _mem()["aliases"][note_key] = {
         "type": tx_type, "category": category, "payment_method": payment_method,
         "confirmed": confirmed, "candidate_count": count,
     }
@@ -1121,7 +1212,7 @@ def add_pool_contribution(pool_name, person, amount, note=None, linked_tx_id=Non
         return row_id
     row_id = _mem_pool_id_counter
     _mem_pool_id_counter += 1
-    _mem_pool_contributions.append({
+    _mem()["pc"].append({
         "id": row_id, "pool": pool_name, "person": person, "amount": amount_dec, "note": note,
         "linked_tx_id": linked_tx_id, "created_at": datetime.now(timezone.utc).isoformat(),
     })
@@ -1139,7 +1230,7 @@ def add_pool_expense(pool_name, amount, category, note=None) -> int:
         return row_id
     row_id = _mem_pool_id_counter
     _mem_pool_id_counter += 1
-    _mem_pool_expenses.append({
+    _mem()["pe"].append({
         "id": row_id, "pool": pool_name, "amount": amount_dec, "category": category, "note": note,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
@@ -1152,7 +1243,7 @@ def get_pool_contributions(pool_name=None):
         if pool_name:
             params["pool"] = f"eq.{pool_name}"
         return _rows(_sb("GET", "pool_contributions", params=params))
-    rows = _mem_pool_contributions
+    rows = _mem()["pc"]
     return [r for r in rows if r["pool"] == pool_name] if pool_name else list(rows)
 
 
@@ -1162,7 +1253,7 @@ def get_pool_expenses(pool_name=None):
         if pool_name:
             params["pool"] = f"eq.{pool_name}"
         return _rows(_sb("GET", "pool_expenses", params=params))
-    rows = _mem_pool_expenses
+    rows = _mem()["pe"]
     return [r for r in rows if r["pool"] == pool_name] if pool_name else list(rows)
 
 
@@ -1194,25 +1285,19 @@ def list_known_pools():
     return sorted(names)
 
 
-def reset_all_data() -> None:
-    """Really wipes the ledger (Supabase tables too when configured)."""
-    global _mem_id_counter, _mem_pool_id_counter
+def reset_all_data(include_settings: bool = False) -> None:
+    """Wipes the SIGNED-IN USER'S ledger only: every _sb() call below is scoped to them, so other
+    accounts are untouched. include_settings=True also removes non-balance settings (account deletion)."""
     if _use_sb():
         _sb("DELETE", "transactions", params={"id": "gt.0"})
         _sb("DELETE", "pool_contributions", params={"id": "gt.0"})
         _sb("DELETE", "pool_expenses", params={"id": "gt.0"})
         _sb("DELETE", "aliases", params={"note_key": "neq.__none__"})
-        _sb("DELETE", "settings", params={"key": "like.starting_balance:*"})
+        _sb("DELETE", "settings",
+            params={"key": "neq.__none__" if include_settings else "like.starting_balance:*"})
         _sb("DELETE", "chat_log", params={"id": "gt.0"})
         return
-    _mem_transactions.clear()
-    _mem_pool_contributions.clear()
-    _mem_pool_expenses.clear()
-    _mem_aliases.clear()
-    for b in PAYMENT_METHODS:
-        _mem_starting_balances[b] = Decimal("0.00")
-    _mem_id_counter = 1
-    _mem_pool_id_counter = 1
+    _MEM.pop(_scope_uid(), None)
 
 
 # ------------------------------------------------------------------ nlp layer
@@ -1914,41 +1999,58 @@ def transcribe_voice(audio_bytes, filename="voice.ogg"):
 
 
 def log_chat_message(role: str, content: str) -> None:
-    """Insert one chat turn into chat_log. Non-fatal: logs on error rather than crashing."""
-    if not (SUPABASE_URL and SUPABASE_KEY):
+    """Insert one chat turn into the signed-in user's chat_log. Non-fatal: logs on error rather than crashing."""
+    if not _use_sb():
         return
     if role == "assistant" and not content.lstrip().startswith("<"):
         content = _esc(content)  # plain-text replies echo user input; the page re-renders history as HTML
     try:
-        resp = requests.post(
-            _sb_url("chat_log"),
-            headers={**SB_HEADERS, "Prefer": "return=minimal"},
-            json={"role": role, "content": content},
-            timeout=SB_TIMEOUT,
-        )
-        if resp.status_code >= 300:
-            print(f"[chat_log] insert failed: {resp.status_code} {resp.text}")
-    except Exception as e:
-        print(f"[chat_log] insert exception: {e}")
+        _sb("POST", "chat_log", json_body={"role": role, "content": content}, prefer="return=minimal")
+    except StorageError as e:
+        print(f"[chat_log] insert failed: {e}")
 
 
 def get_chat_history(limit: int = 50) -> list:
-    """Return chat_log rows oldest-first, ready for chat-display order."""
-    if not (SUPABASE_URL and SUPABASE_KEY):
+    """Return the signed-in user's chat_log rows oldest-first, ready for chat-display order."""
+    if not _use_sb():
         return []
     try:
-        resp = requests.get(
-            _sb_url("chat_log"),
-            headers=SB_HEADERS,
-            params={"select": "*", "order": "created_at.desc", "limit": limit},
-            timeout=SB_TIMEOUT,
-        )
-        resp.raise_for_status()
-        rows = resp.json()
+        rows = _rows(_sb("GET", "chat_log", params={
+            "select": "id,role,content,created_at", "order": "created_at.desc", "limit": limit}))
         return list(reversed(rows))  # oldest first for display
-    except Exception as e:
-        print(f"[chat_log] read exception: {e}")
+    except StorageError as e:
+        print(f"[chat_log] read failed: {e}")
         return []
+
+
+def _content_range_total(r) -> int:
+    total = (r.headers.get("Content-Range") or "").rsplit("/", 1)[-1]
+    return int(total) if total.isdigit() else 0
+
+
+def _rate_limited():
+    """An error message if the signed-in user is over their message caps, else None. Counts rows in
+    chat_log (which already records every user message), so the cap holds across serverless instances.
+    One query: the newest N timestamps for the per-minute check, plus an exact 24h count for the daily one."""
+    if not _use_sb() or (RATE_LIMIT_PER_MIN <= 0 and RATE_LIMIT_PER_DAY <= 0):
+        return None
+    now = datetime.now(timezone.utc)
+    r = _sb("GET", "chat_log",
+            params={"select": "created_at", "role": "eq.user",
+                    "created_at": f"gte.{(now - timedelta(days=1)).isoformat()}",
+                    "order": "created_at.desc", "limit": max(RATE_LIMIT_PER_MIN, 1)},
+            prefer="count=exact")
+    rows = _rows(r)
+    if RATE_LIMIT_PER_DAY > 0 and _content_range_total(r) >= RATE_LIMIT_PER_DAY:
+        return "Daily message limit reached. Try again tomorrow."
+    if RATE_LIMIT_PER_MIN > 0 and len(rows) >= RATE_LIMIT_PER_MIN:
+        try:
+            oldest = datetime.fromisoformat(str(rows[-1]["created_at"]).replace("Z", "+00:00"))
+            if now - oldest < timedelta(seconds=60):
+                return "Slow down a little - too many messages in one minute."
+        except (ValueError, KeyError):
+            pass
+    return None
 
 
 # --------------------------------------------------------------------- HTML / Web Formatters
@@ -2151,80 +2253,464 @@ def _unwrap(res):
     return res, 200
 
 
-# ---------------------------------------------------------------------- Demo login (cookie session)
+# ---------------------------------------------------------------------- Authentication (Supabase Auth)
+#
+# Identity is Supabase Auth (email + password). The backend proxies the sign-in so the browser only ever
+# holds two HttpOnly cookies: the access token (short-lived JWT) and the refresh token. Every /api/* call
+# validates the access token with Supabase (cached for a few seconds), silently refreshes it when it has
+# expired, and then pins g.uid -- the only identity _sb() will ever scope a query to.
 
-_OPEN_API_PATHS = {"/api/login", "/api/logout", "/api/session"}
+ACCESS_COOKIE = "fl_at"
+REFRESH_COOKIE = "fl_rt"
+_COOKIE_PATH = "/api/"
+_COOKIE_SECURE = bool(os.getenv("VERCEL"))  # https on Vercel; plain http works locally
+_REFRESH_MAX_AGE = 60 * 60 * 24 * 30
+
+_PUBLIC_API = frozenset({"/api/config", "/api/login", "/api/signup", "/api/logout", "/api/session",
+                         "/api/forgot", "/api/reset-password"})
+_EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]+\.[^@\s]+$")
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+# Dev-mode (no Supabase) account store. See _dev_auth().
+_DEV_USERS = {}   # email -> {"id", "salt", "hash", "meta"}
+_DEV_TOKENS = {}  # token -> ("access" | "refresh", email, session id)
 
 
-def _is_logged_in() -> bool:
-    return bool(DEMO_USERNAME) and session.get("user") == DEMO_USERNAME
+def _dev_hash(password: str, salt: bytes) -> str:
+    return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2 ** 14, r=8, p=1).hex()
 
 
-_LOGIN_FAILS = {}  # ip -> (failures, window_start). Best effort: one dict per serverless instance.
-_LOGIN_MAX, _LOGIN_WINDOW = 8, 600
+def _dev_user(email):
+    u = _DEV_USERS[email]
+    return {"id": u["id"], "email": email, "user_metadata": dict(u["meta"])}
 
 
-def _client_ip() -> str:
-    fwd = request.headers.get("X-Forwarded-For", "")
-    return fwd.split(",")[0].strip() or request.remote_addr or "?"
+def _dev_session(email, sid=None):
+    sid = sid or uuid.uuid4().hex  # a refresh keeps the session id, like GoTrue
+    at, rt = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+    _DEV_TOKENS[at] = ("access", email, sid)
+    _DEV_TOKENS[rt] = ("refresh", email, sid)
+    return {"access_token": at, "refresh_token": rt, "token_type": "bearer", "expires_in": 3600,
+            "user": _dev_user(email)}
+
+
+def _gotrue(method, path, token=None, params=None, json_body=None, admin=False):
+    """Call Supabase Auth. Returns (status, json_dict). 5xx / network / missing config -> AuthServiceError."""
+    key = SUPABASE_KEY if admin else SUPABASE_ANON_KEY
+    if not (SUPABASE_URL and key):
+        print("[auth] SUPABASE_URL / SUPABASE_ANON_KEY (and SUPABASE_SERVICE_KEY for account deletion) must be set")
+        raise AuthServiceError("authentication is not configured")
+    headers = {"apikey": key, "Authorization": f"Bearer {token or key}", "Content-Type": "application/json"}
+    try:
+        r = requests.request(method, f"{SUPABASE_URL}/auth/v1/{path}", headers=headers, params=params,
+                             json=json_body, timeout=SB_TIMEOUT)
+    except requests.RequestException as e:
+        print(f"[auth] {method} {path} network error: {e}")
+        raise AuthServiceError(f"{method} {path}: {type(e).__name__}") from e
+    try:
+        data = r.json() if r.content else {}
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if r.status_code >= 500:
+        print(f"[auth] {method} {path} -> {r.status_code}")
+        raise AuthServiceError(f"{method} {path} failed (HTTP {r.status_code})")
+    return r.status_code, data
+
+
+def _err_code(d) -> str:
+    return str(d.get("error_code") or d.get("error") or "")
+
+
+def _err_msg(d) -> str:
+    return str(d.get("msg") or d.get("error_description") or d.get("message") or "")
+
+
+# One function per Supabase Auth operation. Each has a real implementation and a dev-mode twin that
+# returns the same (status, json) shapes, so the route handlers below have a single code path.
+
+def _auth_signup(email, password, meta):
+    if _dev_auth():
+        if email in _DEV_USERS:
+            return 422, {"error_code": "user_already_exists", "msg": "User already registered"}
+        salt = os.urandom(16)
+        _DEV_USERS[email] = {"id": str(uuid.uuid4()), "salt": salt, "hash": _dev_hash(password, salt),
+                             "meta": dict(meta or {})}
+        return 200, _dev_session(email)
+    return _gotrue("POST", "signup", json_body={"email": email, "password": password, "data": meta or {}})
+
+
+def _auth_login(email, password):
+    if _dev_auth():
+        u = _DEV_USERS.get(email)
+        if u and hmac.compare_digest(u["hash"], _dev_hash(password, u["salt"])):
+            return 200, _dev_session(email)
+        return 400, {"error_code": "invalid_credentials", "msg": "Invalid login credentials"}
+    return _gotrue("POST", "token", params={"grant_type": "password"},
+                   json_body={"email": email, "password": password})
+
+
+def _auth_refresh(refresh_token):
+    if _dev_auth():
+        entry = _DEV_TOKENS.pop(refresh_token, None)
+        if entry and entry[0] == "refresh" and entry[1] in _DEV_USERS:
+            return 200, _dev_session(entry[1], entry[2])
+        return 400, {"error_code": "refresh_token_not_found", "msg": "Invalid Refresh Token"}
+    return _gotrue("POST", "token", params={"grant_type": "refresh_token"},
+                   json_body={"refresh_token": refresh_token})
+
+
+def _auth_user(access_token):
+    if _dev_auth():
+        entry = _DEV_TOKENS.get(access_token)
+        if entry and entry[0] == "access" and entry[1] in _DEV_USERS:
+            return 200, _dev_user(entry[1])
+        return 401, {"error_code": "bad_jwt", "msg": "invalid JWT"}
+    return _gotrue("GET", "user", token=access_token)
+
+
+def _auth_logout(access_token):
+    if _dev_auth():
+        entry = _DEV_TOKENS.get(access_token)
+        if entry:  # revoke this session only, like Supabase's default (scope=local)
+            for t in [t for t, e in _DEV_TOKENS.items() if e[2] == entry[2]]:
+                _DEV_TOKENS.pop(t, None)
+        return 204, {}
+    return _gotrue("POST", "logout", token=access_token)
+
+
+def _auth_recover(email, redirect_to):
+    if _dev_auth():
+        u = _DEV_USERS.get(email)
+        if u:
+            at = _dev_session(email)["access_token"]
+            print(f"[dev] password reset link for {email}: {redirect_to}#access_token={at}&type=recovery")
+        return 200, {}
+    return _gotrue("POST", "recover", params={"redirect_to": redirect_to}, json_body={"email": email})
+
+
+def _auth_update(access_token, body):
+    if _dev_auth():
+        entry = _DEV_TOKENS.get(access_token)
+        if not (entry and entry[0] == "access" and entry[1] in _DEV_USERS):
+            return 401, {"error_code": "bad_jwt", "msg": "invalid JWT"}
+        u = _DEV_USERS[entry[1]]
+        if "password" in body:
+            u["salt"] = os.urandom(16)
+            u["hash"] = _dev_hash(body["password"], u["salt"])
+        if isinstance(body.get("data"), dict):
+            u["meta"].update(body["data"])
+        return 200, _dev_user(entry[1])
+    return _gotrue("PUT", "user", token=access_token, json_body=body)
+
+
+def _auth_admin_delete(uid):
+    if not _UUID_RE.match(uid):
+        return 400, {}
+    if _dev_auth():
+        for email in [e for e, u in _DEV_USERS.items() if u["id"] == uid]:
+            _DEV_USERS.pop(email, None)
+            for t in [t for t, e in _DEV_TOKENS.items() if e[1] == email]:
+                _DEV_TOKENS.pop(t, None)
+        return 200, {}
+    return _gotrue("DELETE", f"admin/users/{uid}", admin=True)
+
+
+def _principal(user):
+    """The identity we trust for a request, built from Supabase's own answer (never from the client)."""
+    if not isinstance(user, dict):
+        return None
+    uid = str(user.get("id") or "").lower()
+    if not _UUID_RE.match(uid):
+        return None
+    meta = user.get("user_metadata")
+    tz = meta.get("timezone") if isinstance(meta, dict) else None
+    return {"id": uid, "email": str(user.get("email") or ""), "tz": tz if _valid_tz(tz) else None}
+
+
+# Verified-token cache: skips a Supabase round-trip for the burst of calls the page makes on load. Short
+# on purpose -- it is also how long a signed-out token could keep working on a warm instance.
+_TOKEN_CACHE = {}
+_TOKEN_CACHE_TTL = 20.0
+_TOKEN_CACHE_MAX = 512
+
+
+def _token_key(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _cache_principal(token, principal):
+    if len(_TOKEN_CACHE) >= _TOKEN_CACHE_MAX:
+        _TOKEN_CACHE.clear()
+    _TOKEN_CACHE[_token_key(token)] = (time.monotonic() + _TOKEN_CACHE_TTL, principal)
+
+
+def _verify_access_token(token):
+    hit = _TOKEN_CACHE.get(_token_key(token))
+    if hit and hit[0] > time.monotonic():
+        return hit[1]
+    status, data = _auth_user(token)
+    if status == 200:
+        p = _principal(data)
+        if p:
+            _cache_principal(token, p)
+        return p
+    if status in (400, 401, 403, 404):
+        return None  # expired / forged / revoked
+    raise AuthServiceError(f"token check failed (HTTP {status})")
+
+
+def _authenticate():
+    """The signed-in principal for this request, or None. Transparently swaps an expired access token for
+    a fresh pair via the refresh token (the new pair is written to cookies by _after_request)."""
+    at = request.cookies.get(ACCESS_COOKIE)
+    rt = request.cookies.get(REFRESH_COOKIE)
+    if at:
+        p = _verify_access_token(at)
+        if p:
+            return p
+    if rt:
+        status, data = _auth_refresh(rt)
+        if status == 200 and data.get("access_token") and data.get("refresh_token"):
+            p = _principal(data.get("user"))
+            if p:
+                g.new_session = data
+                _cache_principal(data["access_token"], p)
+                return p
+        if status in (200, 400, 401, 403, 422):
+            g.clear_cookies = True  # the refresh token is dead; drop the stale cookies
+            return None
+        raise AuthServiceError(f"refresh failed (HTTP {status})")
+    if at:
+        g.clear_cookies = True
+    return None
+
+
+def _set_auth_cookies(resp, sess):
+    common = dict(httponly=True, secure=_COOKIE_SECURE, samesite="Lax", path=_COOKIE_PATH)
+    resp.set_cookie(ACCESS_COOKIE, sess["access_token"], max_age=int(sess.get("expires_in") or 3600), **common)
+    resp.set_cookie(REFRESH_COOKIE, sess["refresh_token"], max_age=_REFRESH_MAX_AGE, **common)
+
+
+def _clear_auth_cookies(resp):
+    for name in (ACCESS_COOKIE, REFRESH_COOKIE):
+        resp.delete_cookie(name, path=_COOKIE_PATH, httponly=True, secure=_COOKIE_SECURE, samesite="Lax")
 
 
 @app.before_request
-def _require_login():
-    """Every /api/* route except login/logout/session needs a valid signed session cookie."""
+def _gate():
+    """Every /api/* route except the public auth ones needs a valid signed-in user; the identity is
+    pinned to g.uid here and nowhere else. Cross-site state-changing requests are refused outright."""
     path = request.path
-    if request.method == "OPTIONS" or not path.startswith("/api/") or path in _OPEN_API_PATHS:
+    if not path.startswith("/api/") or request.method == "OPTIONS":
         return None
-    if _is_logged_in():
+    if request.method not in ("GET", "HEAD"):
+        origin = request.headers.get("Origin")
+        if origin and urlparse(origin).netloc != request.host:
+            return jsonify({"ok": False, "text": "Cross-site request blocked."}), 403
+    if path in _PUBLIC_API:
         return None
-    return jsonify({"ok": False, "auth": False, "text": "Please sign in first."}), 401
+    p = _authenticate()
+    if not p:
+        return jsonify({"ok": False, "auth": False, "text": "Please sign in first."}), 401
+    g.uid, g.email, g.tz = p["id"], p["email"], p["tz"]
+    return None
 
 
-def _no_store(resp):
-    resp.headers["Cache-Control"] = "no-store"
+@app.after_request
+def _after_request(resp):
+    if request.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-store"  # per-user data must never be cached or shared
+        sess = getattr(g, "new_session", None)
+        if sess:
+            _set_auth_cookies(resp, sess)
+        elif getattr(g, "clear_cookies", False):
+            _clear_auth_cookies(resp)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "same-origin")
     return resp
+
+
+def _norm_email(value) -> str:
+    return str(value or "").strip().lower()[:254]
+
+
+def _pw_problem(password: str, email: str = ""):
+    if len(password) < 8:
+        return "Password must be at least 8 characters."
+    if len(password.encode("utf-8")) > 72:
+        return "Password is too long (72 bytes max)."
+    if email and password.lower() == email:
+        return "Password can't be the same as your email."
+    return None
+
+
+def _remember_tz(access_token, principal, tz):
+    """Keep the account's timezone in step with the browser's (drives 'today' and displayed times)."""
+    if _valid_tz(tz) and tz != principal.get("tz"):
+        try:
+            _auth_update(access_token, {"data": {"timezone": tz}})
+        except AuthServiceError:
+            pass  # cosmetic; never block a sign-in over it
+
+
+@app.route("/api/config", methods=["GET"])
+def api_config():
+    return jsonify({"ok": True, "signups_open": SIGNUPS_OPEN, "needs_code": bool(SIGNUP_CODE)})
+
+
+@app.route("/api/signup", methods=["POST"])
+def api_signup():
+    if not SIGNUPS_OPEN:
+        return jsonify({"ok": False, "text": "Sign-ups are closed."}), 403
+    data = _json_body()
+    if SIGNUP_CODE and not hmac.compare_digest(str(data.get("code") or "").strip().encode("utf-8"),
+                                               SIGNUP_CODE.encode("utf-8")):
+        return jsonify({"ok": False, "text": "That invite code isn't valid."}), 403
+    email = _norm_email(data.get("email"))
+    password = str(data.get("password") or "")
+    if not _EMAIL_RE.match(email):
+        return jsonify({"ok": False, "text": "Enter a valid email address."}), 400
+    problem = _pw_problem(password, email)
+    if problem:
+        return jsonify({"ok": False, "text": problem}), 400
+    tz = data.get("tz")
+    status, d = _auth_signup(email, password, {"timezone": tz} if _valid_tz(tz) else {})
+    if status == 200:
+        if d.get("access_token") and d.get("refresh_token"):  # email confirmation is off: signed in straight away
+            if not _principal(d.get("user")):
+                raise AuthServiceError("signup returned no usable user")
+            g.new_session = d
+            return jsonify({"ok": True, "signed_in": True})
+        # Confirmation is on. Also what an already-registered address gets, so we never reveal who has an account.
+        return jsonify({"ok": True, "signed_in": False,
+                        "text": "Almost there - check your inbox to confirm your email, then sign in."})
+    code = _err_code(d)
+    if code in ("user_already_exists", "email_exists"):
+        return jsonify({"ok": False, "text": "An account with that email already exists. Sign in instead."}), 409
+    if code == "weak_password":
+        return jsonify({"ok": False, "text": _err_msg(d) or "That password is too weak."}), 400
+    if code == "signup_disabled":
+        return jsonify({"ok": False, "text": "Sign-ups are disabled for this project."}), 403
+    if status == 429 or code.startswith("over_"):
+        return jsonify({"ok": False, "text": "Too many attempts. Wait a bit and try again."}), 429
+    if status in (400, 422):
+        return jsonify({"ok": False, "text": _err_msg(d) or "Could not create the account."}), 400
+    raise AuthServiceError(f"signup failed (HTTP {status})")
 
 
 @app.route("/api/login", methods=["POST"])
 def api_login():
-    if not (DEMO_USERNAME and DEMO_PASSWORD):
-        return _no_store(jsonify({"ok": False, "text": "Login is not configured on the server "
-                                  "(set DEMO_USERNAME and DEMO_PASSWORD)."})), 503
-    ip, now = _client_ip(), time.time()
-    fails, started = _LOGIN_FAILS.get(ip, (0, now))
-    if now - started > _LOGIN_WINDOW:
-        fails, started = 0, now
-    if fails >= _LOGIN_MAX:
-        return _no_store(jsonify({"ok": False, "text": "Too many attempts. Try again in a few minutes."})), 429
     data = _json_body()
-    username = str(data.get("username") or "").strip()
+    email = _norm_email(data.get("email"))
     password = str(data.get("password") or "")
-    # case-insensitive username (phones auto-capitalise), exact password, constant-time compares
-    user_ok = hmac.compare_digest(username.lower().encode("utf-8"), DEMO_USERNAME.lower().encode("utf-8"))
-    pass_ok = hmac.compare_digest(password.encode("utf-8"), DEMO_PASSWORD.encode("utf-8"))
-    if user_ok and pass_ok:
-        _LOGIN_FAILS.pop(ip, None)
-        session.clear()
-        session["user"] = DEMO_USERNAME
-        session.permanent = True
-        return _no_store(jsonify({"ok": True, "username": DEMO_USERNAME}))
-    if len(_LOGIN_FAILS) > 1000:
-        _LOGIN_FAILS.clear()
-    _LOGIN_FAILS[ip] = (fails + 1, started)
-    time.sleep(0.4)  # blunt the guessing speed a little
-    return _no_store(jsonify({"ok": False, "text": "Wrong username or password."})), 401
+    if not email or not password:
+        return jsonify({"ok": False, "text": "Enter your email and password."}), 400
+    status, d = _auth_login(email, password)
+    if status == 200 and d.get("access_token") and d.get("refresh_token"):
+        p = _principal(d.get("user"))
+        if not p:
+            raise AuthServiceError("login returned no usable user")
+        _remember_tz(d["access_token"], p, data.get("tz"))
+        g.new_session = d
+        return jsonify({"ok": True, "email": p["email"]})
+    code = _err_code(d)
+    if status == 429 or code.startswith("over_"):
+        return jsonify({"ok": False, "text": "Too many attempts. Wait a minute and try again."}), 429
+    if code == "email_not_confirmed":
+        return jsonify({"ok": False, "text": "Confirm your email first - check your inbox for the link."}), 401
+    if status in (400, 401, 403, 422):
+        return jsonify({"ok": False, "text": "Wrong email or password."}), 401
+    raise AuthServiceError(f"login failed (HTTP {status})")
 
 
 @app.route("/api/logout", methods=["POST"])
 def api_logout():
-    session.clear()
-    return _no_store(jsonify({"ok": True}))
+    at = request.cookies.get(ACCESS_COOKIE)
+    if at:
+        _TOKEN_CACHE.pop(_token_key(at), None)
+        try:
+            _auth_logout(at)  # revokes the session server-side; the cookies are cleared either way
+        except AuthServiceError:
+            pass
+    g.clear_cookies = True
+    return jsonify({"ok": True})
 
 
 @app.route("/api/session", methods=["GET"])
 def api_session():
-    authed = _is_logged_in()
-    return _no_store(jsonify({"ok": True, "authenticated": authed, "username": DEMO_USERNAME if authed else None}))
+    p = _authenticate()
+    if not p:
+        return jsonify({"ok": True, "authenticated": False})
+    return jsonify({"ok": True, "authenticated": True, "email": p["email"], "username": p["email"]})
+
+
+@app.route("/api/forgot", methods=["POST"])
+def api_forgot():
+    data = _json_body()
+    email = _norm_email(data.get("email"))
+    if _EMAIL_RE.match(email):
+        redirect_to = (SITE_URL or request.host_url.rstrip("/")) + "/reset.html"
+        try:
+            _auth_recover(email, redirect_to)
+        except AuthServiceError:
+            pass  # logged; the answer below is identical either way
+    return jsonify({"ok": True, "text": "If that email has an account, a reset link is on its way."})
+
+
+@app.route("/api/reset-password", methods=["POST"])
+def api_reset_password():
+    data = _json_body()
+    token = str(data.get("access_token") or "")
+    password = str(data.get("password") or "")
+    if not token:
+        return jsonify({"ok": False, "text": "This reset link is invalid. Request a new one."}), 400
+    problem = _pw_problem(password)
+    if problem:
+        return jsonify({"ok": False, "text": problem}), 400
+    status, d = _auth_update(token, {"password": password})
+    if status == 200:
+        _TOKEN_CACHE.pop(_token_key(token), None)
+        return jsonify({"ok": True, "text": "Password updated. You can sign in now."})
+    code = _err_code(d)
+    if code in ("same_password", "weak_password"):
+        return jsonify({"ok": False, "text": _err_msg(d) or "Choose a different password."}), 400
+    if status in (401, 403):
+        return jsonify({"ok": False, "text": "This reset link has expired. Request a new one."}), 401
+    if status in (400, 422):
+        return jsonify({"ok": False, "text": _err_msg(d) or "Could not update the password."}), 400
+    raise AuthServiceError(f"password update failed (HTTP {status})")
+
+
+@app.route("/api/account/delete", methods=["POST"])
+def api_account_delete():
+    """Erases the signed-in user's data and then the account itself. Needs the password again."""
+    data = _json_body()
+    password = str(data.get("password") or "")
+    status, _d = _auth_login(g.email, password) if password else (400, {})
+    if status != 200:
+        return jsonify({"ok": False, "text": "Wrong password. Nothing was deleted."}), 403
+    reset_all_data(include_settings=True)  # explicit, so nothing is orphaned even if a foreign key were missing
+    status, _d = _auth_admin_delete(g.uid)
+    if status not in (200, 204, 404):
+        return jsonify({"ok": False, "text": "Your data was erased but the account itself could not be removed. "
+                                              "Try again in a moment."}), 502
+    _TOKEN_CACHE.clear()
+    g.clear_cookies = True
+    return jsonify({"ok": True, "text": "Account deleted."})
+
+
+@app.errorhandler(AuthError)
+def _handle_auth_error(e):
+    return jsonify({"ok": False, "auth": False, "text": "Please sign in first."}), 401
+
+
+@app.errorhandler(AuthServiceError)
+def _handle_auth_service_error(e):
+    print(f"[auth] {e}")
+    return jsonify({"ok": False, "text": "Sign-in is temporarily unavailable. Try again in a moment."}), 503
 
 
 @app.errorhandler(StorageError)
@@ -2470,12 +2956,8 @@ def _process_text_core(text: str, allow_commands: bool = True):
 
         elif cmd == "/reset":
             if not args or args[0].lower() != "confirm":
-                reply_text = ("⚠ /reset permanently deletes ALL transactions, pools, aliases, starting balances "
-                              "and chat history. If you really mean it, send: /reset confirm")
-                return {"ok": True, "text": reply_text, **_balance_pair()}
-            if _use_sb() and not ALLOW_RESET:
-                reply_text = ("Reset is disabled on the live database. Set ALLOW_RESET=1 in the environment, "
-                              "redeploy, send /reset confirm, then remove it again.")
+                reply_text = ("⚠ /reset permanently deletes ALL of YOUR transactions, pools, aliases, starting "
+                              "balances and chat history. If you really mean it, send: /reset confirm")
                 return {"ok": True, "text": reply_text, **_balance_pair()}
             reset_all_data()
             reply_text = "All data reset (database and chat history wiped)." if _use_sb() else "All local data reset."
@@ -2716,6 +3198,10 @@ def api_message():
     if not text:
         return jsonify({"ok": False, "text": "Empty message."}), 400
 
+    limited = _rate_limited()
+    if limited:
+        return jsonify({"ok": False, "text": limited}), 429
+
     # Log user turn
     log_chat_message("user", text)
 
@@ -2733,7 +3219,8 @@ def api_action():
     raw_id = data.get("tx_id")
     if raw_id is not None:
         # strict: int(1.9) == 1 and int(True) == 1 used to silently target the WRONG row
-        ok_type = (isinstance(raw_id, int) and not isinstance(raw_id, bool)) or                   (isinstance(raw_id, str) and raw_id.strip().isdigit())
+        ok_type = (isinstance(raw_id, int) and not isinstance(raw_id, bool)) or \
+                  (isinstance(raw_id, str) and raw_id.strip().isdigit())
         if not ok_type or not (0 < int(raw_id) < 2 ** 62):
             return jsonify({"ok": False, "text": "Invalid transaction id."}), 400
         tx_id = int(raw_id)
@@ -2798,6 +3285,10 @@ def api_voice():
     audio_file = request.files.get("audio")
     if not audio_file:
         return jsonify({"ok": False, "text": "No audio provided."}), 400
+
+    limited = _rate_limited()
+    if limited:
+        return jsonify({"ok": False, "text": limited}), 429
 
     audio_bytes = audio_file.read()
     if not audio_bytes:
@@ -2921,6 +3412,10 @@ def api_history():
     return jsonify(get_chat_history(limit=limit))
 
 
+if DEV_MODE and not _dev_auth():
+    print("[warn] FOGLESS_DEV_MODE is ignored: Supabase is configured or this is Vercel.")
+
+
 if __name__ == "__main__":
-    # debug=True + 0.0.0.0 exposes the Werkzeug debugger (remote code execution) to the whole network
+    # Local use only. Never expose the Werkzeug debugger on a network interface.
     app.run(host="127.0.0.1", port=int(os.getenv("PORT", "5000")), debug=os.getenv("FLASK_DEBUG") == "1")

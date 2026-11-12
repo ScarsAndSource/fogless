@@ -1,213 +1,135 @@
--- Run this once in your Supabase project's SQL Editor (Dashboard -> SQL Editor -> New query)
+-- ============================================================================
+-- Fogless -- complete schema for a NEW Supabase project (multi-user).
+-- Run once: Dashboard -> SQL Editor -> New query.
+--
+-- Already running the single-user version? Do NOT run this. Run, in order:
+--   003_multiuser_1_prepare.sql -> (deploy + create your account) -> 003_multiuser_2_finalize.sql -> 004_safety_and_speed.sql
+--
+-- Every table is owned per user (user_id -> auth.users). The server uses the service-role key and scopes
+-- every query to the signed-in user; Row Level Security below is the safety net for anything that talks to
+-- the database with a user's own token, and it blocks the public anon key entirely.
+-- ============================================================================
 
 create table if not exists transactions (
-  id bigint generated always as identity primary key,
-  type text not null check (type in ('expense', 'income')),
-  amount numeric not null,
-  category text not null,
-  note text,
-  created_at timestamptz not null default now()
+  id             bigint generated always as identity primary key,
+  user_id        uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  type           text not null,
+  amount         numeric not null,
+  category       text,                       -- transfers have no spending category
+  note           text,
+  payment_method text,
+  from_bucket    text,
+  to_bucket      text,
+  person         text,
+  pool           text,
+  linked_tx_id   bigint,
+  created_at     timestamptz not null default now(),
+  constraint transactions_type_check check (type in ('expense', 'income', 'transfer')),
+  constraint transactions_amount_positive check (amount > 0)
+);
+
+create table if not exists aliases (
+  user_id         uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  note_key        text not null,
+  type            text not null check (type in ('expense', 'income')),
+  category        text not null,
+  payment_method  text,
+  confirmed       boolean not null default false,
+  candidate_count integer not null default 1,
+  created_at      timestamptz not null default now(),
+  primary key (user_id, note_key)
 );
 
 create table if not exists settings (
-  key text primary key,
-  value text
+  user_id uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  key     text not null,
+  value   text,
+  primary key (user_id, key)
 );
 
--- Migration: add payment_method column (skip if already applied)
-alter table transactions add column if not exists payment_method text;
-
-create table if not exists aliases (
-  note_key text primary key,
-  type text not null check (type in ('expense', 'income')),
-  category text not null,
-  payment_method text,
-  created_at timestamptz not null default now()
+create table if not exists pool_contributions (
+  id           bigint generated always as identity primary key,
+  user_id      uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  pool         text not null,
+  person       text not null,
+  amount       numeric not null,
+  note         text,
+  linked_tx_id bigint,
+  created_at   timestamptz not null default now(),
+  constraint pool_contributions_amount_positive check (amount > 0)
 );
-alter table aliases enable row level security;
 
-create table if not exists processed_updates (
-  update_id bigint primary key,
-  created_at timestamptz not null default now()
+create table if not exists pool_expenses (
+  id         bigint generated always as identity primary key,
+  user_id    uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  pool       text not null,
+  amount     numeric not null,
+  category   text not null,
+  note       text,
+  created_at timestamptz not null default now(),
+  constraint pool_expenses_amount_positive check (amount > 0)
 );
-alter table processed_updates enable row level security;
 
--- Row Level Security stays enabled with no policies, so only requests using the
--- service_role key (your bot's server-side key) can read/write. The public/anon
--- key -- which this bot never uses -- would be blocked entirely.
-alter table transactions enable row level security;
-alter table settings enable row level security;
-
--- ============================================================================
--- Migration: message -> transaction mapping.
--- Lets an EDITED Telegram message reconcile (replace) the transaction(s) it
--- originally logged, instead of the edit silently creating a duplicate
--- alongside the original. Keyed on (chat_id, message_id) since that's what
--- Telegram gives you on both the original message and its edited_message
--- update -- the update_id itself is different for each, which is exactly why
--- the update_id-based idempotency guard alone couldn't catch this case.
--- ============================================================================
-create table if not exists message_log (
-  chat_id bigint not null,
-  message_id bigint not null,
-  tx_ids bigint[] not null default '{}',
-  updated_at timestamptz not null default now(),
-  primary key (chat_id, message_id)
-);
-alter table message_log enable row level security;
-
--- ============================================================================
--- Migration: alias confidence tracking.
--- An auto-learned alias (from a single Groq guess on the first-ever mention
--- of a note phrase) used to become a permanent, silent default immediately.
--- Now it needs a second independent parse that agrees on the same category
--- before it's trusted enough to skip Groq ("confirmed"). A manual correction
--- via /alias or the inline buttons is still trusted on the first try, since
--- that's explicit human input, not a guess.
--- ============================================================================
-alter table aliases add column if not exists confirmed boolean not null default false;
-alter table aliases add column if not exists candidate_count integer not null default 1;
-
--- Backfill: aliases that already existed before this migration were already
--- being used as trusted fast-path matches in production -- grandfather them
--- in as confirmed rather than silently disabling every alias you'd already
--- taught the bot before today.
-update aliases set confirmed = true where confirmed = false;
-
--- ============================================================================
--- Migration: chat_log table.
--- Persists every user message and assistant reply so the web frontend can
--- restore full conversation history on page load via GET /api/history.
--- ============================================================================
 create table if not exists chat_log (
   id         bigint generated always as identity primary key,
+  user_id    uuid not null default auth.uid() references auth.users(id) on delete cascade,
   role       text not null check (role in ('user', 'assistant')),
   content    text not null,
   created_at timestamptz not null default now()
 );
-alter table chat_log enable row level security;
 
--- ============================================================================
--- Migration: Shared / Debt / Pool money support.
--- 1. Update transactions type constraint to allow 'transfer'
--- 2. Add transfer columns: from_bucket, to_bucket, person, pool, linked_tx_id
--- 3. Create pool_contributions and pool_expenses tables
--- ============================================================================
+-- indexes (the app always filters by user_id first)
+create index if not exists transactions_user_id_idx           on transactions (user_id, id);
+create index if not exists transactions_user_created_idx      on transactions (user_id, created_at);
+create index if not exists transactions_user_linked_idx       on transactions (user_id, linked_tx_id);
+create index if not exists transactions_user_type_created_idx on transactions (user_id, type, created_at);
+create index if not exists pool_contributions_user_pool_idx    on pool_contributions (user_id, pool);
+create index if not exists pool_contributions_user_linked_idx  on pool_contributions (user_id, linked_tx_id);
+create index if not exists pool_contributions_user_created_idx on pool_contributions (user_id, created_at);
+create index if not exists pool_expenses_user_pool_idx         on pool_expenses (user_id, pool);
+create index if not exists pool_expenses_user_created_idx      on pool_expenses (user_id, created_at);
+create index if not exists chat_log_user_created_idx           on chat_log (user_id, created_at desc);
 
--- Drop old check constraint on transactions.type if present and re-add to include 'transfer'
-alter table transactions drop constraint if exists transactions_type_check;
-alter table transactions add constraint transactions_type_check check (type in ('expense', 'income', 'transfer'));
-
-alter table transactions add column if not exists from_bucket text;
-alter table transactions add column if not exists to_bucket text;
-alter table transactions add column if not exists person text;
-alter table transactions add column if not exists pool text;
-alter table transactions add column if not exists linked_tx_id bigint;
-
-create table if not exists pool_contributions (
-  id bigint generated always as identity primary key,
-  pool text not null,
-  person text not null,
-  amount numeric not null,
-  note text,
-  created_at timestamptz not null default now()
-);
+-- Row Level Security: signed-in users see only their own rows; anon sees nothing.
+alter table transactions       enable row level security;
+alter table aliases            enable row level security;
+alter table settings           enable row level security;
 alter table pool_contributions enable row level security;
+alter table pool_expenses      enable row level security;
+alter table chat_log           enable row level security;
 
-create table if not exists pool_expenses (
-  id bigint generated always as identity primary key,
-  pool text not null,
-  amount numeric not null,
-  category text not null,
-  note text,
-  created_at timestamptz not null default now()
-);
-alter table pool_expenses enable row level security;
+drop policy if exists "own rows" on transactions;
+create policy "own rows" on transactions       for all to authenticated
+  using (user_id = (select auth.uid())) with check (user_id = (select auth.uid()));
+drop policy if exists "own rows" on aliases;
+create policy "own rows" on aliases            for all to authenticated
+  using (user_id = (select auth.uid())) with check (user_id = (select auth.uid()));
+drop policy if exists "own rows" on settings;
+create policy "own rows" on settings           for all to authenticated
+  using (user_id = (select auth.uid())) with check (user_id = (select auth.uid()));
+drop policy if exists "own rows" on pool_contributions;
+create policy "own rows" on pool_contributions for all to authenticated
+  using (user_id = (select auth.uid())) with check (user_id = (select auth.uid()));
+drop policy if exists "own rows" on pool_expenses;
+create policy "own rows" on pool_expenses      for all to authenticated
+  using (user_id = (select auth.uid())) with check (user_id = (select auth.uid()));
+drop policy if exists "own rows" on chat_log;
+create policy "own rows" on chat_log           for all to authenticated
+  using (user_id = (select auth.uid())) with check (user_id = (select auth.uid()));
 
--- ============================================================================
--- fogless migration 002 -- run ONCE in Supabase: Dashboard -> SQL Editor -> New query.
--- Idempotent: safe to run again, and safe even if an earlier migration never ran.
--- Do NOT deploy the new index.py before running this.
--- ============================================================================
-
--- 1. Transfers (split / lend / borrow / repay / pool) need 'transfer' as a valid type...
-alter table transactions drop constraint if exists transactions_type_check;
-alter table transactions add constraint transactions_type_check
-  check (type in ('expense', 'income', 'transfer'));
-
--- ...and their own columns (no-ops if you already have them)
-alter table transactions add column if not exists payment_method text;
-alter table transactions add column if not exists from_bucket text;
-alter table transactions add column if not exists to_bucket text;
-alter table transactions add column if not exists person text;
-alter table transactions add column if not exists pool text;
-alter table transactions add column if not exists linked_tx_id bigint;
-
--- 2. Belt and braces: transfers have no spending category, so never let NOT NULL reject them.
---    (The new code also writes category = 'transfer', so it works either way.)
-alter table transactions alter column category drop not null;
-
--- 3. Pool tables (no-ops if present)
-create table if not exists pool_contributions (
-  id bigint generated always as identity primary key,
-  pool text not null,
-  person text not null,
-  amount numeric not null,
-  note text,
-  created_at timestamptz not null default now()
-);
-create table if not exists pool_expenses (
-  id bigint generated always as identity primary key,
-  pool text not null,
-  amount numeric not null,
-  category text not null,
-  note text,
-  created_at timestamptz not null default now()
-);
-alter table pool_contributions enable row level security;
-alter table pool_expenses enable row level security;
-
--- A contribution made by "put N into X pool" remembers the transfer row it belongs to,
--- so /undo and /delete remove both together.
-alter table pool_contributions add column if not exists linked_tx_id bigint;
-
--- 4. Telegram idempotency + edit tracking (no-ops if present)
-create table if not exists processed_updates (
-  update_id bigint primary key,
-  created_at timestamptz not null default now()
-);
-alter table processed_updates enable row level security;
-
-create table if not exists message_log (
-  chat_id bigint not null,
-  message_id bigint not null,
-  tx_ids bigint[] not null default '{}',
-  updated_at timestamptz not null default now(),
-  primary key (chat_id, message_id)
-);
-alter table message_log enable row level security;
--- an edited message may have created pool rows too
-alter table message_log add column if not exists pool_contribution_ids bigint[] not null default '{}';
-alter table message_log add column if not exists pool_expense_ids bigint[] not null default '{}';
-
--- 5. Aliases: confidence columns (no-ops if present). Deliberately NO backfill here:
---    re-confirming every alias would defeat the "needs a second agreeing parse" rule.
-alter table aliases add column if not exists confirmed boolean not null default false;
-alter table aliases add column if not exists candidate_count integer not null default 1;
-
--- 6. Chat log (no-op if present)
-create table if not exists chat_log (
-  id         bigint generated always as identity primary key,
-  role       text not null check (role in ('user', 'assistant')),
-  content    text not null,
-  created_at timestamptz not null default now()
-);
-alter table chat_log enable row level security;
-
--- 7. Indexes for the lookups the new code does (group delete, ordered pagination)
-create index if not exists transactions_linked_tx_id_idx on transactions (linked_tx_id);
-create index if not exists pool_contributions_linked_tx_id_idx on pool_contributions (linked_tx_id);
-create index if not exists transactions_created_at_idx on transactions (created_at);
-
-
-
+-- Per-user balances in one query (the server passes the signed-in user's id; only service_role may call it).
+create or replace function bucket_balances(p_user_id uuid)
+returns table(bucket text, total numeric)
+language sql stable security invoker as $$
+  select s.bucket, sum(s.delta) as total from (
+    select coalesce(payment_method, 'cash') as bucket,
+           case when type = 'income' then amount else -amount end as delta
+      from transactions where user_id = p_user_id and type in ('income', 'expense')
+    union all
+    select coalesce(from_bucket, 'cash'), -amount from transactions where user_id = p_user_id and type = 'transfer'
+    union all
+    select coalesce(to_bucket, 'cash'), amount from transactions where user_id = p_user_id and type = 'transfer'
+  ) s group by s.bucket
+$$;
+revoke all on function bucket_balances(uuid) from public, anon, authenticated;
+grant execute on function bucket_balances(uuid) to service_role;

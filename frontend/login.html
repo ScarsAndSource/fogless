@@ -77,6 +77,23 @@
     40% { transform: translateX(6px); } 60% { transform: translateX(-4px); } 80% { transform: translateX(4px); }
   }
   @media (prefers-reduced-motion: reduce) { .shake { animation: none; } }
+
+  [hidden] { display: none !important; }
+  .tabs { display: flex; gap: 6px; margin: 0 0 4px; }
+  .tab {
+    flex: 1; padding: 9px 6px; cursor: pointer; background: var(--linen); color: var(--ink-muted);
+    font-family: 'Press Start 2P', monospace; font-size: 7px; letter-spacing: 0.06em;
+    border: 1px solid var(--border); border-radius: 8px;
+  }
+  .tab[aria-selected="true"] { background: var(--sage-light); color: var(--sage-dark); border-color: var(--sage-border); }
+  .info { min-height: 0; margin-top: 12px; font-size: 12px; color: var(--sage-dark); }
+  .info:empty { display: none; }
+  .linkbtn {
+    display: block; margin: 12px auto 0; background: none; border: none; cursor: pointer;
+    font-size: 11px; color: var(--sage); text-decoration: underline; padding: 4px;
+  }
+  .hint { font-size: 10px; color: var(--ink-muted); margin-top: 5px; }
+
 </style>
 </head>
 <body>
@@ -111,96 +128,185 @@
       </svg>
     </div>
     <div>
-      <div class="hero-title">Welcome back</div>
-      <div class="hero-sub">Extreme is waiting in the sanctuary.</div>
+      <div class="hero-title" id="hero-title">Welcome back</div>
+      <div class="hero-sub" id="hero-sub">Extreme is waiting in the sanctuary.</div>
     </div>
   </div>
 
-  <form id="login-form" autocomplete="on" novalidate>
-    <label for="username">USERNAME</label>
-    <input id="username" name="username" type="text" autocomplete="username"
+  <div class="tabs" role="tablist" id="tabs">
+    <button type="button" class="tab" role="tab" id="tab-signin" aria-selected="true">SIGN IN</button>
+    <button type="button" class="tab" role="tab" id="tab-signup" aria-selected="false">CREATE ACCOUNT</button>
+  </div>
+
+  <form id="auth-form" autocomplete="on" novalidate>
+    <label for="email">EMAIL</label>
+    <input id="email" name="email" type="email" autocomplete="username" inputmode="email"
            autocapitalize="none" autocorrect="off" spellcheck="false" autofocus required/>
 
-    <label for="password">PASSWORD</label>
-    <div class="field">
-      <input id="password" name="password" type="password" autocomplete="current-password" required/>
-      <button class="toggle-pw" id="toggle-pw" type="button" aria-label="Show password">SHOW</button>
+    <div id="pw-wrap">
+      <label for="password">PASSWORD</label>
+      <div class="field">
+        <input id="password" name="password" type="password" autocomplete="current-password" required/>
+        <button class="toggle-pw" id="toggle-pw" type="button" aria-label="Show password">SHOW</button>
+      </div>
+      <div class="hint" id="pw-hint" hidden>At least 8 characters.</div>
+    </div>
+
+    <div id="confirm-wrap" hidden>
+      <label for="confirm">CONFIRM PASSWORD</label>
+      <input id="confirm" name="confirm" type="password" autocomplete="new-password"/>
+    </div>
+
+    <div id="code-wrap" hidden>
+      <label for="code">INVITE CODE</label>
+      <input id="code" name="code" type="text" autocomplete="off" autocapitalize="none" spellcheck="false"/>
     </div>
 
     <div class="error" id="error" role="alert" aria-live="polite"></div>
+    <div class="info" id="info" role="status" aria-live="polite"></div>
 
     <button class="submit" id="submit" type="submit">ENTER SANCTUARY</button>
   </form>
 
-  <div class="foot">WELCOME!!</div>
+  <button class="linkbtn" id="link-forgot" type="button">Forgot your password?</button>
+  <button class="linkbtn" id="link-back" type="button" hidden>Back to sign in</button>
+
+  <div class="foot">Your ledger is private to your account.</div>
 </main>
 
 <script>
 (function () {
-  var form = document.getElementById('login-form');
-  var userEl = document.getElementById('username');
-  var passEl = document.getElementById('password');
-  var errEl = document.getElementById('error');
-  var btn = document.getElementById('submit');
-  var card = document.getElementById('card');
-  var toggle = document.getElementById('toggle-pw');
+  var $ = function (id) { return document.getElementById(id); };
+  var form = $('auth-form'), emailEl = $('email'), passEl = $('password'), confirmEl = $('confirm'), codeEl = $('code');
+  var errEl = $('error'), infoEl = $('info'), btn = $('submit'), card = $('card');
+  var tabs = $('tabs'), tabIn = $('tab-signin'), tabUp = $('tab-signup');
+  var linkForgot = $('link-forgot'), linkBack = $('link-back');
+  var mode = 'signin';
+  var config = { signups_open: true, needs_code: false };
+  var tz = '';
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { /* optional */ }
+
+  var LABEL = { signin: 'ENTER SANCTUARY', signup: 'CREATE ACCOUNT', forgot: 'SEND RESET LINK' };
 
   // Already signed in? Skip straight to the app.
   fetch('/api/session', { credentials: 'same-origin', cache: 'no-store' })
     .then(function (r) { return r.json(); })
     .then(function (d) { if (d && d.authenticated) location.replace('/'); })
-    .catch(function () { /* stay on the login page */ });
+    .catch(function () { /* stay on the page */ });
 
-  toggle.addEventListener('click', function () {
-    var show = passEl.type === 'password';
-    passEl.type = show ? 'text' : 'password';
-    toggle.textContent = show ? 'HIDE' : 'SHOW';
-    toggle.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
-  });
+  // Is registration open? Is an invite code needed?
+  fetch('/api/config', { credentials: 'same-origin', cache: 'no-store' })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (!d || !d.ok) return;
+      config = d;
+      if (!d.signups_open) { tabUp.hidden = true; if (mode === 'signup') setMode('signin'); }
+      if (location.hash === '#signup' && d.signups_open) setMode('signup');
+      applyMode();
+    })
+    .catch(function () { /* defaults are fine */ });
 
   function fail(msg) {
+    infoEl.textContent = '';
     errEl.textContent = msg;
     card.classList.remove('shake');
     void card.offsetWidth; // restart the animation
     card.classList.add('shake');
   }
+  function ok(msg) { errEl.textContent = ''; infoEl.textContent = msg; }
+  function busy(on) { btn.disabled = on; btn.textContent = on ? 'WORKING\u2026' : LABEL[mode]; }
+
+  function setMode(m) { mode = m; applyMode(); errEl.textContent = ''; infoEl.textContent = ''; }
+  function applyMode() {
+    var up = mode === 'signup', forgot = mode === 'forgot';
+    tabs.hidden = forgot || !config.signups_open;
+    tabIn.setAttribute('aria-selected', String(mode === 'signin'));
+    tabUp.setAttribute('aria-selected', String(up));
+    $('pw-wrap').hidden = forgot;
+    $('pw-hint').hidden = !up;
+    $('confirm-wrap').hidden = !up;
+    $('code-wrap').hidden = !(up && config.needs_code);
+    passEl.autocomplete = up ? 'new-password' : 'current-password';
+    passEl.required = !forgot;
+    linkForgot.hidden = mode !== 'signin';
+    linkBack.hidden = !forgot;
+    $('hero-title').textContent = forgot ? 'Reset password' : up ? 'Join the sanctuary' : 'Welcome back';
+    $('hero-sub').textContent = forgot ? 'We will email you a link.' :
+      up ? 'Create your own private ledger.' : 'Extreme is waiting in the sanctuary.';
+    btn.textContent = LABEL[mode];
+  }
+  tabIn.addEventListener('click', function () { setMode('signin'); });
+  tabUp.addEventListener('click', function () { setMode('signup'); });
+  linkForgot.addEventListener('click', function () { setMode('forgot'); });
+  linkBack.addEventListener('click', function () { setMode('signin'); });
+
+  $('toggle-pw').addEventListener('click', function () {
+    var show = passEl.type === 'password';
+    passEl.type = show ? 'text' : 'password';
+    this.textContent = show ? 'HIDE' : 'SHOW';
+    this.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+  });
+
+  function post(path, payload) {
+    return fetch(path, {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }).then(function (res) {
+      return res.json().catch(function () { return null; }).then(function (data) { return { res: res, data: data }; });
+    });
+  }
+  function msgOf(r, fallback) {
+    return (r.data && r.data.text) || (fallback + ' (HTTP ' + r.res.status + ').');
+  }
 
   form.addEventListener('submit', function (e) {
     e.preventDefault();
-    errEl.textContent = '';
-    var username = userEl.value.trim();
-    var password = passEl.value;
-    if (!username || !password) { fail('Enter both username and password.'); return; }
+    errEl.textContent = ''; infoEl.textContent = '';
+    var email = emailEl.value.trim(), password = passEl.value;
+    if (!email) { fail('Enter your email address.'); return; }
 
-    btn.disabled = true;
-    btn.textContent = 'CHECKING\u2026';
+    if (mode === 'forgot') {
+      busy(true);
+      post('/api/forgot', { email: email }).then(function (r) {
+        busy(false);
+        if (r.res.ok && r.data && r.data.ok) ok(r.data.text);
+        else fail(msgOf(r, 'Could not send the reset link'));
+      }).catch(function () { busy(false); fail('Could not reach the server. Try again.'); });
+      return;
+    }
 
-    fetch('/api/login', {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: username, password: password })
-    })
-      .then(function (res) {
-        return res.json().catch(function () { return null; }).then(function (data) { return { res: res, data: data }; });
-      })
+    if (!password) { fail('Enter your password.'); return; }
+    if (mode === 'signup') {
+      if (password.length < 8) { fail('Password must be at least 8 characters.'); return; }
+      if (password !== confirmEl.value) { fail('The two passwords do not match.'); return; }
+    }
+
+    busy(true);
+    var payload = { email: email, password: password, tz: tz };
+    if (mode === 'signup' && config.needs_code) payload.code = codeEl.value.trim();
+    post(mode === 'signup' ? '/api/signup' : '/api/login', payload)
       .then(function (r) {
         if (r.res.ok && r.data && r.data.ok) {
+          if (mode === 'signup' && r.data.signed_in === false) {   // email confirmation is switched on
+            busy(false);
+            ok(r.data.text || 'Check your inbox to confirm your email, then sign in.');
+            setMode('signin');
+            infoEl.textContent = r.data.text || 'Check your inbox to confirm your email, then sign in.';
+            return;
+          }
           btn.textContent = 'WELCOME!';
           location.replace('/');
           return;
         }
-        fail((r.data && r.data.text) || ('Sign-in failed (HTTP ' + r.res.status + ').'));
-        btn.disabled = false;
-        btn.textContent = 'ENTER SANCTUARY';
-        passEl.select();
+        busy(false);
+        fail(msgOf(r, mode === 'signup' ? 'Could not create the account' : 'Sign-in failed'));
+        if (mode === 'signin') passEl.select();
       })
-      .catch(function () {
-        fail('Could not reach the server. Try again.');
-        btn.disabled = false;
-        btn.textContent = 'ENTER SANCTUARY';
-      });
+      .catch(function () { busy(false); fail('Could not reach the server. Try again.'); });
   });
+
+  applyMode();
 })();
 </script>
 </body>
