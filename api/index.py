@@ -12,8 +12,9 @@ import json
 import requests
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from datetime import datetime, timedelta, timezone
-from flask import Flask, request, jsonify, send_file, Response, render_template_string, session
+from flask import Flask, request, jsonify, send_file, session
 import hashlib
+import secrets
 import hmac
 import time
 import threading
@@ -26,11 +27,32 @@ from werkzeug.utils import safe_join
 # --------------------------------------------------------------------- config
 
 
-CRON_SECRET = os.getenv("CRON_SECRET", "")
+def _load_dotenv(path=None):
+    """Tiny .env reader (no dependency) so the README's local setup really works. Real environment
+    variables always win; it never runs on Vercel or when FOGLESS_NO_DOTENV=1 (used by the tests)."""
+    if os.getenv("VERCEL") or os.getenv("FOGLESS_NO_DOTENV"):
+        return
+    path = path or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except OSError:
+        pass
 
-# Demo login. Override with DEMO_USERNAME / DEMO_PASSWORD env vars if you ever want different ones.
-DEMO_USERNAME = os.getenv("DEMO_USERNAME", "vaibhav10")
-DEMO_PASSWORD = os.getenv("DEMO_PASSWORD", "iwon10")
+
+_load_dotenv()
+
+# Login credentials come ONLY from the environment. No defaults: if they are missing, login is
+# refused (fails closed) instead of silently accepting a password that is public in the repo.
+DEMO_USERNAME = os.getenv("DEMO_USERNAME", "").strip()
+DEMO_PASSWORD = os.getenv("DEMO_PASSWORD", "")
 
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
@@ -40,7 +62,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", os.getenv("SUPABASE_KEY", ""))
 # from the Supabase key (so every serverless instance agrees), or a fixed one for local testing.
 SESSION_SECRET = os.getenv("SESSION_SECRET") or (
     hashlib.sha256(("fogless-session:" + SUPABASE_KEY).encode("utf-8")).hexdigest()
-    if SUPABASE_KEY else "fogless-local-demo-secret"
+    if SUPABASE_KEY else secrets.token_hex(32)  # random per process: never a secret that is public in the repo
 )
 
 
@@ -204,7 +226,24 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=bool(os.getenv("VERCEL")),  # https on Vercel; plain http works locally
     PERMANENT_SESSION_LIFETIME=timedelta(days=14),
+    MAX_CONTENT_LENGTH=4 * 1024 * 1024,  # Vercel rejects bigger bodies anyway; stops giant uploads locally
 )
+
+
+@app.after_request
+def _security_headers(resp):
+    if request.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-store"  # balances/ledger must never be cached
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "same-origin")
+    return resp
+
+
+def _json_body() -> dict:
+    """request JSON as a dict, always. A list/str/number body used to crash with AttributeError (HTTP 500)."""
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
 
 
 # ------------------------------------------------------------------ helpers
@@ -243,7 +282,7 @@ _FILLER_WORDS = {"for", "on", "at", "to", "via", "using", "by", "in", "of", "the
 _KNOWN_COMMANDS = {"/stats", "/balance", "/setbalance", "/settle", "/history", "/undo", "/delete",
                    "/aliases", "/reset", "/debts", "/pool"}
 _AMT_TOKEN_RE = re.compile(r"^(\d+(?:\.\d+)?)(k)?$", re.IGNORECASE)
-_SYMBOL_RE = re.compile(r"[₹$]\s*")
+_SYMBOL_RE = re.compile(r"\s*[₹$]\s*")
 _CUR_PREFIX_RE = re.compile(r"(?<![a-z])(?:rs\.?|inr)\s*(?=[-−–—]?\d)", re.IGNORECASE)
 _CUR_SUFFIX_RE = re.compile(r"(?<=\d)\s*(?:/-|(?:rs\.?|inr|rupees?)(?![a-z]))", re.IGNORECASE)
 _THOUSANDS_RE = re.compile(r"(?<![\d,.])\d{1,3}(?:,\d{2,3})*,\d{3}(?![\d,])(?:\.\d+)?")
@@ -296,7 +335,7 @@ def _normalize_amount_text(text):
     (otherwise the comma splits it into two fake items);  '-500' -> '500' and the fact that it WAS
     negative is returned, so the reply can say 'positive value converted'.
     Returns (clean_text, [Decimal amounts that were typed negative])."""
-    t = _SYMBOL_RE.sub("", text or "")
+    t = _SYMBOL_RE.sub(" ", text or "")
     t = _CUR_PREFIX_RE.sub("", t)
     t = _CUR_SUFFIX_RE.sub("", t)
     t = _THOUSANDS_RE.sub(lambda m: m.group(0).replace(",", ""), t)
@@ -540,27 +579,62 @@ def add_transfer(amount, from_bucket, to_bucket, note, person=None, pool=None, l
     return tx_id
 
 
-def _all_transactions(order="id.desc", limit=None, since=None):
-    """Paginates through PostgREST's max-rows cap, so limit=100000 really returns up to 100000 rows.
+def add_transactions_bulk(items) -> list:
+    """Insert several plain transactions in ONE request (all-or-nothing on Supabase). Returns ids in order."""
+    if len(items) == 1 or not _use_sb():
+        return [add_transaction(i["type"], i["amount"], i["category"], i["note"], i["payment_method"]) for i in items]
+    body = [{"type": i["type"], "amount": str(_to_decimal(i["amount"])), "category": i["category"],
+             "note": i["note"], "payment_method": i["payment_method"]} for i in items]
+    rows = _rows(_sb("POST", "transactions", json_body=body, prefer="return=representation"))
+    if len(rows) != len(items) or any("id" not in r for r in rows):
+        raise StorageError("Supabase bulk insert returned an unexpected number of rows")
+    return [r["id"] for r in sorted(rows, key=lambda r: r["id"])]
+
+
+def add_transfers_bulk(rows) -> None:
+    """Insert several transfer rows in ONE request (all-or-nothing on Supabase)."""
+    if not rows:
+        return
+    if _use_sb():
+        body = [{"type": "transfer", "amount": str(_to_decimal(r["amount"])), "category": "transfer",
+                 "from_bucket": r["from_bucket"], "to_bucket": r["to_bucket"], "note": r.get("note"),
+                 "person": r.get("person"), "pool": r.get("pool"), "linked_tx_id": r.get("linked_tx_id")}
+                for r in rows]
+        _sb("POST", "transactions", json_body=body, prefer="return=minimal")
+        return
+    for r in rows:
+        add_transfer(r["amount"], r["from_bucket"], r["to_bucket"], r.get("note"),
+                     person=r.get("person"), pool=r.get("pool"), linked_tx_id=r.get("linked_tx_id"))
+
+
+def _all_transactions(order="id.desc", limit=None, since=None, tx_type=None):
+    """Keyset-paginates (id < last_id) through PostgREST's max-rows cap. OFFSET paging could return the
+    same row twice (or skip one) when a row was inserted between two pages, which skewed balances.
     SB_PAGE_SIZE must be <= your project's 'Max rows' setting (Supabase default is 1000)."""
     if _use_sb():
-        out = []
-        offset = 0
+        out, last_id = [], None
+        desc = order.endswith(".desc")
         while True:
             page = SB_PAGE_SIZE if limit is None else min(SB_PAGE_SIZE, limit - len(out))
             if page <= 0:
                 break
-            params = {"select": "*", "order": order, "limit": page, "offset": offset}
+            params = {"select": "*", "order": "id.desc" if desc else "id.asc", "limit": page}
             if since:
                 params["created_at"] = f"gte.{since}"
+            if tx_type:
+                params["type"] = f"eq.{tx_type}"
+            if last_id is not None:
+                params["id"] = f"{'lt' if desc else 'gt'}.{last_id}"
             chunk = _rows(_sb("GET", "transactions", params=params))
             out.extend(chunk)
             if len(chunk) < page:
                 break
-            offset += page
+            last_id = chunk[-1]["id"]
         return out
 
     rows = list(_mem_transactions)
+    if tx_type:
+        rows = [r for r in rows if r["type"] == tx_type]
     if since:
         rows = [r for r in rows if r["created_at"] >= since]
     rows.sort(key=lambda x: x["id"], reverse=("desc" in order))
@@ -672,6 +746,57 @@ def delete_last_transaction():
     return delete_transaction_group(rows[0])
 
 
+def _ts(row):
+    try:
+        dt = datetime.fromisoformat(str(row.get("created_at")).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _last_pool_row(table):
+    """Newest pool row that is NOT the twin of a transfer (those are removed with their transfer)."""
+    if _use_sb():
+        params = {"select": "*", "order": "created_at.desc", "limit": 1}
+        if table == "pool_contributions":
+            params["linked_tx_id"] = "is.null"
+        rows = _rows(_sb("GET", table, params=params))
+        return rows[0] if rows else None
+    src = _mem_pool_contributions if table == "pool_contributions" else _mem_pool_expenses
+    cand = [r for r in src if not (table == "pool_contributions" and r.get("linked_tx_id"))]
+    return max(cand, key=_ts) if cand else None
+
+
+def undo_last_action():
+    """Undo the newest thing the user did across transactions AND pool rows. /undo used to look at the
+    transactions table only, so after '300 from goa pool' it silently reverted an OLDER entry instead.
+    Returns (reply_text, rows_removed) or None when there is nothing to undo."""
+    tx = (_all_transactions(limit=1) or [None])[0]
+    cands = [c for c in (("tx", tx), ("pc", _last_pool_row("pool_contributions")),
+                         ("pe", _last_pool_row("pool_expenses"))) if c[1]]
+    if not cands:
+        return None
+    kind, row = max(cands, key=lambda c: _ts(c[1]))  # ties go to the transaction (first in list)
+    if kind == "pc":
+        if not delete_pool_contribution(row["id"]):
+            return None
+        return f"Reverted {_pn(row['person'])}'s ₹{fmt(row['amount'])} deposit into {str(row['pool']).upper()} pool.", 1
+    if kind == "pe":
+        if not delete_pool_expense(row["id"]):
+            return None
+        return f"Reverted ₹{fmt(row['amount'])} spent from {str(row['pool']).upper()} pool.", 1
+    group = delete_transaction_group(row)
+    if not group:
+        return None
+    if len(group) == 1:
+        r = group[0]
+        if r["type"] == "transfer":
+            return f"Reverted #{r['id']}: transfer ₹{fmt(r['amount'])} ({r.get('from_bucket')} → {r.get('to_bucket')}).", 1
+        return f"Reverted #{r['id']}: {r['type']} ₹{fmt(r['amount'])} ({r.get('category')}).", 1
+    anchor = next((r for r in group if r["type"] != "transfer"), group[0])
+    return f"Reverted last action: {len(group)} linked entries (₹{fmt(anchor['amount'])} {anchor['type']}).", len(group)
+
+
 def delete_pool_contribution(row_id) -> bool:
     if _use_sb():
         r = _sb("DELETE", "pool_contributions", params={"id": f"eq.{row_id}"}, prefer="return=representation")
@@ -749,12 +874,35 @@ def set_starting_balance(method: str, amount) -> None:
     _mem_starting_balances[method] = start_bal
 
 
+_RPC = {"ok": None}  # None = not tried yet, False = function not installed (use the slow path)
+
+
+def _rpc_bucket_balances():
+    if not _use_sb() or _RPC["ok"] is False:
+        return None
+    try:
+        rows = _rows(_sb("POST", "rpc/bucket_balances", json_body={}))
+    except StorageError as e:
+        if e.status in (400, 404):
+            _RPC["ok"] = False
+            print("[balances] rpc/bucket_balances not installed - run 003_safety_and_speed.sql for faster balances")
+            return None
+        raise
+    _RPC["ok"] = True
+    return {r["bucket"]: Decimal(str(r["total"])) for r in rows}
+
+
 def get_balances_by_method() -> dict:
     """Grand ledger across every bucket — real payment methods AND virtual iou:*/pool:* buckets.
     Transfers move money between two buckets with zero net effect on the total; income/expense
     move it into or out of exactly one bucket, same as before."""
-    rows = _all_transactions()
     result = get_starting_balances()
+    totals = _rpc_bucket_balances()  # one round trip instead of downloading every row (migration 003)
+    if totals is not None:
+        for bucket, amt in totals.items():
+            result[bucket] = result.get(bucket, Decimal("0.00")) + amt
+        return result
+    rows = _all_transactions()
     for r in rows:
         rtype = r.get("type")
         if rtype == "transfer":
@@ -799,8 +947,8 @@ def get_balance() -> Decimal:
 
 def get_today_expense() -> Decimal:
     since = _since("today")
-    rows = _all_transactions(since=since)
-    return sum((Decimal(str(r["amount"])) for r in rows if r["type"] == "expense"), Decimal("0.00"))
+    rows = _all_transactions(since=since, tx_type="expense")
+    return sum((Decimal(str(r["amount"])) for r in rows), Decimal("0.00"))
 
 
 def _since(period):
@@ -829,7 +977,7 @@ def get_stats(period="month"):
     for r in rows:
         amt = Decimal(str(r["amount"]))
         if r["type"] == "expense":
-            c = r["category"]
+            c = r.get("category") or "other"
             by_cat.setdefault(c, {"total": Decimal("0.00"), "cnt": 0})
             by_cat[c]["total"] += amt
             by_cat[c]["cnt"] += 1
@@ -918,8 +1066,8 @@ def learn_alias_manual(note_key, tx_type, category, payment_method=None):
 def learn_alias_auto(note_key, tx_type, category, payment_method=None):
     """Auto-learned from an LLM guess: needs a SECOND parse that agrees on type + category
     before it is trusted (confirmed) and allowed to skip the LLM."""
-    if not _alias_ok(note_key, tx_type) or not category:
-        return
+    if not _alias_ok(note_key, tx_type) or not category or category == "other":
+        return  # "other" is a non-answer; confirming it would make the alias skip the LLM forever
     existing = _get_alias_row(note_key)
     if existing is None:
         _put_alias(note_key, tx_type, category, payment_method, False, 1)
@@ -1069,18 +1217,32 @@ def reset_all_data() -> None:
 
 # ------------------------------------------------------------------ nlp layer
 
+def _coerce_amount(v) -> Decimal:
+    """'1,200' / '₹1200' / 1200 -> Decimal. NaN/Infinity raise (a NaN used to blow up the WHOLE parse)."""
+    if isinstance(v, str):
+        v = v.replace(",", "").replace("₹", "").strip()
+    d = _to_decimal(v)
+    if not d.is_finite():
+        raise InvalidOperation("non-finite amount")
+    return d
+
+
+def _lc(v):
+    return v.strip().lower() if isinstance(v, str) else None
+
+
 def _validate_item(data):
     if not data or data.get("type") not in ("expense", "income"):
         return None
     try:
-        amount = _to_decimal(data["amount"])
+        amount = _coerce_amount(data["amount"])
     except (TypeError, ValueError, KeyError, InvalidOperation):
         return None
     if amount <= 0 or amount > MAX_AMOUNT:
         return None
     valid_categories = EXPENSE_CATEGORIES if data["type"] == "expense" else INCOME_CATEGORIES
-    category = data.get("category") if data.get("category") in valid_categories else "other"
-    payment_method = data.get("payment_method") if data.get("payment_method") in PAYMENT_METHODS else None
+    category = _lc(data.get("category")) if _lc(data.get("category")) in valid_categories else "other"
+    payment_method = _lc(data.get("payment_method")) if _lc(data.get("payment_method")) in PAYMENT_METHODS else None
     note = str(data["note"]).strip()[:100] if data.get("note") else ""
     return {"type": data["type"], "amount": amount, "category": category, "payment_method": payment_method, "note": note or None}
 
@@ -1094,7 +1256,7 @@ def _validate_debt_item(data):
     if share_type not in ("split", "lend", "borrow", "repayment", "contribution", "pool_contribution_other", "pool_expense"):
         return None
     try:
-        amount = _to_decimal(data["amount"])
+        amount = _coerce_amount(data["amount"])
     except (TypeError, ValueError, KeyError, InvalidOperation):
         return None
     if amount <= 0 or amount > MAX_AMOUNT:
@@ -1119,9 +1281,13 @@ def _validate_debt_item(data):
         return None
     if share_type in ("contribution", "pool_expense") and not pool:
         return None
+    if len(people) > 20:
+        return None  # 20+ sequential writes would blow the serverless time limit
+    if share_type == "split" and _to_decimal(amount / (len(people) + 1)) <= 0:
+        return None  # my share would round to 0.00
 
-    payment_method = data.get("payment_method") if data.get("payment_method") in PAYMENT_METHODS else "cash"
-    category = data.get("category") if data.get("category") in EXPENSE_CATEGORIES else "other"
+    payment_method = _lc(data.get("payment_method")) if _lc(data.get("payment_method")) in PAYMENT_METHODS else "cash"
+    category = _lc(data.get("category")) if _lc(data.get("category")) in EXPENSE_CATEGORIES else "other"
     note = str(data["note"]).strip()[:100] if data.get("note") else None
     repayment_direction = data.get("repayment_direction") if data.get("repayment_direction") in ("they_paid_me", "i_paid_them") else "they_paid_me"
 
@@ -1151,12 +1317,22 @@ def _apply_debt_transaction(item):
         tx_id = add_transaction("expense", my_share, category, note, method)
         per_person = _to_decimal(total_others / len(people))
         running = Decimal("0.00")
-        breakdown = []
+        breakdown, rows = [], []
         for i, p in enumerate(people):
             amt_i = per_person if i < len(people) - 1 else (total_others - running)
             running += amt_i
-            add_transfer(amt_i, method, f"iou:{p}", note, person=p, linked_tx_id=tx_id)
+            if amt_i > 0:  # never write 0.00 transfer rows
+                rows.append({"amount": amt_i, "from_bucket": method, "to_bucket": f"iou:{p}",
+                             "note": note, "person": p, "linked_tx_id": tx_id})
             breakdown.append((p, amt_i))
+        try:
+            add_transfers_bulk(rows)  # ONE request instead of N
+        except StorageError:
+            try:
+                delete_transaction(tx_id)  # don't leave my-share expense behind without its IOUs
+            except StorageError:
+                pass
+            raise
         return {"kind": "split", "tx_id": tx_id, "my_share": my_share, "people": breakdown, "method": method, "category": category}
 
     elif share_type == "lend":
@@ -1177,7 +1353,14 @@ def _apply_debt_transaction(item):
 
     elif share_type == "contribution":
         tx_id = add_transfer(amount, method, f"pool:{pool}", note, pool=pool)
-        add_pool_contribution(pool, "me", amount, note, linked_tx_id=tx_id)
+        try:
+            add_pool_contribution(pool, "me", amount, note, linked_tx_id=tx_id)
+        except StorageError:
+            try:
+                delete_transaction(tx_id)
+            except StorageError:
+                pass
+            raise
         return {"kind": "contribution", "amount": amount, "who": pool, "method": method}
 
     elif share_type == "pool_contribution_other":
@@ -1237,27 +1420,59 @@ def _call_groq_chat(text):
         data = json.loads(content, parse_float=Decimal)
         raw_items = data.get("transactions") if isinstance(data, dict) else None
         if raw_items:
-            results = []
+            results, dropped = [], 0
             for x in raw_items:
-                v = _validate_debt_item(x) if x.get("share_type") else _validate_item(x)
+                v = None
+                if isinstance(x, dict):
+                    v = _validate_debt_item(x) if x.get("share_type") else _validate_item(x)
                 if v is not None:
                     results.append(v)
+                else:
+                    dropped += 1
             if results:
+                if dropped:  # used to vanish silently while the reply claimed success
+                    _tl.notices.append(f"{dropped} item(s) in your message could not be read and were NOT logged.")
                 return _demote_unbacked_debt(results, text)
     except Exception as e:
         print(f"Groq API call error: {e}")
     return _fallback_rule_parse(text)
 
 
+# bare "got" used to flip "300 got milk" / "got haircut 200" into INCOME. "got" now only counts when an
+# amount or "paid" follows it ("got 424 upi", "got paid 5000").
 _INCOME_RE = re.compile(
-    r"\b(?:income|salary|got paid|got|received|earned|payout|refund|credited|deposited)\b", re.IGNORECASE
+    r"\b(?:income|salary|got\s+paid|received|earned|payout|refund|credited|deposited)\b"
+    r"|\bgot\s+(?:rs\.?\s*)?[-−]?\d", re.IGNORECASE
 )
+
+_MON = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|"
+        r"sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
+_DATE_RES = [
+    re.compile(rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+{_MON}\b(?:\s+\d{{4}})?", re.I),   # 12 nov, 5th march 2026
+    re.compile(rf"\b{_MON}\s+\d{{1,2}}(?:st|nd|rd|th)?\b(?:,?\s+\d{{4}})?", re.I),  # nov 12
+    re.compile(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b"),                          # 12/11, 12-11-2026
+    re.compile(r"\b\d+(?:st|nd|rd|th)\b", re.I),                                       # 5th
+]
+_QTY_FOR_RE = re.compile(r"\b(\d{1,2})\s+([a-z][a-z]*(?:\s[a-z]+){0,2}?)\s+(?:for|at|@|worth|total)\s+(\d+(?:\.\d+)?k?)\b", re.I)
+_QTY_ON_RE = re.compile(r"\b(\d+(?:\.\d+)?k?)\s+(?:on|for)\s+(\d{1,2})\s+([a-z]{3,})\b", re.I)
+
+
+def _fallback_prep(text):
+    """Dates and quantities are not amounts: '450 dinner on 12 nov' used to log a phantom Rs12 expense,
+    '3 shirts for 1500' logged Rs3, 'spent 20 on 2 samosas' logged two items."""
+    t = text
+    for rx in _DATE_RES:
+        t = rx.sub(" ", t)
+    t = _QTY_FOR_RE.sub(lambda m: f"{m.group(3)} {m.group(2)} x{m.group(1)}", t)
+    t = _QTY_ON_RE.sub(lambda m: f"{m.group(1)} {m.group(3)} x{m.group(2)}", t)
+    return re.sub(r"[ \t]+", " ", t).strip()
 
 _CATEGORY_WORDS = (
     ("food", ["lunch", "dinner", "breakfast", "food", "cafe", "restaurant", "burger", "pizza", "juice",
-              "biscuit", "tea", "coffee", "snack"]),
+              "biscuit", "tea", "coffee", "snack", "chai", "samosa", "dosa", "biryani", "swiggy", "zomato"]),
     ("groceries", ["milk", "groceries", "grocery", "veggies", "vegetables", "fruit", "market"]),
-    ("transport", ["uber", "cab", "bus", "train", "metro", "flight", "transit", "petrol", "fuel"]),
+    ("transport", ["uber", "cab", "taxi", "ola", "rapido", "auto", "rickshaw", "bus", "train", "metro", "flight",
+                   "transit", "petrol", "diesel", "fuel", "parking", "toll"]),
     ("rent", ["rent"]),
     ("bills", ["electricity", "wifi", "bill", "water"]),
     ("subscriptions", ["netflix", "spotify", "prime", "hotstar", "youtube", "subscription"]),
@@ -1475,6 +1690,16 @@ def _fallback_debt_parse(text):
                 "payment_method": _method_in(tl), "note": _leftover_note(pre),
             })
 
+    m = re.search(r"\b(?:split|share)\s+" + N + r"\b(.*?)\bwith\s+(.+)$", tl)  # "split 600 dinner with rahul"
+    if m:
+        amount, people = _amount_from_str(m.group(1)), _take_people(m.group(3))
+        if amount and people:
+            pre = m.group(2)
+            return _validate_debt_item({
+                "share_type": "split", "amount": amount, "people": people, "category": _guess_category(pre),
+                "payment_method": _method_in(tl), "note": _leftover_note(pre),
+            })
+
     m = re.search(r"\b(?:gave|lent|lend)\s+(?!\d)(.+?)\s+" + N + r"\b", tl)
     if m:
         amount, name = _amount_from_str(m.group(2)), _take_name(m.group(1))
@@ -1577,6 +1802,7 @@ def _split_chunks(text):
 
 def _fallback_rule_parse(text):
     """Rule-based regex parser when Groq API key is absent or unavailable."""
+    text = _fallback_prep(text)
     debt_item = _fallback_debt_parse(text)
     if debt_item:
         return [debt_item]
@@ -1734,7 +1960,7 @@ def format_stats_html(period="month") -> str:
     
     rows_html = ""
     for idx, cat_item in enumerate(s["by_category"]):
-        c_name = cat_item["category"].capitalize()
+        c_name = _esc(str(cat_item["category"] or "other").capitalize())
         c_tot = cat_item["total"]
         pct = int(round((c_tot / tot_exp) * 100))
         cells_cnt = max(1, min(10, int(round((pct / 100) * 10))))
@@ -1840,7 +2066,7 @@ def format_history_html(limit=5) -> str:
             lines.append(f"""
             <div class='py-1 border-b border-[#E5DFC9]'>
               <div class='flex justify-between'>
-                <span>#{r['id']} transfer {frm} → {to}</span>
+                <span>#{r['id']} transfer {_esc(str(frm))} → {_esc(str(to))}</span>
                 <span class='font-numeral font-bold text-[#6B7280]'>₹{fmt(r['amount'])}</span>
               </div>
               <div class='text-[9px] text-[#8A8578]'>{date_str}</div>
@@ -1854,7 +2080,7 @@ def format_history_html(limit=5) -> str:
         lines.append(f"""
         <div class='py-1 border-b border-[#E5DFC9]'>
           <div class='flex justify-between'>
-            <span>#{r['id']} {r['category']}{note}{pay}</span>
+            <span>#{r['id']} {_esc(str(r['category'] or 'other'))}{note}{pay}</span>
             <span class='font-numeral font-bold {color}'>{sign}₹{fmt(r['amount'])}</span>
           </div>
           <div class='text-[9px] text-[#8A8578]'>{date_str}</div>
@@ -1908,6 +2134,16 @@ FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 # ---------------------------------------------------------------------- Web Routes
 
 
+def _totals(extra=None) -> dict:
+    out = _balance_pair()
+    out.update(extra or {})
+    return out
+
+
+def _balance_pair() -> dict:
+    return {"balance": float(get_balance()), "today_spent": float(get_today_expense())}
+
+
 def _unwrap(res):
     """_process_text returns either a dict or a (dict, http_status) tuple (usage errors)."""
     if isinstance(res, tuple):
@@ -1921,7 +2157,16 @@ _OPEN_API_PATHS = {"/api/login", "/api/logout", "/api/session"}
 
 
 def _is_logged_in() -> bool:
-    return session.get("user") == DEMO_USERNAME
+    return bool(DEMO_USERNAME) and session.get("user") == DEMO_USERNAME
+
+
+_LOGIN_FAILS = {}  # ip -> (failures, window_start). Best effort: one dict per serverless instance.
+_LOGIN_MAX, _LOGIN_WINDOW = 8, 600
+
+
+def _client_ip() -> str:
+    fwd = request.headers.get("X-Forwarded-For", "")
+    return fwd.split(",")[0].strip() or request.remote_addr or "?"
 
 
 @app.before_request
@@ -1942,17 +2187,30 @@ def _no_store(resp):
 
 @app.route("/api/login", methods=["POST"])
 def api_login():
-    data = request.get_json(silent=True) or {}
+    if not (DEMO_USERNAME and DEMO_PASSWORD):
+        return _no_store(jsonify({"ok": False, "text": "Login is not configured on the server "
+                                  "(set DEMO_USERNAME and DEMO_PASSWORD)."})), 503
+    ip, now = _client_ip(), time.time()
+    fails, started = _LOGIN_FAILS.get(ip, (0, now))
+    if now - started > _LOGIN_WINDOW:
+        fails, started = 0, now
+    if fails >= _LOGIN_MAX:
+        return _no_store(jsonify({"ok": False, "text": "Too many attempts. Try again in a few minutes."})), 429
+    data = _json_body()
     username = str(data.get("username") or "").strip()
     password = str(data.get("password") or "")
     # case-insensitive username (phones auto-capitalise), exact password, constant-time compares
     user_ok = hmac.compare_digest(username.lower().encode("utf-8"), DEMO_USERNAME.lower().encode("utf-8"))
     pass_ok = hmac.compare_digest(password.encode("utf-8"), DEMO_PASSWORD.encode("utf-8"))
     if user_ok and pass_ok:
+        _LOGIN_FAILS.pop(ip, None)
         session.clear()
         session["user"] = DEMO_USERNAME
         session.permanent = True
         return _no_store(jsonify({"ok": True, "username": DEMO_USERNAME}))
+    if len(_LOGIN_FAILS) > 1000:
+        _LOGIN_FAILS.clear()
+    _LOGIN_FAILS[ip] = (fails + 1, started)
     time.sleep(0.4)  # blunt the guessing speed a little
     return _no_store(jsonify({"ok": False, "text": "Wrong username or password."})), 401
 
@@ -2070,7 +2328,7 @@ def _process_text_core(text: str, allow_commands: bool = True):
             reply_text = ("Unknown command. Try /stats, /balance, /history, /debts, /pool, /settle, /undo, "
                           "/delete, /aliases - or just type what you spent, e.g. 24 coffee upi")
             log_chat_message("assistant", reply_text)
-            return {"ok": True, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
+            return {"ok": True, "text": reply_text, **_balance_pair()}
         args = parts[1:]
 
         if cmd == "/stats":
@@ -2080,7 +2338,7 @@ def _process_text_core(text: str, allow_commands: bool = True):
             html = format_stats_html(period)
             reply_text = f"Stats for {period} period."
             log_chat_message("assistant", html)
-            return {"ok": True, "html": html, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
+            return {"ok": True, "html": html, "text": reply_text, **_balance_pair()}
 
         elif cmd in ("/balance", "/setbalance"):
             if args:
@@ -2108,12 +2366,11 @@ def _process_text_core(text: str, allow_commands: bool = True):
                         "ok": True,
                         "text": reply_text,
                         "html": html,
-                        "balance": float(get_balance()),
-                        "today_spent": float(get_today_expense()),
+                        **_balance_pair(),
                     }
             html = format_balance_html()
             log_chat_message("assistant", html)
-            return {"ok": True, "text": "Balance summary.", "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
+            return {"ok": True, "text": "Balance summary.", "html": html, **_balance_pair()}
 
         elif cmd == "/settle":
             # order-free: /settle rohan rahul 500 upi   |   /settle 500 upi rohan rahul
@@ -2160,37 +2417,27 @@ def _process_text_core(text: str, allow_commands: bool = True):
                 "ok": True,
                 "text": reply_text,
                 "html": html_res,
-                "balance": float(get_balance()),
-                "today_spent": float(get_today_expense()),
+                **_balance_pair(),
             }
         elif cmd == "/history":
             limit = max(1, min(int(args[0]), 50)) if args and re.fullmatch(r"[0-9]{1,6}", args[0]) else 5
             html = format_history_html(limit)
             log_chat_message("assistant", html)
-            return {"ok": True, "text": f"Last {limit} transactions shown.", "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
+            return {"ok": True, "text": f"Last {limit} transactions shown.", "html": html, **_balance_pair()}
 
         elif cmd == "/undo":
-            group = delete_last_transaction()
-            if not group:
+            undone = undo_last_action()
+            if not undone:
                 reply_text = "Nothing to undo."
                 log_chat_message("assistant", reply_text)
-                return {"ok": True, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
-            if len(group) == 1:
-                row = group[0]
-                if row["type"] == "transfer":
-                    reply_text = f"Reverted #{row['id']}: transfer ₹{fmt(row['amount'])} ({row.get('from_bucket')} → {row.get('to_bucket')})."
-                else:
-                    reply_text = f"Reverted #{row['id']}: {row['type']} ₹{fmt(row['amount'])} ({row.get('category')})."
-            else:
-                anchor = next((r for r in group if r["type"] != "transfer"), group[0])
-                reply_text = f"Reverted last action: {len(group)} linked entries (₹{fmt(anchor['amount'])} {anchor['type']})."
+                return {"ok": True, "text": reply_text, **_totals()}
+            reply_text, n = undone
             log_chat_message("assistant", reply_text)
             return {
                 "ok": True,
                 "text": reply_text,
-                "html": f"<p>Reverted <strong>{len(group)}</strong> linked entr{'y' if len(group) == 1 else 'ies'} from the treasury purse.</p>",
-                "balance": float(get_balance()),
-                "today_spent": float(get_today_expense()),
+                "html": f"<p>Reverted <strong>{n}</strong> linked entr{'y' if n == 1 else 'ies'} from the treasury purse.</p>",
+                **_totals(),
             }
 
         elif cmd == "/delete":
@@ -2207,8 +2454,7 @@ def _process_text_core(text: str, allow_commands: bool = True):
             return {
                 "ok": True,
                 "text": reply_text,
-                "balance": float(get_balance()),
-                "today_spent": float(get_today_expense()),
+                **_balance_pair(),
             }
 
         elif cmd == "/aliases":
@@ -2226,11 +2472,11 @@ def _process_text_core(text: str, allow_commands: bool = True):
             if not args or args[0].lower() != "confirm":
                 reply_text = ("⚠ /reset permanently deletes ALL transactions, pools, aliases, starting balances "
                               "and chat history. If you really mean it, send: /reset confirm")
-                return {"ok": True, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
+                return {"ok": True, "text": reply_text, **_balance_pair()}
             if _use_sb() and not ALLOW_RESET:
                 reply_text = ("Reset is disabled on the live database. Set ALLOW_RESET=1 in the environment, "
                               "redeploy, send /reset confirm, then remove it again.")
-                return {"ok": True, "text": reply_text, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
+                return {"ok": True, "text": reply_text, **_balance_pair()}
             reset_all_data()
             reply_text = "All data reset (database and chat history wiped)." if _use_sb() else "All local data reset."
             log_chat_message("assistant", reply_text)
@@ -2239,7 +2485,7 @@ def _process_text_core(text: str, allow_commands: bool = True):
         elif cmd == "/debts":
             html = format_debts_html()
             log_chat_message("assistant", html)
-            return {"ok": True, "text": "IOU ledger shown.", "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
+            return {"ok": True, "text": "IOU ledger shown.", "html": html, **_balance_pair()}
 
         elif cmd == "/pool":
             pool_name = (_clean_name(" ".join(args), hyphen=True) or None) if args else None
@@ -2256,7 +2502,7 @@ def _process_text_core(text: str, allow_commands: bool = True):
                     </div>
                     """
                     log_chat_message("assistant", html)
-                    return {"ok": True, "text": reply_text, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
+                    return {"ok": True, "text": reply_text, "html": html, **_balance_pair()}
 
                 pool_cards = []
                 for p in pools:
@@ -2282,7 +2528,7 @@ def _process_text_core(text: str, allow_commands: bool = True):
                 """
                 reply_text = f"Known pools: {', '.join(pools)}"
                 log_chat_message("assistant", html)
-                return {"ok": True, "text": reply_text, "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
+                return {"ok": True, "text": reply_text, "html": html, **_balance_pair()}
             s = get_pool_summary(pool_name)
             contrib_lines = "".join(
                 f"<div class='flex justify-between py-0.5 border-b border-[#E5DFC9]'><span>{_nm(p)}</span><span class='font-numeral text-[10px] font-bold'>+₹{fmt(a)}</span></div>"
@@ -2316,7 +2562,7 @@ def _process_text_core(text: str, allow_commands: bool = True):
             </div>
             """
             log_chat_message("assistant", html)
-            return {"ok": True, "text": f"Pool summary for {pool_name}.", "html": html, "balance": float(get_balance()), "today_spent": float(get_today_expense())}
+            return {"ok": True, "text": f"Pool summary for {pool_name}.", "html": html, **_balance_pair()}
 
     # Check for natural language balance setting intent
     bal_match = re.search(r"\b(?:set|update|my)\s+(?:(\w+)\s+)?balance\s+(?:to|is|=)?\s*(?:₹|\$)?\s*(\d+(?:\.\d+)?k?)\b|\bset\s+balance\s+(?:to|is|=)?\s*(?:₹|\$)?\s*(\d+(?:\.\d+)?k?)(?:\s+in|\s+for|\s+on|\s+to)?(?:\s+(\w+))?\b", text, re.IGNORECASE)
@@ -2343,8 +2589,7 @@ def _process_text_core(text: str, allow_commands: bool = True):
                         "ok": True,
                         "text": reply_text,
                         "html": html,
-                        "balance": float(get_balance()),
-                        "today_spent": float(get_today_expense()),
+                        **_balance_pair(),
                     }
             except Exception as e:
                 print(f"Error parsing balance setting: {e}")
@@ -2359,8 +2604,7 @@ def _process_text_core(text: str, allow_commands: bool = True):
             "ok": True,
             "text": reply_text,
             "html": f"<p>Could not parse amount from <span class='bg-[#F87171] text-white px-1 text-[13px] font-mono'>\"{_esc(text)}\"</span>. Hint: type the coins first, e.g. <strong class='underline decoration-2'>12 notebook cash</strong>.</p>",
-            "balance": float(get_balance()),
-            "today_spent": float(get_today_expense()),
+            **_balance_pair(),
         }
 
     # A lone debt/shared item
@@ -2373,21 +2617,26 @@ def _process_text_core(text: str, allow_commands: bool = True):
             "ok": True,
             "html": html_res,
             "text": reply_text,
-            "balance": float(get_balance()),
-            "today_spent": float(get_today_expense()),
+            **_balance_pair(),
         }
 
     # One or more items (plain and/or debt) -- each is applied and reported on its own
     logged = []
+    plain_items = [p for p in transactions if not p.get("share_type")]
+    plain_ids = {}
+    if len(plain_items) > 1:
+        plain_ids = {id(p): i for p, i in zip(plain_items, add_transactions_bulk(plain_items))}
     for parsed in transactions:
         if parsed.get("share_type"):
             r = _apply_debt_transaction(parsed)
             summary, _ = _debt_reply(parsed, r)
             logged.append({"debt": True, "summary": summary, "amount": parsed["amount"]})
         else:
-            tx_id = add_transaction(parsed["type"], parsed["amount"], parsed["category"], parsed["note"], parsed["payment_method"])
+            tx_id = plain_ids.get(id(parsed)) or add_transaction(
+                parsed["type"], parsed["amount"], parsed["category"], parsed["note"], parsed["payment_method"])
             note_key = (parsed.get("note") or "").lower().strip()
-            _soft_learn_auto(note_key, parsed["type"], parsed["category"], parsed["payment_method"])
+            if note_key and note_key not in aliases:  # already-confirmed aliases need no extra DB round trips
+                _soft_learn_auto(note_key, parsed["type"], parsed["category"], parsed["payment_method"])
             logged.append({**parsed, "id": tx_id, "debt": False})
 
     if len(logged) == 1:
@@ -2412,8 +2661,7 @@ def _process_text_core(text: str, allow_commands: bool = True):
             "tx_id": last_tx["id"],
             "category": last_tx["category"],
             "payment_method": last_tx.get("payment_method"),
-            "balance": float(get_balance()),
-            "today_spent": float(get_today_expense()),
+            **_balance_pair(),
         }
 
     has_debt = any(x["debt"] for x in logged)
@@ -2456,15 +2704,15 @@ def _process_text_core(text: str, allow_commands: bool = True):
         "ok": True,
         "html": html_res,
         "text": reply_text,
-        "balance": float(get_balance()),
-        "today_spent": float(get_today_expense()),
+        **_balance_pair(),
     }
 
 
 @app.route("/api/message", methods=["POST"])
 def api_message():
-    data = request.get_json(silent=True) or {}
-    text = str(data.get("text") or "").strip()
+    data = _json_body()
+    raw_text = data.get("text")
+    text = raw_text.strip() if isinstance(raw_text, str) else ""  # {"text": 50} / {"text": ["a"]} are not messages
     if not text:
         return jsonify({"ok": False, "text": "Empty message."}), 400
 
@@ -2479,26 +2727,27 @@ def api_message():
 
 @app.route("/api/action", methods=["POST"])
 def api_action():
-    data = request.get_json(silent=True) or {}
+    data = _json_body()
     action = data.get("action")
     tx_id = None
-    if data.get("tx_id") is not None:
-        try:
-            tx_id = int(data.get("tx_id"))
-        except (TypeError, ValueError):
+    raw_id = data.get("tx_id")
+    if raw_id is not None:
+        # strict: int(1.9) == 1 and int(True) == 1 used to silently target the WRONG row
+        ok_type = (isinstance(raw_id, int) and not isinstance(raw_id, bool)) or                   (isinstance(raw_id, str) and raw_id.strip().isdigit())
+        if not ok_type or not (0 < int(raw_id) < 2 ** 62):
             return jsonify({"ok": False, "text": "Invalid transaction id."}), 400
+        tx_id = int(raw_id)
 
     def _totals(extra):
-        out = {"balance": float(get_balance()), "today_spent": float(get_today_expense())}
+        out = _balance_pair()
         out.update(extra)
         return jsonify(out)
 
     if action == "undo":
-        group = delete_last_transaction()
-        if not group:
+        undone = undo_last_action()
+        if not undone:
             return _totals({"ok": True, "text": "Nothing to undo."})
-        n = len(group)
-        return _totals({"ok": True, "text": f"Reverted last action ({n} linked entr{'y' if n == 1 else 'ies'})."})
+        return _totals({"ok": True, "text": undone[0]})
 
     if action == "delete" and tx_id is not None:
         group = delete_transaction_group_by_id(tx_id)
@@ -2574,17 +2823,22 @@ def api_export():
     rows = _all_transactions(order="id.asc")  # paginated: every row, not just the first 1000
     buf = io.StringIO()
     writer = csv.writer(buf)
+
+    def _csv_safe(v):
+        # a note like "=HYPERLINK(...)" would run as a formula when the CSV is opened in Excel/Sheets
+        return "'" + v if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
+
     writer.writerow(["id", "type", "amount", "category", "note", "payment_method",
                      "from_bucket", "to_bucket", "person", "pool", "linked_tx_id", "created_at"])
     for r in rows:
-        writer.writerow([
+        writer.writerow([_csv_safe(c) for c in (
             r.get("id"), r.get("type"), r.get("amount"), r.get("category"), r.get("note"),
             r.get("payment_method"), r.get("from_bucket"), r.get("to_bucket"), r.get("person"),
             r.get("pool"), r.get("linked_tx_id"), r.get("created_at"),
-        ])
+        )])
 
     output = io.BytesIO()
-    output.write(buf.getvalue().encode('utf-8'))
+    output.write(buf.getvalue().encode('utf-8-sig'))  # BOM: Excel shows unicode correctly
     output.seek(0)
     return send_file(output, mimetype="text/csv", as_attachment=True, download_name="expenses_export.csv")
 
@@ -2668,4 +2922,5 @@ def api_history():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # debug=True + 0.0.0.0 exposes the Werkzeug debugger (remote code execution) to the whole network
+    app.run(host="127.0.0.1", port=int(os.getenv("PORT", "5000")), debug=os.getenv("FLASK_DEBUG") == "1")
