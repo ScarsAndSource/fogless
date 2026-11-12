@@ -1,4 +1,5 @@
 // Web Audio 8-bit Synthesizer for Retro Sound Effects
+// _fogless_patched
 let audioCtx = null;
 let soundEnabled = true;
 
@@ -334,7 +335,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const formData = new FormData();
     formData.append('audio', blob, `voice.${ext}`);
     try {
-      const res = await fetch('/api/voice', { method: 'POST', body: formData });
+      const res = await fetch('/api/voice', { method: 'POST', body: formData, credentials: 'same-origin' });
       let data = null;
       try { data = await res.json(); } catch (_) { data = null; }
       if (!data) {
@@ -359,7 +360,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Restore persisted chat history on page load
   async function loadChatHistory() {
     try {
-      const res = await fetch('/api/history?limit=50');
+      const res = await fetch('/api/history?limit=50', { credentials: 'same-origin', cache: 'no-store' });
       if (!res.ok) throw new Error(`history fetch failed: ${res.status}`);
       const messages = await res.json();
       if (!messages || !messages.length) return;
@@ -400,7 +401,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   async function fetchInitialState() {
     try {
-      const res = await fetch('/api/state');
+      const res = await fetch('/api/state', { credentials: 'same-origin', cache: 'no-store' });
       const data = await res.json();
       if (res.ok && data.ok) {
         if (data.balance !== undefined) updateBalanceDisplay(data.balance);
@@ -562,12 +563,18 @@ document.addEventListener('DOMContentLoaded', () => {
       const res = await fetch('/api/action', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'undo' })
+        body: JSON.stringify({ action: 'undo' }),
+        credentials: 'same-origin',
       });
-      const data = await res.json();
+      let data = null;
+      try { data = await res.json(); } catch (_) { data = null; }
+      if (!data) {
+        renderCompanionBubble(`⚠ Server error (HTTP ${res.status}) — undo may not have gone through. Check /history.`);
+        return;
+      }
       if (data.ok && data.balance !== undefined) updateBalanceDisplay(data.balance);
       if (data.ok && data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
-      renderCompanionBubble(data.text || `⚔ SPELL: REVERT EXECUTED. Restored GP to the treasury purse.`);
+      renderCompanionBubble(data.html || data.text || `⚔ SPELL: REVERT EXECUTED. Restored GP to the treasury purse.`);
     } catch(e) {
       renderCompanionBubble(`⚠ Connection error — undo did NOT go through. Balance unchanged. Try again.`);
     }
@@ -640,7 +647,8 @@ document.addEventListener('DOMContentLoaded', () => {
       const res = await fetch('/api/message', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: cmd })
+        body: JSON.stringify({ text: cmd }),
+        credentials: 'same-origin',
       });
       let data = null;
       try { data = await res.json(); } catch (_) { data = null; }
