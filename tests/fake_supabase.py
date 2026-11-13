@@ -14,6 +14,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
+import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit, parse_qsl
 
@@ -100,6 +101,12 @@ class FakeSupabase:
 
         class H(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+
+            def setup(self):
+                super().setup()
+                # http.server writes headers and body as two packets; without NODELAY, Nagle + the client's
+                # delayed ACK stall every reused keep-alive connection by ~40 ms (real servers do not do this).
+                self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
             def log_message(self, *a):
                 pass
