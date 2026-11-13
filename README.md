@@ -77,6 +77,8 @@ Until step 3 you will see an empty ledger (your rows are not lost, just not yet 
 
 ## Environment variables
 
+Both legacy (JWT `anon` / `service_role`) and new-style (`sb_publishable_…` / `sb_secret_…`) Supabase keys work; the new-style ones are sent only in the `apikey` header, as Supabase requires.
+
 See `.env.example`. `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_KEY` are required; without them every
 sign-in attempt returns `503` (it fails closed). `ALLOW_RESET`, `DEMO_USERNAME`, `DEMO_PASSWORD`, `SESSION_SECRET`
 and `CRON_SECRET` no longer exist -- remove them from Vercel.

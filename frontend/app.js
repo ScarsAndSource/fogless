@@ -500,7 +500,10 @@ document.addEventListener('DOMContentLoaded', () => {
     bubble.className = 'msg-assistant';
     
     let inlineMenuHtml = '';
+    txId = Number.isInteger(Number(txId)) && Number(txId) > 0 ? Number(txId) : null;  // only ever a plain number inside onclick
     if (txId) {
+      const catLabel = escapeHtml(category || 'other');
+      const payLabel = escapeHtml(paymentMethod || 'cash (default)');
       inlineMenuHtml = `
         <div style="background:#FAF8F3;border:1px solid var(--border);border-radius:6px;padding:8px;margin-top:8px;font-size:12px;">
           <div style="display:flex;align-items:center;justify-content:space-between;font-family:'Press Start 2P',monospace;font-size:6.5px;color:var(--sage);margin-bottom:6px;">
@@ -510,11 +513,11 @@ document.addEventListener('DOMContentLoaded', () => {
           <div style="display:flex;flex-direction:column;gap:4px;">
             <button style="display:flex;align-items:center;text-align:left;background:none;border:none;padding:3px 6px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:12px;color:var(--ink);" onclick="window.changeCategory(${txId})">
               <span style="color:var(--sage);font-weight:bold;margin-right:6px;">▶</span>
-              <span>Category: <strong style="color:var(--sage-dark);">${category || 'Dining'}</strong></span>
+              <span>Category: <strong style="color:var(--sage-dark);">${catLabel}</strong></span>
             </button>
             <button style="display:flex;align-items:center;text-align:left;background:none;border:none;padding:3px 6px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:12px;color:var(--ink);" onclick="window.changePayment(${txId})">
               <span style="color:var(--sage);font-weight:bold;margin-right:6px;">▶</span>
-              <span>Payment: <strong style="color:var(--rose-dark);">${paymentMethod || 'UPI Wallet'}</strong></span>
+              <span>Payment: <strong style="color:var(--rose-dark);">${payLabel}</strong></span>
             </button>
             <button style="display:flex;align-items:center;text-align:left;background:none;border:none;padding:3px 6px;border-radius:4px;cursor:pointer;font-family:inherit;font-size:12px;color:#DC2626;" onclick="window.undoTxId(${txId})">
               <span style="color:#DC2626;font-weight:bold;margin-right:6px;">▶</span>
@@ -574,7 +577,7 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       if (data.ok && data.balance !== undefined) updateBalanceDisplay(data.balance);
       if (data.ok && data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
-      renderCompanionBubble(data.html || data.text || `⚔ SPELL: REVERT EXECUTED. Restored GP to the treasury purse.`);
+      renderCompanionBubble(data.html || escapeHtml(data.text || '') || `⚔ SPELL: REVERT EXECUTED. Restored GP to the treasury purse.`);
     } catch(e) {
       renderCompanionBubble(`⚠ Connection error — undo did NOT go through. Balance unchanged. Try again.`);
     }
@@ -601,6 +604,42 @@ document.addEventListener('DOMContentLoaded', () => {
       renderCompanionBubble(`⚠ Connection error — #${txId} was NOT confirmed removed. Check /history.`);
     }
   };
+  window.quickSetBalance = async function(method) {
+    const label = String(method || 'cash').toUpperCase();
+    const raw = prompt(`Enter correct ${label} balance (₹):`);
+    if (raw === null) return;
+    const amt = parseFloat(String(raw).replace(/[^0-9.]/g, ''));
+    if (!Number.isFinite(amt) || amt < 0) {
+      alert('Enter a valid non-negative number.');
+      return;
+    }
+    playBeep(520);
+    try {
+      const res = await fetch('/api/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: `/balance ${amt} ${method}` }),
+        credentials: 'same-origin',
+      });
+      let data = null;
+      try { data = await res.json(); } catch (_) { data = null; }
+      if (!data) {
+        renderCompanionBubble(`⚠ Server error (HTTP ${res.status}) — ${label} balance NOT confirmed changed. Check /balance.`);
+        return;
+      }
+      if (data.ok) {
+        playCoin();
+        if (data.balance !== undefined) updateBalanceDisplay(data.balance);
+        if (data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
+        renderCompanionBubble(data.html || escapeHtml(data.text || `${label} balance set to ₹${amt.toFixed(2)}.`));
+      } else {
+        renderCompanionBubble(`⚠ ${escapeHtml(data.text || `Could not set ${label} balance.`)}`);
+      }
+    } catch (e) {
+      renderCompanionBubble(`⚠ Connection error — ${label} balance may not have changed. Check /balance.`);
+    }
+  };
+
   window.changeCategory = async function(txId) {
     const newCat = prompt("Enter new category (food, groceries, transport, bills, shopping, entertainment, health, rent, other):", "groceries");
     if (!newCat) return;
@@ -666,6 +705,8 @@ document.addEventListener('DOMContentLoaded', () => {
   async function fetchAndDisplayBalance() { return _runReadOnlyCommand('/balance', 'balances'); }
   async function fetchAndDisplayHistory() { return _runReadOnlyCommand('/history', 'history'); }
   function escapeHtml(str) {
-    return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return String(str == null ? '' : str)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 });

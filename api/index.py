@@ -53,12 +53,12 @@ def _load_dotenv(path=None):
 
 _load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
 # Service-role key: used server-side ONLY for database access (every query is scoped to the signed-in
 # user inside _sb()) and for deleting an account. It is never sent to the browser.
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", os.getenv("SUPABASE_KEY", ""))
+SUPABASE_KEY = (os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY") or "").strip()
 # Anon / publishable key: used for the Supabase Auth endpoints (sign-up, sign-in, refresh, ...).
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()
 
 # Public URL of the deployed site; the password-reset email links back to SITE_URL/reset.html.
 # It must be listed under Supabase -> Authentication -> URL Configuration -> Redirect URLs.
@@ -84,20 +84,37 @@ RATE_LIMIT_PER_DAY = _env_int("RATE_LIMIT_PER_DAY", 300)
 DEV_MODE = os.getenv("FOGLESS_DEV_MODE", "") == "1"
 
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_CHAT_API = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_AUDIO_API = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "openai/gpt-oss-120b"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 
 
-SB_HEADERS = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json",
-} if SUPABASE_KEY else {}
+def _is_jwt(key: str) -> bool:
+    """Legacy anon / service_role keys are JWTs. The newer sb_publishable_... / sb_secret_... keys are NOT:
+    Supabase accepts them only in the `apikey` header and rejects the call ("Invalid JWT") if they are also
+    sent as `Authorization: Bearer`."""
+    return key.startswith("eyJ") and key.count(".") == 2
+
+
+def _key_headers(key: str) -> dict:
+    headers = {"apikey": key, "Content-Type": "application/json"}
+    if _is_jwt(key):
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
+SB_HEADERS = _key_headers(SUPABASE_KEY) if SUPABASE_KEY else {}
 SB_TIMEOUT = 8
 SB_PAGE_SIZE = 1000
+
+
+# One pooled session for every Supabase call (REST + Auth). Without it each query paid a fresh TCP + TLS
+# handshake, which on a message that makes ~10 queries was most of the latency.
+_HTTP = requests.Session()
+_HTTP.mount("https://", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=16))
+_HTTP.mount("http://", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=16))
 
 
 IST = timezone(timedelta(hours=5, minutes=30))  # local calendar-day boundary for /stats "today"
@@ -286,6 +303,7 @@ def fmt(amount) -> str:
 
 MAX_AMOUNT = Decimal("1000000000")  # 100 crore: anything bigger is a typo, not a purchase
 MAX_TEXT_LEN = 1000
+MAX_ITEMS_PER_MESSAGE = 25  # a runaway LLM answer must not trigger dozens of sequential writes
 _SELF_WORDS = {"me", "myself", "i", "self", "us", "mine"}
 _NOT_PEOPLE = {"salary", "freelance", "refund", "bonus", "interest", "cashback", "job", "work"}
 _NAME_STOP = {"via", "on", "using", "by", "for", "in", "at", "and", "back", "each", "way", "ways",
@@ -513,13 +531,21 @@ def _sb_raw(method, path, params=None, json_body=None, prefer=None, ok_statuses=
     headers = dict(SB_HEADERS)
     if prefer:
         headers["Prefer"] = prefer
-    try:
-        r = requests.request(
-            method, _sb_url(path), headers=headers, params=params, json=json_body, timeout=SB_TIMEOUT
-        )
-    except requests.RequestException as e:
-        print(f"[supabase] {method} {path} network error: {e}")
-        raise StorageError(f"{method} {path}: {type(e).__name__}") from e
+    # A reused keep-alive connection can turn out to be dead (idle serverless instance). Reads are safe to
+    # repeat once; writes are never retried, so a flaky connection can not create a duplicate row.
+    attempts = 2 if method.upper() == "GET" else 1
+    for attempt in range(attempts):
+        try:
+            r = _HTTP.request(
+                method, _sb_url(path), headers=headers, params=params, json=json_body, timeout=SB_TIMEOUT
+            )
+            break
+        except requests.RequestException as e:
+            if (attempt + 1 < attempts and isinstance(e, requests.ConnectionError)
+                    and not isinstance(e, requests.Timeout)):
+                continue
+            print(f"[supabase] {method} {path} network error: {e}")
+            raise StorageError(f"{method} {path}: {type(e).__name__}") from e
     if r.status_code >= 300 and r.status_code not in ok_statuses:
         print(f"[supabase] {method} {path} -> {r.status_code} {r.text[:300]}")
         raise StorageError(f"{method} {path} failed (HTTP {r.status_code})", r.status_code)
@@ -1504,9 +1530,9 @@ def _call_groq_chat(text):
         content = r.json()["choices"][0]["message"]["content"]
         data = json.loads(content, parse_float=Decimal)
         raw_items = data.get("transactions") if isinstance(data, dict) else None
-        if raw_items:
-            results, dropped = [], 0
-            for x in raw_items:
+        if isinstance(raw_items, list) and raw_items:
+            results, dropped = [], max(0, len(raw_items) - MAX_ITEMS_PER_MESSAGE)
+            for x in raw_items[:MAX_ITEMS_PER_MESSAGE]:
                 v = None
                 if isinstance(x, dict):
                     v = _validate_debt_item(x) if x.get("share_type") else _validate_item(x)
@@ -2300,10 +2326,12 @@ def _gotrue(method, path, token=None, params=None, json_body=None, admin=False):
     if not (SUPABASE_URL and key):
         print("[auth] SUPABASE_URL / SUPABASE_ANON_KEY (and SUPABASE_SERVICE_KEY for account deletion) must be set")
         raise AuthServiceError("authentication is not configured")
-    headers = {"apikey": key, "Authorization": f"Bearer {token or key}", "Content-Type": "application/json"}
+    headers = _key_headers(key)
+    if token:  # a signed-in user's own access token (or a recovery token) always travels as the bearer
+        headers["Authorization"] = f"Bearer {token}"
     try:
-        r = requests.request(method, f"{SUPABASE_URL}/auth/v1/{path}", headers=headers, params=params,
-                             json=json_body, timeout=SB_TIMEOUT)
+        r = _HTTP.request(method, f"{SUPABASE_URL}/auth/v1/{path}", headers=headers, params=params,
+                          json=json_body, timeout=SB_TIMEOUT)
     except requests.RequestException as e:
         print(f"[auth] {method} {path} network error: {e}")
         raise AuthServiceError(f"{method} {path}: {type(e).__name__}") from e
@@ -2478,6 +2506,8 @@ def _authenticate():
                 g.new_session = data
                 _cache_principal(data["access_token"], p)
                 return p
+        if _err_code(data) == "refresh_token_already_used":
+            return None  # a parallel request just rotated it; its response carries the new cookies, keep them
         if status in (200, 400, 401, 403, 422):
             g.clear_cookies = True  # the refresh token is dead; drop the stale cookies
             return None
@@ -2992,7 +3022,7 @@ def _process_text_core(text: str, allow_commands: bool = True):
                     pool_cards.append(f"""
                     <div class="border-b border-[#E5DFC9] pb-1 mb-1">
                       <div class="flex justify-between font-bold text-[12px] text-[#142B1A]">
-                        <span>⚡ {p.upper()} Pool</span>
+                        <span>⚡ {_esc(p.upper())} Pool</span>
                         <span class="font-numeral text-[10px] text-[#059669] font-bold">₹{fmt(s['balance'])} LEFT</span>
                       </div>
                       <div class="text-[10px] text-[#6B7280]">In: ₹{fmt(s['total_in'])} | Out: ₹{fmt(s['total_out'])}</div>
@@ -3020,7 +3050,7 @@ def _process_text_core(text: str, allow_commands: bool = True):
             for e in s["expenses"]:
                 note_str = f" ({_esc(e['note'])})" if e.get("note") else ""
                 expense_lines_list.append(
-                    f"<div class='flex justify-between py-0.5 border-b border-[#E5DFC9]'><span>{e.get('category','other').capitalize()}{note_str}</span><span class='font-numeral text-[10px] font-bold text-[#E15554]'>-₹{fmt(e['amount'])}</span></div>"
+                    f"<div class='flex justify-between py-0.5 border-b border-[#E5DFC9]'><span>{_esc(str(e.get('category') or 'other').capitalize())}{note_str}</span><span class='font-numeral text-[10px] font-bold text-[#E15554]'>-₹{fmt(e['amount'])}</span></div>"
                 )
             expense_lines = "".join(expense_lines_list)
             net_lines = "".join(
@@ -3030,7 +3060,7 @@ def _process_text_core(text: str, allow_commands: bool = True):
             html = f"""
             <div class="space-y-2">
               <div class="flex justify-between items-center border-b border-[#A6DCB1] pb-1">
-                <span class="font-bold text-[14px] text-[#142B1A]">⚡ {pool_name.upper()} Pool</span>
+                <span class="font-bold text-[14px] text-[#142B1A]">⚡ {_esc(pool_name.upper())} Pool</span>
                 <span class="font-numeral text-[10px] bg-[#142B1A] text-[#FDE047] px-1.5 py-0.5">₹{fmt(s['balance'])} LEFT</span>
               </div>
               <div class="pixel-window-jrpg p-2 text-[12px] space-y-0.5">
@@ -3198,6 +3228,9 @@ def api_message():
     if not text:
         return jsonify({"ok": False, "text": "Empty message."}), 400
 
+    if len(text) > MAX_TEXT_LEN:  # reject BEFORE anything is stored or counted
+        return jsonify({"ok": False, "text": f"Message too long (max {MAX_TEXT_LEN} characters)."}), 400
+
     limited = _rate_limited()
     if limited:
         return jsonify({"ok": False, "text": limited}), 429
@@ -3299,7 +3332,7 @@ def api_voice():
         # Never invent a transcript: a failed transcription logs nothing.
         return jsonify({"ok": False, "text": err}), 502
 
-    log_chat_message("user", f"🎙 {transcribed}")
+    log_chat_message("user", f"🎙 {transcribed[:MAX_TEXT_LEN]}")
     res = _process_text(transcribed, allow_commands=False)
     payload, status = _unwrap(res)
     payload = dict(payload)
