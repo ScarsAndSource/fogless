@@ -4,9 +4,9 @@
   "webDir": "www",
   "backgroundColor": "#FBF8F1",
   "server": {
-    "url": "https://YOUR-APP.vercel.app",
+    "url": "https://fogless-psi.vercel.app",
     "cleartext": false,
-    "allowNavigation": ["YOUR-APP.vercel.app"],
+    "allowNavigation": ["fogless-psi.vercel.app"],
     "errorPath": "offline.html"
   },
   "android": {
