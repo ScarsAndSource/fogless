@@ -18,6 +18,7 @@ import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 
 import com.getcapacitor.BridgeActivity;
+import com.vcorp.fogless.widget.WidgetRefresher;
 
 public class MainActivity extends BridgeActivity {
     private static final String APP_URL = "https://YOUR-APP.vercel.app";   // same as server.url
@@ -66,6 +67,8 @@ public class MainActivity extends BridgeActivity {
     @Override
     public void onPause() {
         CookieManager.getInstance().flush();
+        // Leaving the app (usually right after logging something): repaint the home-screen widgets.
+        WidgetRefresher.requestNow(getApplicationContext());
         super.onPause();
     }
 }
