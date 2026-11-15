@@ -127,6 +127,24 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  // Phone menu: Quick Actions (balances, export, backup, delete account) open as a full-screen sheet.
+  const menuBtn = document.getElementById('menu-btn');
+  const rightPanel = document.getElementById('right-panel');
+  const panelClose = document.getElementById('panel-close');
+  function setMenu(open) {
+    if (!rightPanel) return;
+    rightPanel.classList.toggle('open', open);
+  }
+  if (menuBtn) menuBtn.addEventListener('click', () => { playBeep(440); setMenu(true); });
+  if (panelClose) panelClose.addEventListener('click', () => { playBeep(330); setMenu(false); });
+  if (rightPanel) {
+    rightPanel.addEventListener('click', (e) => {
+      if (e.target.closest && e.target.closest('.panel-btn')) setMenu(false);
+    });
+  }
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setMenu(false); });
+  window.addEventListener('resize', () => { if (window.innerWidth >= 1024) setMenu(false); });
+
   let currentBalance = 0;
   let todaySpent = 0;
   const todayLimit = 120.00;
@@ -346,7 +364,7 @@ document.addEventListener('DOMContentLoaded', () => {
         playCoin();
         if (data.balance !== undefined) updateBalanceDisplay(data.balance);
         if (data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
-        renderCompanionBubble(data.message_html || escapeHtml(data.text || ''), data.tx_id, data.category, data.payment_method);
+        renderCompanionBubble(data.message_html || plainToHtml(data.text || ''), data.tx_id, data.category, data.payment_method);
       } else {
         renderCompanionBubble(`⚠ ${escapeHtml(data.text || 'Voice note could not be processed.')}`);
       }
@@ -388,7 +406,8 @@ document.addEventListener('DOMContentLoaded', () => {
           `;
           chatThread.appendChild(bubble);
         } else {
-          renderCompanionBubble(msg.content);
+          const c = String(msg.content == null ? '' : msg.content);
+          renderCompanionBubble(c.trimStart().startsWith('<') ? c : c.replace(/\r?\n/g, '<br>'));
         }
       });
 
@@ -460,9 +479,9 @@ document.addEventListener('DOMContentLoaded', () => {
         playCoin();
         if (data.balance !== undefined) updateBalanceDisplay(data.balance);
         if (data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
-        renderCompanionBubble(data.html || escapeHtml(data.text || ''), data.tx_id, data.category, data.payment_method);
+        renderCompanionBubble(data.html || plainToHtml(data.text || ''), data.tx_id, data.category, data.payment_method);
       } else {
-        renderCompanionBubble(escapeHtml(data.text || "Could not execute spell."));
+        renderCompanionBubble(plainToHtml(data.text || "Could not execute spell."));
       }
     } catch(e) {
       // Network failure: the request may or may not have reached the server.
@@ -641,7 +660,7 @@ document.addEventListener('DOMContentLoaded', () => {
   };
 
   window.changeCategory = async function(txId) {
-    const newCat = prompt("Enter new category (food, groceries, transport, bills, shopping, entertainment, health, rent, other):", "groceries");
+    const newCat = prompt("New category.\nExpense: food, groceries, transport, bills, shopping, entertainment, health, subscriptions, rent, education, travel, fitness, other\nIncome: salary, freelance, gift, refund, other", "groceries");
     if (!newCat) return;
     try {
       const res = await fetch('/api/action', {
@@ -695,7 +714,7 @@ document.addEventListener('DOMContentLoaded', () => {
         renderCompanionBubble(`⚠ Server error (HTTP ${res.status}) while loading ${label}.`);
         return;
       }
-      renderCompanionBubble(data.ok ? (data.html || escapeHtml(data.text || '')) : escapeHtml(data.text || `Could not load ${label}.`));
+      renderCompanionBubble(data.ok ? (data.html || plainToHtml(data.text || '')) : plainToHtml(data.text || `Could not load ${label}.`));
     } catch(e) {
       renderCompanionBubble(`⚠ Connection error — could not load ${label}.`);
     }
@@ -704,6 +723,11 @@ document.addEventListener('DOMContentLoaded', () => {
   async function fetchAndDisplayStats() { return _runReadOnlyCommand('/stats', 'stats'); }
   async function fetchAndDisplayBalance() { return _runReadOnlyCommand('/balance', 'balances'); }
   async function fetchAndDisplayHistory() { return _runReadOnlyCommand('/history', 'history'); }
+  // Plain-text replies (e.g. /aliases) keep their line breaks; server-built HTML is left alone.
+  function plainToHtml(str) {
+    return escapeHtml(str).replace(/\r?\n/g, '<br>');
+  }
+
   function escapeHtml(str) {
     return String(str == null ? '' : str)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")

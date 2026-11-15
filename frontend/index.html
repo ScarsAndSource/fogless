@@ -2,13 +2,14 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
 <meta name="description" content="Fogless — your calm JRPG budget companion. Log expenses, track balances, and chat with Extreme."/>
 <title>Fogless — JRPG Budget Companion</title>
 <link href="https://fonts.googleapis.com" rel="preconnect"/>
 <link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
 <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&display=swap" rel="stylesheet"/>
 <link rel="stylesheet" href="/style.css"/>
+<link rel="stylesheet" href="/utilities.css"/>
 <script src="/auth.js"></script>
 </head>
 <body>
@@ -120,6 +121,7 @@
         <div class="chat-topbar-title">Sanctuary Chat</div>
         <div class="chat-topbar-sub">Log expenses · Ask Extreme · Run spells</div>
       </div>
+      <button type="button" class="menu-btn" id="menu-btn" aria-label="Open menu">&#9776; MENU</button>
       <span id="greeting-time" style="font-family:'Press Start 2P',monospace;font-size:8px;color:#A89A8A;">09:14 AM</span>
     </div>
 
@@ -185,7 +187,7 @@
           <textarea
             id="terminal-input"
             rows="1"
-            placeholder="Type '24 coffee' or '/' for spells…"
+            placeholder="Type '24 coffee' or '/'…"
           ></textarea>
           <span class="pixel-cursor"></span>
         </div>
@@ -201,6 +203,7 @@
 
   <!-- ══════════ RIGHT PANEL ══════════ -->
   <div id="right-panel">
+    <button type="button" class="panel-close" id="panel-close" aria-label="Close menu">&#10005; CLOSE</button>
     <div>
       <div class="panel-title">Quick Actions</div>
       <div style="display:flex;flex-direction:column;gap:6px;margin-top:8px;">
@@ -237,6 +240,7 @@
       </div>
     </div>
 
+    <a class="panel-link" href="/privacy.html">Privacy policy</a>
     <!-- A / B control row kept for keyboard shortcuts feel -->
     <div class="control-row">
       <button class="ctrl-btn" id="btn-b" title="Undo">B · REVERT</button>

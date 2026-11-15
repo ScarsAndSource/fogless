@@ -1,0 +1,54 @@
+/* Fogless utilities.css: defines every class api/index.py emits (Tailwind is not loaded) + phone layout */
+.flex{display:flex}.flex-wrap{flex-wrap:wrap}.items-center{align-items:center}
+.justify-between{justify-content:space-between;gap:10px}.gap-1\.5{gap:6px}.cursor-pointer{cursor:pointer}
+.space-y-0\.5>*+*{margin-top:2px}.space-y-1>*+*{margin-top:4px}.space-y-1\.5>*+*{margin-top:6px}
+.space-y-2>*+*{margin-top:8px}.space-y-2\.5>*+*{margin-top:10px}
+.mb-1{margin-bottom:4px}.mt-2{margin-top:8px}.p-2{padding:8px}.pb-1{padding-bottom:4px}
+.px-1{padding-left:4px;padding-right:4px}.px-1\.5{padding-left:6px;padding-right:6px}
+.py-0\.5{padding-top:2px;padding-bottom:2px}.py-1{padding-top:4px;padding-bottom:4px}
+.border{border:1px solid}.border-b{border-bottom:1px solid}
+.border-\[\#065F46\]{border-color:#065F46}.border-\[\#1D4ED8\]{border-color:#1D4ED8}
+.border-\[\#1E40AF\]{border-color:#1E40AF}.border-\[\#6D28D9\]{border-color:#6D28D9}
+.border-\[\#7F1D1D\]{border-color:#7F1D1D}.border-\[\#991B1B\]{border-color:#991B1B}
+.border-\[\#A6DCB1\]{border-color:#A6DCB1}.border-\[\#B45309\]{border-color:#B45309}
+.border-\[\#E5DFC9\]{border-color:#E5DFC9}
+.bg-\[\#10B981\]{background-color:#10B981}.bg-\[\#142B1A\]{background-color:#142B1A}
+.bg-\[\#374151\]{background-color:#374151}.bg-\[\#3B82F6\]{background-color:#3B82F6}
+.bg-\[\#8B5CF6\]{background-color:#8B5CF6}.bg-\[\#E15554\]{background-color:#E15554}
+.bg-\[\#F59E0B\]{background-color:#F59E0B}.bg-\[\#F87171\]{background-color:#F87171}
+.text-white{color:#fff}.text-\[\#059669\]{color:#059669}.text-\[\#064E3B\]{color:#064E3B}
+.text-\[\#065F46\]{color:#065F46}.text-\[\#142B1A\]{color:#142B1A}.text-\[\#2D5A35\]{color:#2D5A35}
+.text-\[\#6B7280\]{color:#6B7280}.text-\[\#8A8578\]{color:#8A8578}.text-\[\#E15554\]{color:#E15554}
+.text-\[\#FDE047\]{color:#FDE047}
+.text-\[9px\]{font-size:9px}.text-\[10px\]{font-size:10px}.text-\[11px\]{font-size:11px}
+.text-\[12px\]{font-size:12px}.text-\[13px\]{font-size:13px}.text-\[14px\]{font-size:14px}
+.font-bold{font-weight:700}.font-mono{font-family:'Space Mono',monospace}
+.font-numeral{font-variant-numeric:tabular-nums;white-space:nowrap}
+.italic{font-style:italic}.underline{text-decoration:underline}.decoration-2{text-decoration-thickness:2px}
+.pixel-window-jrpg{background:#FAF8F3;border:1px solid var(--border,#D7CDBB);border-radius:6px}
+.pixel-hp-bar{display:flex;gap:2px}.meter-cell{flex:1;height:8px;border-radius:1px}
+.bubble-meta{gap:12px}
+.bubble-sage,.bubble-rose{overflow-wrap:anywhere}
+.panel-link{display:block;font-size:11px;color:var(--ink-muted);text-align:center;padding:8px 0}
+.menu-btn,.panel-close{display:none}
+
+@media (max-width:1023px){
+  #app{width:100%;height:100%;grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(0,1fr)}
+  #sidebar{display:block;grid-row:1;border-right:none;border-bottom:1px solid var(--border);overflow:visible}
+  #sidebar .app-brand,#sidebar .extreme-card,#sidebar .sidebar-scroll,#sidebar .sidebar-footer{display:none}
+  #sidebar .sidebar-header{display:flex;gap:8px;padding:8px 10px;border-bottom:none}
+  #sidebar .balance-card,#sidebar .pace-card{flex:1 1 0;min-width:0;margin-top:0;padding:8px 10px}
+  #sidebar .balance-amount{font-size:12px}
+  #chat-area{grid-row:2;min-height:0;border-right:none}
+  .chat-topbar{padding:10px 12px;gap:8px}.chat-topbar-sub{display:none}
+  #chat-thread{padding:14px 12px}.msg-assistant{max-width:94%}.msg-user{max-width:88%}
+  .menu-btn{display:inline-block;font-family:'Press Start 2P',monospace;font-size:8px;color:var(--sage-dark);
+    background:var(--sage-light);border:1px solid var(--sage-border);border-radius:6px;padding:8px 10px;cursor:pointer}
+  #right-panel{display:none}
+  #right-panel.open{display:flex;flex-direction:column;gap:14px;position:fixed;inset:0;z-index:100;
+    overflow-y:auto;background:var(--linen);padding:16px}
+  #right-panel.open .control-row{display:none}
+  .panel-close{display:block;align-self:flex-end;font-family:'Press Start 2P',monospace;font-size:8px;
+    color:var(--ink);background:#fff;border:1px solid var(--border);border-radius:6px;padding:10px 12px;cursor:pointer}
+  #right-panel .panel-btn{min-height:44px}
+}
