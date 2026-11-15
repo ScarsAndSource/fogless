@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/cap_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="horizontal"
+    android:gravity="center_vertical"
+    android:padding="6dp"
+    android:background="@drawable/widget_bg">
+
+    <TextView
+        android:id="@+id/cap_text"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:gravity="center_vertical"
+        android:paddingStart="14dp"
+        android:paddingEnd="8dp"
+        android:maxLines="1"
+        android:ellipsize="end"
+        android:fontFamily="monospace"
+        android:text="@string/widget_capture_hint"
+        android:textColor="#716450"
+        android:textSize="14sp"
+        android:contentDescription="@string/widget_capture_text_cd"
+        android:background="@drawable/widget_field_bg" />
+
+    <TextView
+        android:id="@+id/cap_mic"
+        android:layout_width="52dp"
+        android:layout_height="match_parent"
+        android:layout_marginStart="6dp"
+        android:gravity="center"
+        android:text="&#x1F399;&#xFE0F;"
+        android:textSize="20sp"
+        android:contentDescription="@string/widget_capture_mic_cd"
+        android:background="@drawable/widget_mic_bg" />
+</LinearLayout>

@@ -33,6 +33,58 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths"></meta-data>
         </provider>
+
+        <!-- ===== Home-screen widgets ===== -->
+
+        <receiver
+            android:name=".widget.CaptureWidgetProvider"
+            android:label="@string/widget_capture_label"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/capture_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.InfoWidgetProvider"
+            android:label="@string/widget_info_label"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/info_widget_info" />
+        </receiver>
+
+        <!-- Launched by the system when an info widget is added / reconfigured -->
+        <activity
+            android:name=".widget.InfoConfigActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Material.Light.Dialog.NoActionBar">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" />
+            </intent-filter>
+        </activity>
+
+        <!-- Floating quick-capture screens, started only by our own widget -->
+        <activity
+            android:name=".widget.QuickTextActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:windowSoftInputMode="stateAlwaysVisible|adjustResize"
+            android:theme="@android:style/Theme.Material.Light.Dialog.NoActionBar" />
+
+        <activity
+            android:name=".widget.VoiceCaptureActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Material.Light.Dialog.NoActionBar" />
     </application>
 
     <!-- Permissions -->

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="widget_capture_label">Fogless &#183; Quick log</string>
+    <string name="widget_capture_desc">Type or speak an expense straight from your home screen.</string>
+    <string name="widget_capture_hint">Log: 24 coffee upi&#8230;</string>
+    <string name="widget_capture_text_cd">Type an expense</string>
+    <string name="widget_capture_mic_cd">Record a voice note</string>
+    <string name="widget_info_label">Fogless &#183; Stats</string>
+    <string name="widget_info_desc">Balance, this month\'s stats or recent history.</string>
+    <string name="widget_info_title_default">FOGLESS</string>
+    <string name="widget_refresh_cd">Refresh</string>
+</resources>
