@@ -51,7 +51,11 @@ class User:
 
 
 class Base(unittest.TestCase):
+    def setUp(self):
+        idx._THROTTLE.clear()  # every test client shares 127.0.0.1; the per-IP abuse limits must start empty
+
     def tearDown(self):
+        idx._THROTTLE.clear()
         FAKE.confirm_email = False
         idx.SIGNUPS_OPEN, idx.SIGNUP_CODE = True, ""
         idx.RATE_LIMIT_PER_MIN, idx.RATE_LIMIT_PER_DAY = 20, 300

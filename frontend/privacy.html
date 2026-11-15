@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Fogless — Privacy Policy</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  :root { --linen:#FBF8F1; --sage:#5B8B67; --sage-dark:#2A4533; --ink:#243528; --ink-muted:#716450; --border:#D7CDBB; }
+  body { margin:0; padding:24px; background:var(--linen); color:var(--ink);
+         font-family:'Space Mono', ui-monospace, Menlo, Consolas, monospace; font-size:14px; line-height:1.6; }
+  main { max-width:720px; margin:0 auto; background:#fff; border:1px solid var(--border); border-radius:12px; padding:24px; }
+  h1 { font-size:20px; margin:0 0 4px; color:var(--sage-dark); }
+  h2 { font-size:15px; margin:24px 0 6px; color:var(--sage-dark); }
+  p, li { margin:6px 0; }
+  ul { padding-left:20px; }
+  .muted { color:var(--ink-muted); font-size:12px; }
+  a { color:var(--sage-dark); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Fogless Privacy Policy</h1>
+  <p class="muted">Last updated: 14 November 2026</p>
+
+  <p>Fogless is a personal expense tracker. You type what you spent or received; the app parses, categorises and
+  stores it in your private ledger. Fogless does <strong>not</strong> connect to your bank, read your SMS, or access
+  your contacts. It only knows what you type or say to it.</p>
+
+  <h2>What we collect</h2>
+  <ul>
+    <li><strong>Account:</strong> your email address and password (the password is handled by our authentication
+    provider and is stored only in hashed form; we never see or store it in plain text), and your device's time zone.</li>
+    <li><strong>Your ledger:</strong> the transactions, notes, categories, payment methods, balances, shared-money
+    entries (including any names of people you type), learned shortcuts, and the chat history of messages you send to the app.</li>
+    <li><strong>Voice notes:</strong> if you use the microphone button, the recording is sent to be transcribed and then
+    discarded by us. Only the resulting text is kept in your chat history.</li>
+    <li><strong>Technical data:</strong> standard server logs (such as IP address and time of request) kept by our hosting
+    providers for security and reliability.</li>
+  </ul>
+  <p>We do not use advertising, analytics or tracking SDKs, and we do not sell your data.</p>
+
+  <h2>How we use it</h2>
+  <p>Only to run the app for you: to sign you in, to understand and record what you type, to show your balances and
+  history, and to protect the service from abuse. Your ledger is visible only to your account.</p>
+
+  <h2>Who processes it</h2>
+  <ul>
+    <li><strong>Supabase</strong> — authentication and database storage.</li>
+    <li><strong>Vercel</strong> — hosting of the app and its server.</li>
+    <li><strong>Groq</strong> — the text of messages you send (and voice recordings) is sent to Groq's AI service to be
+    parsed or transcribed. Do not type anything into the app that you would not want processed this way.</li>
+    <li><strong>Google Fonts</strong> — the app loads its fonts from Google, which means Google receives your IP address
+    when a page loads.</li>
+  </ul>
+
+  <h2>Cookies</h2>
+  <p>Two strictly necessary, HttpOnly session cookies keep you signed in. There are no tracking cookies.</p>
+
+  <h2>How long we keep it</h2>
+  <p>Until you delete it. You can erase your whole ledger with <code>/reset confirm</code>, or delete your account and
+  all of its data from the app (Quick Actions → Delete Account). Copies may remain in our providers' backups for a
+  limited time after deletion.</p>
+
+  <h2>Your choices and rights</h2>
+  <ul>
+    <li><strong>Access / export:</strong> download your data any time as CSV or JSON from Quick Actions.</li>
+    <li><strong>Correction:</strong> edit or delete any entry in the app.</li>
+    <li><strong>Deletion:</strong> delete your account in the app. If you cannot sign in, email us at the address below
+    from your registered email address and we will delete the account and its data.</li>
+    <li>Depending on where you live (for example under India's Digital Personal Data Protection Act, 2023), you may
+    have further rights, including to withdraw consent and to raise a grievance. Contact us below.</li>
+  </ul>
+
+  <h2>Security</h2>
+  <p>Data is encrypted in transit (HTTPS) and each account's data is isolated from every other account. No system is
+  perfectly secure; please use a strong, unique password.</p>
+
+  <h2>Children</h2>
+  <p>Fogless is not intended for anyone under 18.</p>
+
+  <h2>Changes</h2>
+  <p>If this policy changes, the date above will be updated.</p>
+
+  <h2>Contact</h2>
+  <p>V Corp. — <a href="mailto:REPLACE-WITH-YOUR-EMAIL@example.com">REPLACE-WITH-YOUR-EMAIL@example.com</a></p>
+
+  <p><a href="/login.html">Back to sign in</a></p>
+</main>
+</body>
+</html>

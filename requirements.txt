@@ -1,3 +1,16 @@
-flask==3.0.3
-requests==2.32.3
-tzdata>=2024.1
+# Direct dependencies and their transitive dependencies, all pinned to exact versions (reproducible builds,
+# and a freshly-published malicious release cannot slip in). Every version is at least 14 days old.
+# Re-check with:  pip-audit -r requirements.txt
+flask==3.1.3
+requests==2.34.2
+tzdata==2026.5
+blinker==1.9.0
+certifi==2026.10.23
+charset-normalizer==3.5.2
+click==8.5.0
+idna==3.20
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.4
+urllib3==2.8.0
+Werkzeug==3.1.9

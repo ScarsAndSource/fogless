@@ -80,6 +80,13 @@ def _env_int(name, default):
 RATE_LIMIT_PER_MIN = _env_int("RATE_LIMIT_PER_MIN", 20)
 RATE_LIMIT_PER_DAY = _env_int("RATE_LIMIT_PER_DAY", 300)
 
+# Pre-login abuse limits, per client IP (in-memory, per serverless instance: best effort, but it stops a burst
+# from using up Supabase's own sign-in limit, which is shared by EVERY user because sign-in is proxied through
+# this server). Wrong-password attempts are counted; successful sign-ins never are.
+AUTH_FAILS_PER_5MIN = _env_int("AUTH_FAILS_PER_5MIN", 10)
+SIGNUPS_PER_IP_PER_10MIN = _env_int("SIGNUPS_PER_IP_PER_10MIN", 10)
+VOICE_PER_MIN = _env_int("VOICE_PER_MIN", 12)  # every upload costs a Whisper call, even if it fails
+
 # Local-only mode: in-memory users and data, no Supabase. Ignored when Supabase is configured or on Vercel.
 DEV_MODE = os.getenv("FOGLESS_DEV_MODE", "") == "1"
 
@@ -2528,6 +2535,49 @@ def _clear_auth_cookies(resp):
         resp.delete_cookie(name, path=_COOKIE_PATH, httponly=True, secure=_COOKIE_SECURE, samesite="Lax")
 
 
+# --------------------------------------------------------------- abuse throttling (in-memory, best effort)
+
+_THROTTLE = {}  # (bucket, key) -> [monotonic timestamps]
+_THROTTLE_MAX_KEYS = 4096
+
+
+def _client_ip() -> str:
+    """The caller's IP. On Vercel the platform sets X-Forwarded-For itself (a client-supplied value is replaced)."""
+    xff = request.headers.get("X-Forwarded-For", "")
+    ip = xff.split(",")[0].strip() if xff else ""
+    return (ip or request.remote_addr or "unknown")[:64]
+
+
+def _throttle_recent(bucket, key, window):
+    now = time.monotonic()
+    return [t for t in _THROTTLE.get((bucket, key), ()) if now - t < window]
+
+
+def _throttle_blocked(bucket, key, limit, window) -> bool:
+    """True if `key` already has `limit` or more recorded events in the last `window` seconds."""
+    return limit > 0 and len(_throttle_recent(bucket, key, window)) >= limit
+
+
+def _throttle_hit(bucket, key, limit, window) -> bool:
+    """Records one event and returns True if `key` is now OVER `limit` events within `window` seconds."""
+    events = _throttle_recent(bucket, key, window)
+    events.append(time.monotonic())
+    if (bucket, key) not in _THROTTLE and len(_THROTTLE) >= _THROTTLE_MAX_KEYS:
+        _THROTTLE.clear()  # crude memory bound; an attacker spraying keys only resets everybody's counters
+    _THROTTLE[(bucket, key)] = events
+    return limit > 0 and len(events) > limit
+
+
+# Sent with every response from Flask; vercel.json sends the same policy for the static files (a test keeps the two
+# identical). The pages use inline <script>, inline style="" and onclick="" attributes, so 'unsafe-inline' is
+# required for scripts and styles; everything else is locked to this origin (+ Google Fonts).
+CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
+       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
+       "img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; "
+       "base-uri 'self'; form-action 'self'; object-src 'none'")
+PERMISSIONS_POLICY = "camera=(), microphone=(self), geolocation=(), payment=(), usb=()"
+
+
 @app.before_request
 def _gate():
     """Every /api/* route except the public auth ones needs a valid signed-in user; the identity is
@@ -2560,6 +2610,8 @@ def _after_request(resp):
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("X-Frame-Options", "DENY")
     resp.headers.setdefault("Referrer-Policy", "same-origin")
+    resp.headers.setdefault("Content-Security-Policy", CSP)
+    resp.headers.setdefault("Permissions-Policy", PERMISSIONS_POLICY)
     return resp
 
 
@@ -2595,6 +2647,8 @@ def api_config():
 def api_signup():
     if not SIGNUPS_OPEN:
         return jsonify({"ok": False, "text": "Sign-ups are closed."}), 403
+    if _throttle_hit("signup", _client_ip(), SIGNUPS_PER_IP_PER_10MIN, 600):
+        return jsonify({"ok": False, "text": "Too many attempts. Wait a few minutes and try again."}), 429
     data = _json_body()
     if SIGNUP_CODE and not hmac.compare_digest(str(data.get("code") or "").strip().encode("utf-8"),
                                                SIGNUP_CODE.encode("utf-8")):
@@ -2638,7 +2692,12 @@ def api_login():
     password = str(data.get("password") or "")
     if not email or not password:
         return jsonify({"ok": False, "text": "Enter your email and password."}), 400
+    ip = _client_ip()
+    if _throttle_blocked("login", ip, AUTH_FAILS_PER_5MIN, 300):
+        return jsonify({"ok": False, "text": "Too many attempts. Wait a few minutes and try again."}), 429
     status, d = _auth_login(email, password)
+    if status != 200:
+        _throttle_hit("login", ip, AUTH_FAILS_PER_5MIN, 300)
     if status == 200 and d.get("access_token") and d.get("refresh_token"):
         p = _principal(d.get("user"))
         if not p:
@@ -2683,10 +2742,13 @@ def api_forgot():
     email = _norm_email(data.get("email"))
     if _EMAIL_RE.match(email):
         redirect_to = (SITE_URL or request.host_url.rstrip("/")) + "/reset.html"
-        try:
-            _auth_recover(email, redirect_to)
-        except AuthServiceError:
-            pass  # logged; the answer below is identical either way
+        if (_throttle_hit("forgot_ip", _client_ip(), 10, 600) or _throttle_hit("forgot_email", email, 3, 600)):
+            pass  # too many requests: send nothing, but answer exactly as usual
+        else:
+            try:
+                _auth_recover(email, redirect_to)
+            except AuthServiceError:
+                pass  # logged; the answer below is identical either way
     return jsonify({"ok": True, "text": "If that email has an account, a reset link is on its way."})
 
 
@@ -2719,8 +2781,11 @@ def api_account_delete():
     """Erases the signed-in user's data and then the account itself. Needs the password again."""
     data = _json_body()
     password = str(data.get("password") or "")
+    if _throttle_blocked("delete_pw", g.uid, 5, 600):
+        return jsonify({"ok": False, "text": "Too many attempts. Wait a few minutes and try again."}), 429
     status, _d = _auth_login(g.email, password) if password else (400, {})
     if status != 200:
+        _throttle_hit("delete_pw", g.uid, 5, 600)
         return jsonify({"ok": False, "text": "Wrong password. Nothing was deleted."}), 403
     reset_all_data(include_settings=True)  # explicit, so nothing is orphaned even if a foreign key were missing
     status, _d = _auth_admin_delete(g.uid)
@@ -2749,7 +2814,7 @@ def _handle_storage_error(e):
     print(f"[storage] {e}")
     return jsonify({
         "ok": False,
-        "text": f"Database error ({e}). Check /history before retrying — the last action may not have been saved.",
+        "text": "Database error. Check /history before retrying — the last action may not have been saved.",
     }), 503
 
 
@@ -3322,6 +3387,8 @@ def api_voice():
     limited = _rate_limited()
     if limited:
         return jsonify({"ok": False, "text": limited}), 429
+    if _throttle_hit("voice", g.uid, VOICE_PER_MIN, 60):
+        return jsonify({"ok": False, "text": "Slow down a little - too many voice notes in one minute."}), 429
 
     audio_bytes = audio_file.read()
     if not audio_bytes:

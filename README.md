@@ -122,3 +122,15 @@ All routes except the public auth ones require a signed-in session.
 | `/api/state` `/api/balances` `/api/transactions` `/api/aliases` `/api/history` | GET | Your data |
 | `/api/action` | POST | undo / delete / change category or payment method |
 | `/api/export` `/api/backup` | GET | CSV / JSON of **your** data |
+
+## Pre-launch hardening (Nov 2026)
+
+- Dependencies are exactly pinned (`requirements.txt`); re-check with `pip-audit -r requirements.txt`.
+- Per-IP throttles on login failures, sign-up, forgot-password and delete-account; per-user throttle on voice uploads.
+- Security headers (CSP, no framing, nosniff, Permissions-Policy) on every response, including static files via `vercel.json`.
+  After each deploy run `curl -I https://YOUR-APP/` and confirm `Content-Security-Policy` is present.
+- `005_lockdown_and_verify.sql`: run it after 004; every row of its result must say PASS.
+- `frontend/privacy.html` is the privacy policy: put your real contact email in it.
+- `python release_check.py` fails if anything is still a placeholder or a secret-looking string is committed.
+- Android: load the deployed https site (cookie sessions need that origin). See `android-reference/`.
+- Not done here: CI. Add one that runs `pytest` and `pip-audit`, with actions pinned by commit SHA.

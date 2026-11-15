@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 .vercel
 .pytest_cache/
+.env.*
+!.env.example
+*.zip
+.DS_Store
+node_modules/
