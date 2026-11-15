@@ -1,0 +1,16 @@
+{
+  "appId": "com.vcorp.fogless",
+  "appName": "Fogless",
+  "webDir": "www",
+  "backgroundColor": "#FBF8F1",
+  "server": {
+    "url": "https://YOUR-APP.vercel.app",
+    "cleartext": false,
+    "allowNavigation": ["YOUR-APP.vercel.app"],
+    "errorPath": "offline.html"
+  },
+  "android": {
+    "allowMixedContent": false,
+    "webContentsDebuggingEnabled": false
+  }
+}
