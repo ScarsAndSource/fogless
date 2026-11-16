@@ -3,6 +3,7 @@ package com.vcorp.fogless;
 import android.app.DownloadManager;
 import android.content.Context;
 import android.graphics.Color;
+import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
@@ -40,13 +41,22 @@ public class MainActivity extends BridgeActivity {
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
-        // The web UI is light-only (linen). Without this, a dark-mode phone gets white status/nav-bar icons on a
-        // linen page (invisible) and WebView may try to auto-darken the page.
         AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_NO);
+
+        // The manifest gives this activity the launch/splash theme. EdgeToEdge.enable() below touches the window's
+        // decor view, which builds the window's views under whatever theme is active at that moment. Switch to the
+        // real app theme FIRST, otherwise the splash styling leaks into those views.
+        setTheme(R.style.AppTheme_NoActionBar);
         EdgeToEdge.enable(this);
         super.onCreate(savedInstanceState);
 
+        // Whatever happens, never let the window behind the page show anything but linen.
+        getWindow().setBackgroundDrawable(new ColorDrawable(LINEN));
+        getWindow().getDecorView().setBackgroundColor(LINEN);
+
         // 1) Keep the page clear of the status bar, navigation bar, camera cut-out and keyboard.
+        //    This is the ONLY place that pads for system bars: capacitor.config.json sets
+        //    SystemBars.insetsHandling = "disable", so Capacitor does not add a second padding on top.
         View root = findViewById(android.R.id.content);
         root.setBackgroundColor(LINEN);
         ViewCompat.setOnApplyWindowInsetsListener(root, (v, insets) -> {
@@ -56,6 +66,10 @@ public class MainActivity extends BridgeActivity {
             v.setPadding(bars.left, bars.top, bars.right, bars.bottom);
             return WindowInsetsCompat.CONSUMED;
         });
+        ViewCompat.requestApplyInsets(root);
+
+        // The WebView paints linen until the first page frame, never white/black/splash.
+        getBridge().getWebView().setBackgroundColor(LINEN);
 
         // 2) Export CSV / Backup JSON: send the session cookie with the download.
         WebView web = getBridge().getWebView();

@@ -13,12 +13,18 @@
         <item name="windowActionBar">false</item>
         <item name="windowNoTitle">true</item>
         <item name="android:background">@null</item>
+        <!-- Any gap around the WebView (status/nav bar areas) is linen, never black/white/splash -->
+        <item name="android:windowBackground">@color/fogless_linen</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
     </style>
 
 
     <style name="AppTheme.NoActionBarLaunch" parent="Theme.SplashScreen">
-        <!-- Android 10-11: window background image (regenerated with the Fogless badge) -->
-        <item name="android:background">@drawable/splash</item>
+        <!-- Android 10-11: launch window background. Must be windowBackground, NOT android:background:
+             a theme-level android:background is inherited by every View created under this theme and was
+             painting the splash image into stray strips of the app (the squashed icon in the header). -->
+        <item name="android:windowBackground">@drawable/splash</item>
         <!-- Android 12+: system splash = linen background + the app icon, in light AND dark mode -->
         <item name="windowSplashScreenBackground">#FBF8F1</item>
         <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher_foreground</item>
