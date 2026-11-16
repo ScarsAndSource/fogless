@@ -28,9 +28,11 @@ body { overscroll-behavior: none; }
   .balance-label,
   .pace-label { font-size: 10px; letter-spacing: 0.03em; margin-bottom: 4px; }
   .pace-label { flex-wrap: wrap; gap: 0 8px; }
-  #sidebar .balance-amount { font-size: 17px; font-weight: 700; min-width: 0; }
+  #sidebar .balance-card { flex: 1.25 1 0; }
+  #sidebar .pace-card { flex: 1 1 0; }
+  #sidebar .balance-amount { font-size: clamp(12px, 4.2vw, 17px); font-weight: 700; min-width: 0; }
   #sidebar .balance-currency { font-size: 12px; }
-  .pace-today { font-size: 15px; }
+  .pace-today { font-size: clamp(12px, 3.8vw, 15px); }
   #today-pct-val { font-size: 10px !important; }
   .pace-cell { height: 6px; }
   #balance-val, #today-logged-val {
@@ -39,7 +41,8 @@ body { overscroll-behavior: none; }
 
   /* ============ top bar ============ */
   .chat-topbar { padding: 8px 12px; min-height: 52px; }
-  .chat-topbar-title { font-size: 15px; }
+  .chat-topbar-title { font-size: 15px; white-space: nowrap; }
+  #logout-btn { font-size: 11px; min-height: 40px; padding: 0 8px; white-space: nowrap; }
   #greeting-time { display: none; }
   .menu-btn {
     display: inline-flex; align-items: center; justify-content: center;
@@ -66,8 +69,10 @@ body { overscroll-behavior: none; }
   .chat-footer { padding: 8px 10px; }
   .input-row { gap: 8px; }
   #mic-btn { width: 46px; height: 46px; font-size: 20px; border-radius: 12px; }
-  .input-wrap { min-height: 46px; padding: 0 12px; border-radius: 12px; }
-  #terminal-input { font-size: 16px; padding: 11px 0; max-height: 110px; }
+  .input-wrap { min-height: 46px; min-width: 0; padding: 0 12px; border-radius: 12px; }
+  #terminal-input { font-size: 16px; padding: 11px 0; max-height: 110px; min-width: 0; }
+  #terminal-input::placeholder { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .input-prompt { font-size: 14px; }
   .pixel-cursor { display: none; }                      /* the real caret is enough */
   #send-btn {
     height: 46px; min-width: 64px; padding: 0 14px;
