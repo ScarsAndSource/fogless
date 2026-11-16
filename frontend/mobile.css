@@ -1,0 +1,139 @@
+/* Fogless mobile.css: phone / Android polish. Linked LAST on every page, so it wins over the page CSS.
+   Desktop (>= 1024px) is untouched apart from the harmless resets in the first block. */
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: pan-x pan-y;            /* no pinch / double-tap zoom: behaves like an app, not a web page */
+}
+body { overscroll-behavior: none; }
+
+@media (max-width: 1023px) {
+
+  /* ============ chrome that should never be text-selected ============ */
+  button, .cmd-chip, .panel-btn, .menu-btn, #spells-toggle, #drawer-close-btn,
+  .tab, .submit, .linkbtn, .toggle-pw {
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  /* decorative fireflies repaint forever: pure battery cost on a phone */
+  .mote-1, .mote-2 { display: none; }
+
+  /* ============ header: balance + today's outflow ============ */
+  #sidebar .sidebar-header { padding: 8px 10px; gap: 8px; }
+  #sidebar .balance-card,
+  #sidebar .pace-card { padding: 9px 11px; border-radius: 10px; }
+  .balance-label,
+  .pace-label { font-size: 10px; letter-spacing: 0.03em; margin-bottom: 4px; }
+  .pace-label { flex-wrap: wrap; gap: 0 8px; }
+  #sidebar .balance-amount { font-size: 17px; font-weight: 700; min-width: 0; }
+  #sidebar .balance-currency { font-size: 12px; }
+  .pace-today { font-size: 15px; }
+  #today-pct-val { font-size: 10px !important; }
+  .pace-cell { height: 6px; }
+  #balance-val, #today-logged-val {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  /* ============ top bar ============ */
+  .chat-topbar { padding: 8px 12px; min-height: 52px; }
+  .chat-topbar-title { font-size: 15px; }
+  #greeting-time { display: none; }
+  .menu-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    margin-left: auto; min-height: 40px; padding: 0 14px;
+    font-size: 11px; letter-spacing: 0.04em; border-radius: 10px;
+  }
+
+  /* ============ chat ============ */
+  #chat-thread {
+    padding: 12px 10px; gap: 12px;
+    overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
+  }
+  .msg-assistant { max-width: 96%; gap: 8px; }
+  .msg-user { max-width: 90%; }
+  .msg-assistant > :last-child,
+  .msg-user > * { min-width: 0; max-width: 100%; }
+  .bubble-icon { width: 28px; height: 28px; }
+  .bubble-sage,
+  .bubble-rose { font-size: 15px; line-height: 1.5; padding: 10px 12px; overflow-x: auto; }
+  .bubble-sage .bubble-meta,
+  .bubble-rose .bubble-meta { font-size: 9px; letter-spacing: 0.03em; gap: 8px; }
+
+  /* ============ input bar ============ */
+  .chat-footer { padding: 8px 10px; }
+  .input-row { gap: 8px; }
+  #mic-btn { width: 46px; height: 46px; font-size: 20px; border-radius: 12px; }
+  .input-wrap { min-height: 46px; padding: 0 12px; border-radius: 12px; }
+  #terminal-input { font-size: 16px; padding: 11px 0; max-height: 110px; }
+  .pixel-cursor { display: none; }                      /* the real caret is enough */
+  #send-btn {
+    height: 46px; min-width: 64px; padding: 0 14px;
+    font-size: 13px; font-weight: 700; letter-spacing: 0.04em; border-radius: 12px;
+  }
+  .footer-hint { margin-top: 4px; justify-content: flex-end; }
+  .footer-hint > span:first-child { display: none; }    /* saves a line while the keyboard is open */
+  #spells-toggle { font-size: 12px; padding: 6px 4px; }
+
+  /* ============ spell drawer ============ */
+  #slash-suggest-drawer { max-height: 34vh; overflow-y: auto; padding-bottom: 8px; margin-bottom: 8px; }
+  .drawer-header { font-size: 10px; }
+  #drawer-close-btn { font-size: 12px; padding: 8px 4px; }
+  #slash-chips { gap: 8px; }
+  #slash-chips .cmd-chip { font-size: 12px; padding: 8px 12px; min-height: 36px; border-radius: 8px; }
+
+  /* ============ full-screen quick-actions sheet ============ */
+  #right-panel.open {
+    gap: 12px;
+    padding: 12px 14px calc(14px + env(safe-area-inset-bottom, 0px));
+  }
+  .panel-close {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 44px; padding: 0 16px; font-size: 11px; border-radius: 10px;
+  }
+  .panel-title { font-size: 11px; letter-spacing: 0.08em; margin-bottom: 2px; }
+  #right-panel.open .panel-title + div {
+    display: grid !important; grid-template-columns: 1fr 1fr; gap: 8px !important;
+  }
+  #right-panel .panel-btn {
+    min-height: 52px; padding: 10px 12px; font-size: 13px; line-height: 1.25;
+    border-radius: 12px; gap: 8px;
+  }
+  #right-panel .panel-btn-icon { font-size: 20px; }
+  .panel-link { font-size: 13px; padding: 14px 0; }
+
+  /* touch screens have no hover: avoid "stuck" highlights, show a press state instead */
+  .panel-btn:hover { background: #fff; box-shadow: none; }
+  .panel-btn:active { background: var(--sage-light); }
+  .cmd-chip:hover { background: var(--sage-light); }
+  .cmd-chip:active { background: #c6e8cc; }
+  #send-btn:hover { background: var(--sage); }
+  #send-btn:active { background: var(--sage-dark); }
+
+  /* ============ sign-in / reset-password pages ============ */
+  .login-card { padding: 24px 20px 20px; }
+  .login-card .brand { font-size: 11px; margin-bottom: 18px; }
+  .login-card label { font-size: 10px; letter-spacing: 0.06em; margin: 16px 0 8px; }
+  .login-card input { font-size: 16px; padding: 14px; border-radius: 10px; }
+  .login-card #password { padding-right: 78px; }
+  .login-card .toggle-pw { font-size: 10px; padding: 12px 10px; }
+  .login-card .tab { font-size: 10px; min-height: 44px; }
+  .login-card .submit { font-size: 12px; min-height: 50px; border-radius: 10px; }
+  .login-card .error,
+  .login-card .info { font-size: 13px; }
+  .login-card .linkbtn { font-size: 13px; padding: 10px; }
+  .login-card .hint,
+  .login-card .foot { font-size: 11px; }
+
+  /* ============ privacy page ============ */
+  body > main { padding: 18px; }
+}
+
+/* keyboard open (or landscape phone): hand the whole screen to the chat */
+@media (max-width: 1023px) and (max-height: 520px) {
+  #sidebar { display: none; }
+  #app { grid-template-rows: minmax(0, 1fr); }
+  #chat-area { grid-row: 1; }
+}
