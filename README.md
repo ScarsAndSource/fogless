@@ -2,7 +2,7 @@
 
 A personal expense tracker that runs off plain text. You type what you spent (or received) and it is parsed,
 categorised and logged -- no forms, no dropdowns. Flask on Vercel, Supabase (Postgres + Auth), optional Groq for
-natural-language parsing and voice.
+natural-language parsing and voice, paired with a Capacitor Android native app featuring interactive home-screen widgets and mobile polish.
 
 **Multi-user:** every person signs up with their own email + password and gets a completely private ledger.
 
@@ -16,6 +16,45 @@ natural-language parsing and voice.
   `/aliases`, `/reset confirm`.
 - **Per-method balances** -- cash / UPI / card / netbanking, plus a total.
 - **Accounts** -- sign up, sign in, sign out, forgot/reset password, delete account (with all data).
+- **Mobile & Home-screen Widgets** -- Capacitor Android wrapper with native zero-lag floating quick-log, voice logging, and customizable balance / month stats / history home-screen widgets.
+
+## Android App & Native Widgets (`fogless-app`)
+
+Fogless includes an Android client built with Capacitor (`com.vcorp.fogless`) located in `fogless-app/`:
+
+### Key Features
+- **Edge-to-Edge & Light Theme Enforcement**:
+  - Full edge-to-edge support with display cutout, status bar, and keyboard inset padding.
+  - Light theme lock (`AppCompatDelegate.MODE_NIGHT_NO`) ensures consistent linen-styled readability regardless of system dark-mode.
+  - Android 12+ splash screen (`windowSplashScreenBackground` set to linen `#FBF8F1`, Foreground icon, and background `#071D34`).
+- **Seamless Session & Back Navigation**:
+  - `CookieManager.flush()` and synchronized HttpOnly cookies (`fl_at` / `fl_rt`) shared directly between the WebView and native widget requests.
+  - Native back-button handling closes open mobile UI drawers or modals first before navigating back or moving the app to background.
+  - Download handling for CSV / JSON backups enqueued directly via Android's `DownloadManager` with session cookies attached.
+- **Home-Screen Widgets**:
+  1. **Quick Capture Widget (`CaptureWidgetProvider`)**:
+     - Single tap opens native floating dialogs without loading the full WebView.
+     - **Quick Text (`QuickTextActivity`)**: Floating, dialog-themed quick expense entry posting straight to `/api/message`.
+     - **Quick Voice (`VoiceCaptureActivity`)**: Floating voice memo recorder saving AAC `.m4a` and posting directly to `/api/voice` (Groq Whisper transcription).
+  2. **Info Widget (`InfoWidgetProvider`)**:
+     - Configurable via `InfoConfigActivity` with reconfigurable views:
+       - **Balance Mode**: Total balance + per-payment method breakdown (UPI, Cash, Card, etc.).
+       - **Stats Mode**: Monthly total outflow, inflow, net, and top expense categories.
+       - **History Mode**: Recent transactions with dynamic color coding (expenses in red, income in green).
+     - Privacy mode toggle ("Hide amounts" with bullet masks `••••`).
+     - Responsive row count adapting automatically to the widget's resizable grid dimensions.
+     - Background updates powered by Android `WorkManager` (`RefreshWorker`, periodic 15-minute refresh + manual refresh button `↻`).
+
+## Web & Mobile Polish (`frontend/`)
+
+- **`mobile.css`**: Mobile-first responsive polish linked last across pages:
+  - Disables double-tap and pinch-zoom (`touch-action: pan-x pan-y`) for native app feel.
+  - Prevents unintended text selection on buttons, chips, and tabs.
+  - Disables battery-draining background particle animations on mobile viewport (`< 1024px`).
+  - Optimized touch targets, mobile chat bubbles, and full-screen quick-actions sheets.
+  - Keyboard-aware layout (`max-height: 520px` mode dedicating the full viewport to chat when the virtual keyboard is open).
+- **`utilities.css`**: Utility classes supporting clean layouts, spacing, and privacy settings.
+- **Account Deletion & Data Privacy**: Built-in account wiping in settings and GDPR-compliant `privacy.html`.
 
 ## How accounts and privacy work
 
@@ -132,5 +171,4 @@ All routes except the public auth ones require a signed-in session.
 - `005_lockdown_and_verify.sql`: run it after 004; every row of its result must say PASS.
 - `frontend/privacy.html` is the privacy policy: put your real contact email in it.
 - `python release_check.py` fails if anything is still a placeholder or a secret-looking string is committed.
-- Android: load the deployed https site (cookie sessions need that origin). See `android-reference/`.
-- Not done here: CI. Add one that runs `pytest` and `pip-audit`, with actions pinned by commit SHA.
+- Android: configured with Capacitor under `fogless-app/`, targeting `https://fogless-psi.vercel.app`.
