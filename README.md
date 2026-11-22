@@ -14,6 +14,14 @@ natural-language parsing and voice, paired with a Capacitor Android native app f
 - **Voice** -- short voice memos are transcribed with Groq Whisper and logged the same way.
 - **Commands** -- `/stats`, `/balance`, `/setbalance`, `/history`, `/undo`, `/delete`, `/debts`, `/pool`, `/settle`,
   `/aliases`, `/reset confirm`.
+- **Browse by date** -- `/stats` and `/history` take any period: `today`, `yesterday`, `week` (last 7 days), `month` (last 30 days),
+  `thismonth`, `lastmonth`, `all`, a month (`2026-11`, `nov`, `nov 2025`) or a day (`2026-11-20`, `20/11/2026`, `14 nov`).
+  `/history` shows 12 rows at a time with date, time, payment method and id (`/history 20 yesterday` for a different count).
+  Every Stats / History card carries its own navigator -- view tabs, quick ranges, ‹ › stepping, and native date / month
+  pickers -- that swaps the card in place without adding chat messages.
+- **Main screen** -- net amount, today's outflow and today's inflow, refreshed whenever the app comes back to the foreground.
+- **Chat history** -- the newest 100 messages load first, older ones load as you scroll up, each day gets a separator and
+  every message shows its real time. Anything logged elsewhere (e.g. the home-screen widget) is appended when you return.
 - **Per-method balances** -- cash / UPI / card / netbanking, plus a total.
 - **Accounts** -- sign up, sign in, sign out, forgot/reset password, delete account (with all data).
 - **Mobile & Home-screen Widgets** -- Capacitor Android wrapper with native zero-lag floating quick-log, voice logging, and customizable balance / month stats / history home-screen widgets.
@@ -158,7 +166,9 @@ All routes except the public auth ones require a signed-in session.
 | `/api/account/delete` | POST | Erase your data and your account (needs your password) |
 | `/api/message` | POST | Freeform text or slash commands (rate-limited) |
 | `/api/voice` | POST | Audio -> transcription -> log (rate-limited) |
-| `/api/state` `/api/balances` `/api/transactions` `/api/aliases` `/api/history` | GET | Your data |
+| `/api/state` `/api/balances` `/api/transactions` `/api/aliases` | GET | Your data (`/api/state` includes `today_spent` and `today_income`) |
+| `/api/history` | GET | Chat history, oldest first. `?limit=` (max 500), `?before=<id>` pages back, `?after=<id>` catches up |
+| `/api/browse` | GET | Stats / History card as HTML: `?view=stats\|history&range=<period>&limit=<n>` (read-only; never touches the chat) |
 | `/api/action` | POST | undo / delete / change category or payment method |
 | `/api/export` `/api/backup` | GET | CSV / JSON of **your** data |
 

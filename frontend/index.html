@@ -70,8 +70,7 @@
       <!-- Net balance card -->
       <div class="balance-card">
         <div class="balance-label">
-          <span class="sparkle-anim" style="color:#F59E0B;">✧</span>
-          NET GOLD
+          NET AMOUNT
         </div>
         <div class="balance-amount">
           <span class="balance-currency">₹</span>
@@ -86,6 +85,13 @@
           <div style="display:flex;align-items:baseline;gap:2px;">
             <span class="balance-currency">₹</span>
             <span class="pace-today" id="today-logged-val">…</span>
+          </div>
+        </div>
+        <div class="pace-label pace-in">
+          <span>TODAY'S INFLOW</span>
+          <div style="display:flex;align-items:baseline;gap:2px;">
+            <span class="balance-currency">₹</span>
+            <span class="pace-today pace-today-in" id="today-income-val">…</span>
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:8px;">
@@ -132,7 +138,7 @@
       <div class="mote-2"></div>
 
       <!-- Default greeting -->
-      <div class="msg-assistant">
+      <div class="msg-assistant" data-greeting="1">
         <div class="bubble-icon">
           <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
             <rect x="7" y="2"  width="2" height="2" fill="#F472B6"/>
@@ -208,7 +214,7 @@
     <div>
       <div class="panel-title">Quick Actions</div>
       <div style="display:flex;flex-direction:column;gap:6px;margin-top:8px;">
-        <button class="panel-btn cmd-chip" data-cmd="/stats">
+        <button class="panel-btn cmd-chip" data-cmd="/stats thismonth">
           <span class="panel-btn-icon">📊</span> Stats
         </button>
         <button class="panel-btn cmd-chip" data-cmd="/balance">

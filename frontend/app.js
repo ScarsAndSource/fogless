@@ -99,6 +99,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const balanceVal = document.getElementById('balance-val');
   const balancePct = null; // removed in Sanctuary layout
   const todayLoggedVal = document.getElementById('today-logged-val');
+  const todayIncomeVal = document.getElementById('today-income-val');
   const todayGaugeCells = document.getElementById('today-gauge-cells');
   const todayPctVal = document.getElementById('today-pct-val');
   const headerSprite = document.getElementById('extreme-master-svg') || document.getElementById('mochi-master-svg');
@@ -153,6 +154,12 @@ document.addEventListener('DOMContentLoaded', () => {
   let mediaRecorder = null;
   let audioChunks = [];
   let isRecording = false;
+  let lastMsgId = 0;            // newest chat_log id this page has seen (live replies report theirs)
+  let oldestMsgId = 0;          // oldest loaded chat_log id: the cursor for "load earlier"
+  let hasEarlier = false;
+  let loadingEarlier = false;
+  let syncing = false;
+  let lastDayKey = null;        // day of the newest message on screen (drives the day separators)
 
   // Real Clock updating
   function updateClock() {
@@ -286,6 +293,22 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  function updateTodayIncomeDisplay(newIncome) {
+    if (todayIncomeVal) todayIncomeVal.textContent = newIncome.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  // Every server reply that carries totals goes through here.
+  function applyTotals(d) {
+    if (!d) return;
+    if (d.balance !== undefined) updateBalanceDisplay(d.balance);
+    if (d.today_spent !== undefined) updateTodayPaceDisplay(d.today_spent);
+    if (d.today_income !== undefined) updateTodayIncomeDisplay(d.today_income);
+  }
+  function noteChatId(id) {
+    const n = Number(id);
+    if (Number.isInteger(n) && n > lastMsgId) lastMsgId = n;
+  }
+
   // Voice Note Recording
   if (micBtn) {
     micBtn.addEventListener('click', async () => {
@@ -347,8 +370,7 @@ document.addEventListener('DOMContentLoaded', () => {
         </div>
       </div>
     `;
-    chatThread.appendChild(cassetteBubble);
-    chatThread.scrollTop = chatThread.scrollHeight;
+    pushMsg(cassetteBubble);
 
     const formData = new FormData();
     formData.append('audio', blob, `voice.${ext}`);
@@ -360,10 +382,10 @@ document.addEventListener('DOMContentLoaded', () => {
         renderCompanionBubble(`⚠ Voice upload failed (HTTP ${res.status}). Nothing was logged.`);
         return;
       }
+      noteChatId(data.chat_id);
       if (data.ok) {
         playCoin();
-        if (data.balance !== undefined) updateBalanceDisplay(data.balance);
-        if (data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
+        applyTotals(data);
         renderCompanionBubble(data.message_html || plainToHtml(data.text || ''), data.tx_id, data.category, data.payment_method);
       } else {
         renderCompanionBubble(`⚠ ${escapeHtml(data.text || 'Voice note could not be processed.')}`);
@@ -375,42 +397,181 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Server Communication & Logic Execution
 
+  // ── Chat retention ──────────────────────────────────────────────────────────────
+  // The whole conversation lives in the database. The page shows the newest HISTORY_PAGE messages, fetches
+  // older ones as you scroll up (or tap the pill), marks every new day with a separator, shows each message's
+  // real time, and catches up on anything logged elsewhere (e.g. the home-screen widget) when you come back.
+  const HISTORY_PAGE = 100;
+  const pad2 = (n) => String(n).padStart(2, '0');
+  function dayKey(d) { return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; }
+  function keyToDate(k) { const p = k.split('-').map(Number); return new Date(p[0], p[1] - 1, p[2]); }
+  function fmtClock(d) {
+    let h = d.getHours();
+    const ampm = h >= 12 ? 'PM' : 'AM';
+    h = h % 12 || 12;
+    return `${pad2(h)}:${pad2(d.getMinutes())} ${ampm}`;
+  }
+  function dayLabel(key) {
+    const d = keyToDate(key);
+    const now = new Date();
+    const diff = Math.round((keyToDate(dayKey(now)) - d) / 86400000);
+    if (diff === 0) return 'Today';
+    if (diff === 1) return 'Yesterday';
+    const base = d.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
+    return d.getFullYear() === now.getFullYear() ? base : `${base} ${d.getFullYear()}`;
+  }
+  function makeSep(key) {
+    const el = document.createElement('div');
+    el.className = 'fl-day-sep';
+    el.dataset.day = key;
+    el.innerHTML = `<span>${escapeHtml(dayLabel(key))}</span>`;
+    return el;
+  }
+  function refreshDayLabels() {
+    chatThread.querySelectorAll('.fl-day-sep').forEach((el) => {
+      const span = el.firstElementChild;
+      if (span && el.dataset.day) span.textContent = dayLabel(el.dataset.day);
+    });
+  }
+  function firstFlowEl() {
+    return Array.from(chatThread.children).find((el) => el.matches('.msg-assistant, .msg-user, .fl-day-sep'));
+  }
+  // A live message: open a new day separator first if the day changed since the last one.
+  function pushMsg(el) {
+    const key = dayKey(new Date());
+    if (key !== lastDayKey) { chatThread.appendChild(makeSep(key)); lastDayKey = key; }
+    el.dataset.day = key;
+    chatThread.appendChild(el);
+    chatThread.scrollTop = chatThread.scrollHeight;
+  }
+
+  function buildUserBubble(text, label) {
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-user';
+    bubble.innerHTML = `
+      <div class="bubble-rose">
+        <div class="bubble-meta">
+          <span>HERO</span>
+          <span>${escapeHtml(label)}</span>
+        </div>
+        <p style="font-weight:600">${escapeHtml(text)}</p>
+      </div>
+    `;
+    return bubble;
+  }
+  function buildHistoryNode(msg, when) {
+    const label = when ? fmtClock(when) : '';
+    if (msg.role === 'user') return buildUserBubble(msg.content, label);
+    const c = String(msg.content == null ? '' : msg.content);
+    return buildCompanionBubble(c.trimStart().startsWith('<') ? c : c.replace(/\r?\n/g, '<br>'), null, null, null, when || false);
+  }
+  // Messages (oldest first) -> DOM fragment with a day separator wherever the day changes.
+  function buildBatch(messages, prevKey) {
+    const frag = document.createDocumentFragment();
+    let lastKey = prevKey || null;
+    messages.forEach((msg) => {
+      let when = msg.created_at ? new Date(msg.created_at) : null;
+      if (when && isNaN(when)) when = null;
+      const key = when ? dayKey(when) : lastKey;
+      if (key && key !== lastKey) frag.appendChild(makeSep(key));
+      const node = buildHistoryNode(msg, when);
+      if (key) { node.dataset.day = key; lastKey = key; }
+      frag.appendChild(node);
+    });
+    return { frag, lastKey };
+  }
+  // Put older messages above what is on screen, keeping the day separators consistent at the seam.
+  function prependMessages(messages) {
+    const { frag, lastKey } = buildBatch(messages, null);
+    const anchor = firstFlowEl();
+    if (anchor) {
+      if (anchor.classList.contains('fl-day-sep')) {
+        if (anchor.dataset.day === lastKey) anchor.remove();           // the day simply continues
+      } else if (anchor.dataset.day && anchor.dataset.day !== lastKey) {
+        frag.appendChild(makeSep(anchor.dataset.day));                 // live message of a newer day
+      }
+    }
+    chatThread.insertBefore(frag, firstFlowEl() || null);
+    return lastKey;
+  }
+  function trackIds(rows) {
+    rows.forEach((m) => {
+      const id = Number(m.id);
+      if (!Number.isInteger(id) || id <= 0) return;
+      lastMsgId = Math.max(lastMsgId, id);
+      oldestMsgId = oldestMsgId ? Math.min(oldestMsgId, id) : id;
+    });
+  }
+  async function fetchHistory(params) {
+    const res = await fetch('/api/history?' + new URLSearchParams(params), { credentials: 'same-origin', cache: 'no-store' });
+    if (!res.ok) throw new Error(`history fetch failed: ${res.status}`);
+    const rows = await res.json();
+    return Array.isArray(rows) ? rows : [];
+  }
+
+  const earlierObserver = ('IntersectionObserver' in window)
+    ? new IntersectionObserver((entries) => {
+        if (entries.some((e) => e.isIntersecting) && chatThread.scrollTop < 160) loadEarlier();
+      }, { root: chatThread, rootMargin: '160px 0px 0px 0px' })
+    : null;
+  function setEarlierControl() {
+    let el = document.getElementById('load-earlier');
+    if (!hasEarlier) {
+      if (el && el.tagName === 'BUTTON') {
+        const done = document.createElement('div');
+        done.id = 'load-earlier';
+        done.className = 'fl-earlier-done';
+        done.textContent = '— start of your history —';
+        if (earlierObserver) earlierObserver.unobserve(el);
+        el.replaceWith(done);
+      }
+      return;
+    }
+    if (!el) {
+      el = document.createElement('button');
+      el.id = 'load-earlier';
+      el.type = 'button';
+      el.className = 'fl-earlier';
+      el.addEventListener('click', () => loadEarlier());
+      chatThread.insertBefore(el, firstFlowEl() || null);
+      if (earlierObserver) earlierObserver.observe(el);
+    }
+    el.disabled = false;
+    el.textContent = '↑ Load earlier messages';
+  }
+  async function loadEarlier() {
+    if (loadingEarlier || !hasEarlier || !oldestMsgId) return;
+    loadingEarlier = true;
+    const btn = document.getElementById('load-earlier');
+    if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
+    try {
+      const rows = await fetchHistory({ limit: HISTORY_PAGE, before: oldestMsgId });
+      const prevH = chatThread.scrollHeight;
+      const prevTop = chatThread.scrollTop;
+      if (rows.length) { prependMessages(rows); trackIds(rows); }
+      hasEarlier = rows.length >= HISTORY_PAGE;
+      chatThread.scrollTop = prevTop + (chatThread.scrollHeight - prevH);   // keep reading where you were
+    } catch (err) {
+      console.error('Failed to load earlier messages:', err);
+    } finally {
+      loadingEarlier = false;
+      setEarlierControl();
+    }
+  }
+
   // Restore persisted chat history on page load
   async function loadChatHistory() {
     try {
-      const res = await fetch('/api/history?limit=50', { credentials: 'same-origin', cache: 'no-store' });
-      if (!res.ok) throw new Error(`history fetch failed: ${res.status}`);
-      const messages = await res.json();
-      if (!messages || !messages.length) return;
-
-      // Remove the default Extreme greeting so history replaces it cleanly
-      const defaultGreeting = chatThread.querySelector('.msg-assistant');
-      if (defaultGreeting) defaultGreeting.remove();
-
-      messages.forEach(msg => {
-        const ts = msg.created_at
-          ? new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-          : '';
-
-        if (msg.role === 'user') {
-          const bubble = document.createElement('div');
-          bubble.className = 'msg-user';
-          bubble.innerHTML = `
-            <div class="bubble-rose">
-              <div class="bubble-meta">
-                <span>HERO</span>
-                <span>${ts}</span>
-              </div>
-              <p style="font-weight:600">${escapeHtml(msg.content)}</p>
-            </div>
-          `;
-          chatThread.appendChild(bubble);
-        } else {
-          const c = String(msg.content == null ? '' : msg.content);
-          renderCompanionBubble(c.trimStart().startsWith('<') ? c : c.replace(/\r?\n/g, '<br>'));
-        }
-      });
-
+      const rows = await fetchHistory({ limit: HISTORY_PAGE });
+      if (!rows.length) return;
+      const greeting = chatThread.querySelector('[data-greeting]');
+      if (greeting) greeting.remove();                       // real history replaces the default greeting
+      const hadLive = !!firstFlowEl();                       // you may have typed before this arrived
+      const lastKey = prependMessages(rows);
+      trackIds(rows);
+      if (!hadLive && lastKey) lastDayKey = lastKey;
+      hasEarlier = rows.length >= HISTORY_PAGE;
+      setEarlierControl();
       chatThread.scrollTop = chatThread.scrollHeight;
     } catch (err) {
       console.error('Failed to load chat history:', err);
@@ -418,40 +579,59 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   loadChatHistory();
 
-  async function fetchInitialState() {
+  // Anything logged since this page last looked (home-screen widget, another device): append it.
+  async function syncNewMessages() {
+    if (syncing) return;
+    syncing = true;
+    try {
+      const rows = await fetchHistory({ after: lastMsgId, limit: HISTORY_PAGE });
+      if (!rows.length) return;
+      const greeting = chatThread.querySelector('[data-greeting]');
+      if (greeting) greeting.remove();
+      const nearBottom = chatThread.scrollHeight - chatThread.scrollTop - chatThread.clientHeight < 160;
+      const { frag, lastKey } = buildBatch(rows, lastDayKey);
+      chatThread.appendChild(frag);
+      if (lastKey) lastDayKey = lastKey;
+      trackIds(rows);
+      if (nearBottom) chatThread.scrollTop = chatThread.scrollHeight;
+    } catch (err) {
+      console.error('Chat sync failed:', err);
+    } finally {
+      syncing = false;
+    }
+  }
+  let hiddenAt = 0;
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { hiddenAt = Date.now(); return; }
+    if (hiddenAt && Date.now() - hiddenAt < 4000) return;    // a quick app-switch is not worth a refresh
+    refreshDayLabels();
+    fetchInitialState(true);
+    syncNewMessages();
+  });
+
+  async function fetchInitialState(quiet = false) {
     try {
       const res = await fetch('/api/state', { credentials: 'same-origin', cache: 'no-store' });
       const data = await res.json();
       if (res.ok && data.ok) {
-        if (data.balance !== undefined) updateBalanceDisplay(data.balance);
-        if (data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
+        applyTotals(data);
         return;
       }
       throw new Error((data && data.text) || `HTTP ${res.status}`);
     } catch(e) {
       console.error('Could not load state:', e);
+      if (quiet) return;                       // a refresh that failed keeps the numbers already on screen
       // Never show made-up numbers: show that we don't know.
       if (balanceVal) balanceVal.textContent = '—';
       if (todayLoggedVal) todayLoggedVal.textContent = '—';
+      if (todayIncomeVal) todayIncomeVal.textContent = '—';
       if (todayPctVal) todayPctVal.textContent = '–';
     }
   }
   fetchInitialState();
 
   async function executeCommandText(text) {
-    const heroBubble = document.createElement('div');
-    heroBubble.className = 'msg-user';
-    heroBubble.innerHTML = `
-      <div class="bubble-rose">
-        <div class="bubble-meta">
-          <span>HERO</span>
-          <span>JUST NOW</span>
-        </div>
-        <p style="font-weight:600">${escapeHtml(text)}</p>
-      </div>
-    `;
-    chatThread.appendChild(heroBubble);
-    chatThread.scrollTop = chatThread.scrollHeight;
+    pushMsg(buildUserBubble(text, 'JUST NOW'));
 
     if (headerSprite) {
       headerSprite.classList.remove('extreme-idle', 'mochi-idle');
@@ -475,10 +655,10 @@ document.addEventListener('DOMContentLoaded', () => {
         renderCompanionBubble(`⚠ Server error (HTTP ${res.status}). I can't confirm "${escapeHtml(text)}" was saved — check /history before retrying, or you may log it twice.`);
         return;
       }
+      noteChatId(data.chat_id);
       if (data.ok) {
         playCoin();
-        if (data.balance !== undefined) updateBalanceDisplay(data.balance);
-        if (data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
+        applyTotals(data);
         renderCompanionBubble(data.html || plainToHtml(data.text || ''), data.tx_id, data.category, data.payment_method);
       } else {
         renderCompanionBubble(plainToHtml(data.text || "Could not execute spell."));
@@ -514,7 +694,8 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  function renderCompanionBubble(htmlContent, txId = null, category = null, paymentMethod = null) {
+  // `when`: a Date for a restored message, false for "unknown", omitted for "now".
+  function buildCompanionBubble(htmlContent, txId = null, category = null, paymentMethod = null, when = null) {
     const bubble = document.createElement('div');
     bubble.className = 'msg-assistant';
     
@@ -547,12 +728,7 @@ document.addEventListener('DOMContentLoaded', () => {
       `;
     }
 
-    const now = new Date();
-    let h = now.getHours();
-    const mins = String(now.getMinutes()).padStart(2, '0');
-    const ampm = h >= 12 ? 'PM' : 'AM';
-    h = h % 12 || 12;
-    const timeStr = `${String(h).padStart(2, '0')}:${mins} ${ampm}`;
+    const timeStr = when === false ? '' : fmtClock(when || new Date());
 
     bubble.innerHTML = `
       <div class="bubble-icon">
@@ -575,8 +751,11 @@ document.addEventListener('DOMContentLoaded', () => {
         ${inlineMenuHtml}
       </div>
     `;
-    chatThread.appendChild(bubble);
-    chatThread.scrollTop = chatThread.scrollHeight;
+    return bubble;
+  }
+
+  function renderCompanionBubble(htmlContent, txId = null, category = null, paymentMethod = null) {
+    pushMsg(buildCompanionBubble(htmlContent, txId, category, paymentMethod, null));
   }
 
   window.handleQuickUndo = async function() {
@@ -594,8 +773,7 @@ document.addEventListener('DOMContentLoaded', () => {
         renderCompanionBubble(`⚠ Server error (HTTP ${res.status}) — undo may not have gone through. Check /history.`);
         return;
       }
-      if (data.ok && data.balance !== undefined) updateBalanceDisplay(data.balance);
-      if (data.ok && data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
+      if (data.ok) applyTotals(data);
       renderCompanionBubble(data.html || escapeHtml(data.text || '') || `⚔ SPELL: REVERT EXECUTED. Restored GP to the treasury purse.`);
     } catch(e) {
       renderCompanionBubble(`⚠ Connection error — undo did NOT go through. Balance unchanged. Try again.`);
@@ -616,8 +794,7 @@ document.addEventListener('DOMContentLoaded', () => {
         renderCompanionBubble(`⚠ Server error (HTTP ${res.status}) — #${txId} was NOT confirmed removed. Check /history.`);
         return;
       }
-      if (data.ok && data.balance !== undefined) updateBalanceDisplay(data.balance);
-      if (data.ok && data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
+      if (data.ok) applyTotals(data);
       renderCompanionBubble(escapeHtml(data.text || (data.ok ? `Removed transaction #${txId}.` : `Could not remove #${txId}.`)));
     } catch(e) {
       renderCompanionBubble(`⚠ Connection error — #${txId} was NOT confirmed removed. Check /history.`);
@@ -648,8 +825,7 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       if (data.ok) {
         playCoin();
-        if (data.balance !== undefined) updateBalanceDisplay(data.balance);
-        if (data.today_spent !== undefined) updateTodayPaceDisplay(data.today_spent);
+        applyTotals(data);
         renderCompanionBubble(data.html || escapeHtml(data.text || `${label} balance set to ₹${amt.toFixed(2)}.`));
       } else {
         renderCompanionBubble(`⚠ ${escapeHtml(data.text || `Could not set ${label} balance.`)}`);
@@ -700,6 +876,79 @@ document.addEventListener('DOMContentLoaded', () => {
       renderCompanionBubble(`⚠ Connection error — payment method for #${txId} NOT confirmed changed.`);
     }
   };
+  // ── Stats / History navigator ───────────────────────────────────────────────────
+  // The cards the server sends carry their own controls (data-fl-*). A tap swaps that one card in place
+  // through /api/browse: no new chat messages, no page reload, no typing.
+  function showCardError(card, text) {
+    const old = card.querySelector('.fl-err');
+    if (old) old.remove();
+    const el = document.createElement('div');
+    el.className = 'fl-err';
+    el.textContent = '⚠ ' + text;
+    card.appendChild(el);
+  }
+  async function flBrowse(card, view, range, limit) {
+    const ticket = (card._flTicket || 0) + 1;     // a slower, older answer must never overwrite a newer tap
+    card._flTicket = ticket;
+    card.classList.add('fl-loading');
+    const params = new URLSearchParams({ view: view || 'stats', range: range || 'month' });
+    if (view === 'history' && limit) params.set('limit', limit);
+    try {
+      const res = await fetch('/api/browse?' + params, { credentials: 'same-origin', cache: 'no-store' });
+      let data = null;
+      try { data = await res.json(); } catch (_) { data = null; }
+      if (card._flTicket !== ticket || !card.isConnected) return;
+      if (data && data.ok && data.html) {
+        const holder = document.createElement('div');
+        holder.innerHTML = data.html;
+        const fresh = holder.firstElementChild;
+        if (fresh) { fresh._flTicket = ticket; card.replaceWith(fresh); return; }
+      }
+      card.classList.remove('fl-loading');
+      showCardError(card, (data && data.text) || `Could not load (HTTP ${res.status}).`);
+    } catch (e) {
+      if (card._flTicket !== ticket) return;
+      card.classList.remove('fl-loading');
+      showCardError(card, 'Connection error — try again.');
+    }
+  }
+  function openPicker(wrap) {
+    const inp = wrap.querySelector('.fl-pick');
+    const card = wrap.closest('.fl-browse');
+    if (!inp || !card) return;
+    if (inp.type === 'text') {                    // this browser has no date / month picker: ask in words
+      const raw = prompt(inp.dataset.flPick === 'month'
+        ? 'Which month? (2026-10, oct, oct 2025)' : 'Which day? (2026-11-20, 20/11/2026, 14 nov)');
+      if (raw && raw.trim()) flBrowse(card, inp.dataset.flView, raw.trim());
+      return;
+    }
+    try { if (typeof inp.showPicker === 'function') { inp.showPicker(); return; } } catch (_) { /* fall through */ }
+    inp.focus();
+    inp.click();
+  }
+  chatThread.addEventListener('click', (e) => {
+    const wrap = e.target.closest('.fl-pick-wrap');
+    if (wrap) { openPicker(wrap); return; }
+    const btn = e.target.closest('button[data-fl-range]');
+    if (!btn || btn.disabled) return;
+    const card = btn.closest('.fl-browse');
+    if (!card) return;
+    playBeep(520);
+    flBrowse(card, btn.dataset.flView || card.dataset.flView, btn.dataset.flRange, btn.dataset.flLimit);
+  });
+  chatThread.addEventListener('keydown', (e) => {
+    if ((e.key === 'Enter' || e.key === ' ') && e.target.classList && e.target.classList.contains('fl-pick-wrap')) {
+      e.preventDefault();
+      openPicker(e.target);
+    }
+  });
+  chatThread.addEventListener('change', (e) => {
+    const inp = e.target.closest && e.target.closest('.fl-pick');
+    if (!inp || !inp.value) return;
+    const card = inp.closest('.fl-browse');
+    if (card) flBrowse(card, inp.dataset.flView || card.dataset.flView, inp.value);
+  });
+
   async function _runReadOnlyCommand(cmd, label) {
     try {
       const res = await fetch('/api/message', {
