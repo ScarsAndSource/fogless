@@ -11,7 +11,7 @@ import re
 import json
 import requests
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from flask import Flask, request, jsonify, send_file, Response, render_template_string, g, has_request_context
 import hashlib
 import hmac
@@ -724,7 +724,7 @@ def add_transfers_bulk(rows) -> None:
                      person=r.get("person"), pool=r.get("pool"), linked_tx_id=r.get("linked_tx_id"))
 
 
-def _all_transactions(order="id.desc", limit=None, since=None, tx_type=None):
+def _all_transactions(order="id.desc", limit=None, since=None, tx_type=None, until=None):
     """Keyset-paginates (id < last_id) through PostgREST's max-rows cap. OFFSET paging could return the
     same row twice (or skip one) when a row was inserted between two pages, which skewed balances.
     SB_PAGE_SIZE must be <= your project's 'Max rows' setting (Supabase default is 1000)."""
@@ -736,8 +736,12 @@ def _all_transactions(order="id.desc", limit=None, since=None, tx_type=None):
             if page <= 0:
                 break
             params = {"select": "*", "order": "id.desc" if desc else "id.asc", "limit": page}
-            if since:
+            if since and until:  # a repeated key is how PostgREST ANDs two filters on one column
+                params["created_at"] = [f"gte.{since}", f"lt.{until}"]
+            elif since:
                 params["created_at"] = f"gte.{since}"
+            elif until:
+                params["created_at"] = f"lt.{until}"
             if tx_type:
                 params["type"] = f"eq.{tx_type}"
             if last_id is not None:
@@ -754,6 +758,8 @@ def _all_transactions(order="id.desc", limit=None, since=None, tx_type=None):
         rows = [r for r in rows if r["type"] == tx_type]
     if since:
         rows = [r for r in rows if r["created_at"] >= since]
+    if until:
+        rows = [r for r in rows if r["created_at"] < until]
     rows.sort(key=lambda x: x["id"], reverse=("desc" in order))
     if limit:
         rows = rows[:limit]
@@ -1068,6 +1074,18 @@ def get_today_expense() -> Decimal:
     since = _since("today")
     rows = _all_transactions(since=since, tx_type="expense")
     return sum((Decimal(str(r["amount"])) for r in rows), Decimal("0.00"))
+
+
+def get_today_flows():
+    """(income, expense) logged today in the user's timezone, from a single query. Transfers (moving money
+    between your own pouches, IOUs, pools) are neither inflow nor outflow, exactly as in get_today_expense."""
+    income = expense = Decimal("0.00")
+    for r in _all_transactions(since=_since("today")):
+        if r.get("type") == "income":
+            income += Decimal(str(r["amount"]))
+        elif r.get("type") == "expense":
+            expense += Decimal(str(r["amount"]))
+    return income, expense
 
 
 def _since(period):
@@ -2037,20 +2055,38 @@ def log_chat_message(role: str, content: str) -> None:
         return
     if role == "assistant" and not content.lstrip().startswith("<"):
         content = _esc(content)  # plain-text replies echo user input; the page re-renders history as HTML
+    r = None
+    for attempt in (1, 2):  # a dropped chat row is a hole in the user's history; a rare duplicate is harmless
+        try:
+            r = _sb("POST", "chat_log", json_body={"role": role, "content": content}, prefer="return=representation")
+            break
+        except StorageError as e:
+            if attempt == 2:
+                print(f"[chat_log] insert failed: {e}")
+                return
     try:
-        _sb("POST", "chat_log", json_body={"role": role, "content": content}, prefer="return=minimal")
-    except StorageError as e:
-        print(f"[chat_log] insert failed: {e}")
+        rows = _rows(r)
+        if rows and has_request_context():
+            g.last_chat_id = max(int(rows[0]["id"]), getattr(g, "last_chat_id", 0))
+    except (StorageError, KeyError, TypeError, ValueError):
+        pass
 
 
-def get_chat_history(limit: int = 50) -> list:
-    """Return the signed-in user's chat_log rows oldest-first, ready for chat-display order."""
+def get_chat_history(limit: int = 50, before=None, after=None) -> list:
+    """The signed-in user's chat_log rows, oldest-first (chat-display order).
+    Default: the newest `limit` rows. before=<id>: the `limit` rows just older than that id (scrolling back).
+    after=<id>: rows newer than that id, oldest first (catching up after the app was in the background)."""
     if not _use_sb():
         return []
     try:
-        rows = _rows(_sb("GET", "chat_log", params={
-            "select": "id,role,content,created_at", "order": "created_at.desc", "limit": limit}))
-        return list(reversed(rows))  # oldest first for display
+        params = {"select": "id,role,content,created_at", "limit": limit}
+        if after is not None:
+            params.update({"order": "id.asc", "id": f"gt.{max(0, int(after))}"})
+            return _rows(_sb("GET", "chat_log", params=params))
+        params["order"] = "id.desc"  # ids only grow, so this is chronological and can never tie
+        if before:
+            params["id"] = f"lt.{int(before)}"
+        return list(reversed(_rows(_sb("GET", "chat_log", params=params))))
     except StorageError as e:
         print(f"[chat_log] read failed: {e}")
         return []
@@ -2086,50 +2122,468 @@ def _rate_limited():
     return None
 
 
-# --------------------------------------------------------------------- HTML / Web Formatters
+# --------------------------------------------------------------------- browsing by date (stats / history)
+#
+# One small grammar is shared by the /stats and /history commands, the in-chat navigator and /api/browse:
+#   today  yesterday  week (last 7 days)  month (last 30 days)  thismonth  lastmonth  all
+#   2026-11 (a month)   2026-11-20 (a day)   20/11/2026 (day first)   nov / nov 2025 / 14 nov / nov 14
+# Day and month boundaries are the signed-in user's own local midnights, not UTC and not IST.
+
+
+class RangeError(ValueError):
+    """The text is not a day, month or period this app understands."""
+
+
+_RANGE_HELP = ("Try today, yesterday, week, month, thismonth, lastmonth, all, 2026-11, 2026-11-20, nov, nov 2025 "
+               "or 14 nov.")
+_MONTH_NAMES = ("january", "february", "march", "april", "may", "june", "july", "august", "september",
+                "october", "november", "december")
+_MONTH_LOOKUP = {}
+for _i, _nm_ in enumerate(_MONTH_NAMES, 1):
+    _MONTH_LOOKUP[_nm_] = _i
+    _MONTH_LOOKUP[_nm_[:3]] = _i
+_MONTH_LOOKUP["sept"] = 9
+_RANGE_ALIASES = {"this month": "thismonth", "this-month": "thismonth", "mtd": "thismonth",
+                  "last month": "lastmonth", "last-month": "lastmonth", "7d": "week", "30d": "month",
+                  "all time": "all", "alltime": "all", "": "month"}
+_CAT_ICONS = {"food": "🍽", "groceries": "🛒", "transport": "🚌", "bills": "🧾", "shopping": "🛍",
+              "entertainment": "🎬", "health": "💊", "subscriptions": "🔁", "rent": "🏠", "education": "📚",
+              "travel": "✈️", "fitness": "🏋️", "salary": "💼", "freelance": "💻", "gift": "🎁",
+              "refund": "↩️", "transfer": "↔️"}
+PAGE_STEP = 12          # rows a history view shows at a time ("Show 12 more")
+MAX_VIEW_ROWS = 300     # hard ceiling for one history view
+TREND_MAX_DAYS = 62     # longer spans are charted month by month
+
+
+def _today_local() -> date:
+    return datetime.now(timezone.utc).astimezone(_user_tz()).date()
+
+
+def _midnight_utc(d: date) -> str:
+    """Local midnight at the start of day d, as a UTC timestamp string the database can compare."""
+    return datetime(d.year, d.month, d.day, tzinfo=_user_tz()).astimezone(timezone.utc).isoformat()
+
+
+def _to_local(iso_str):
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_user_tz())
+    except Exception:
+        return None
+
+
+def _d_label(d: date, year=True) -> str:
+    return f"{d.strftime('%a')} {d.day} {d.strftime('%b')}" + (f" {d.year}" if year else "")
+
+
+def _span_label(a: date, b: date) -> str:
+    return f"{a.day} {a.strftime('%b')} - {b.day} {b.strftime('%b')} {b.year}"
+
+
+def _next_month(first: date) -> date:
+    return date(first.year + (first.month == 12), first.month % 12 + 1, 1)
+
+
+def _prev_month(first: date) -> date:
+    return date(first.year - (first.month == 1), (first.month - 2) % 12 + 1, 1)
+
+
+def _check_year(y: int):
+    if not 2000 <= y <= 2100:
+        raise RangeError(f"Year {y} is out of range. " + _RANGE_HELP)
+
+
+def _canon_day(d: date, today: date) -> str:
+    if d == today:
+        return "today"
+    return "yesterday" if d == today - timedelta(days=1) else d.isoformat()
+
+
+def _canon_month(first: date, today: date) -> str:
+    cur = date(today.year, today.month, 1)
+    if first == cur:
+        return "thismonth"
+    return "lastmonth" if first == _prev_month(cur) else f"{first.year:04d}-{first.month:02d}"
+
+
+def _day_range(d: date, today: date) -> dict:
+    _check_year(d.year)
+    tok = _canon_day(d, today)
+    return {"kind": "day", "token": tok,
+            "title": {"today": "Today", "yesterday": "Yesterday"}.get(tok, _d_label(d)),
+            "sub": _d_label(d) if tok in ("today", "yesterday") else "",
+            "since": _midnight_utc(d), "until": _midnight_utc(d + timedelta(days=1)),
+            "start": d, "end": d, "days": 1,
+            "prev": _canon_day(d - timedelta(days=1), today),
+            "next": _canon_day(d + timedelta(days=1), today) if d < today else None}
+
+
+def _month_range(y: int, m: int, today: date) -> dict:
+    first = date(y, m, 1)
+    _check_year(first.year)
+    nxt = _next_month(first)
+    last = nxt - timedelta(days=1)
+    cur = date(today.year, today.month, 1)
+    end = min(last, today) if first <= today else last
+    tok = _canon_month(first, today)
+    return {"kind": "month", "token": tok,
+            "title": {"thismonth": "This month", "lastmonth": "Last month"}.get(
+                tok, f"{_MONTH_NAMES[m - 1].capitalize()} {y}"),
+            "sub": _span_label(first, end),
+            "since": _midnight_utc(first), "until": _midnight_utc(nxt),
+            "start": first, "end": end, "days": max(1, (end - first).days + 1),
+            "prev": _canon_month(_prev_month(first), today),
+            "next": _canon_month(nxt, today) if nxt <= cur else None}
+
+
+def _rolling_range(kind: str, today: date) -> dict:
+    days = 7 if kind == "week" else 30
+    since = _since(kind)  # the same rolling window /stats week|month always used
+    start = (_to_local(since) or datetime.now(_user_tz())).date()
+    return {"kind": "rolling", "token": kind, "title": f"Last {days} days", "sub": _span_label(start, today),
+            "since": since, "until": None, "start": start, "end": today, "days": days, "prev": None, "next": None}
+
+
+def _guess_date(day: int, mon: int, year_str, today: date) -> date:
+    if year_str:
+        return date(int(year_str), mon, day)
+    d = date(today.year, mon, day)
+    return d if d <= today else date(today.year - 1, mon, day)
+
+
+def _parse_range(text=None) -> dict:
+    """Turn a period phrase into {kind, token, title, sub, since, until, start, end, days, prev, next}.
+    `since` is inclusive, `until` exclusive (UTC timestamps, or None for open-ended). Raises RangeError."""
+    t = re.sub(r"\s+", " ", str(text if text is not None else "").strip().lower().replace("_", " "))[:40]
+    t = _RANGE_ALIASES.get(t, t)
+    today = _today_local()
+    cur = date(today.year, today.month, 1)
+    if t == "today":
+        return _day_range(today, today)
+    if t == "yesterday":
+        return _day_range(today - timedelta(days=1), today)
+    if t in ("week", "month"):
+        return _rolling_range(t, today)
+    if t == "all":
+        return {"kind": "all", "token": "all", "title": "All time", "sub": "", "since": None, "until": None,
+                "start": None, "end": today, "days": None, "prev": None, "next": None}
+    if t == "thismonth":
+        return _month_range(cur.year, cur.month, today)
+    if t == "lastmonth":
+        p = _prev_month(cur)
+        return _month_range(p.year, p.month, today)
+    try:
+        m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", t)
+        if m:
+            return _day_range(date(int(m[1]), int(m[2]), int(m[3])), today)
+        m = re.fullmatch(r"(\d{4})-(\d{1,2})", t)
+        if m:
+            return _month_range(int(m[1]), int(m[2]), today)
+        m = re.fullmatch(r"(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})", t)  # 20/11/2026: day first, the Indian way
+        if m:
+            return _day_range(date(int(m[3]), int(m[2]), int(m[1])), today)
+        m = re.fullmatch(r"(\d{1,2})[/.-](\d{4})", t)
+        if m:
+            return _month_range(int(m[2]), int(m[1]), today)
+        m = re.fullmatch(r"([a-z]{3,9})\.?(?: (\d{4}))?", t)
+        if m and m[1] in _MONTH_LOOKUP:
+            mon = _MONTH_LOOKUP[m[1]]
+            return _month_range(int(m[2]) if m[2] else (today.year if mon <= today.month else today.year - 1),
+                                mon, today)
+        m = re.fullmatch(r"(\d{1,2}) ([a-z]{3,9})\.?(?: (\d{4}))?", t)
+        if m and m[2] in _MONTH_LOOKUP:
+            return _day_range(_guess_date(int(m[1]), _MONTH_LOOKUP[m[2]], m[3], today), today)
+        m = re.fullmatch(r"([a-z]{3,9})\.? (\d{1,2})(?:,? (\d{4}))?", t)
+        if m and m[1] in _MONTH_LOOKUP:
+            return _day_range(_guess_date(int(m[2]), _MONTH_LOOKUP[m[1]], m[3], today), today)
+    except RangeError:
+        raise
+    except (ValueError, OverflowError):
+        raise RangeError("That is not a real date. " + _RANGE_HELP)
+    raise RangeError(f"Could not read {t[:30]!r} as a day or month. " + _RANGE_HELP)
+
+
+def _bucket_label(b) -> str:
+    b = str(b or "?")
+    if b.startswith("iou:"):
+        return f"{b[4:]} (IOU)"
+    if b.startswith("pool:"):
+        return f"{b[5:]} pool"
+    return b
+
+
+def _summarize_rows(rows) -> dict:
+    """Everything the Stats card shows, from the ledger rows of one period. Transfers never count."""
+    zero = Decimal("0.00")
+    out = {"income": zero, "expense": zero, "n_in": 0, "n_out": 0, "by_category": [], "by_payment": [],
+           "by_income": [], "daily": {}, "biggest": None, "first_day": None}
+    cats, pays, incs = {}, {}, {}
+    for r in rows:
+        kind = r.get("type")
+        if kind not in ("income", "expense"):
+            continue
+        amt = Decimal(str(r["amount"]))
+        local = _to_local(r.get("created_at"))
+        day = local.date() if local else None
+        if day and (out["first_day"] is None or day < out["first_day"]):
+            out["first_day"] = day
+        if kind == "income":
+            out["income"] += amt
+            out["n_in"] += 1
+            c = incs.setdefault(r.get("category") or "other", {"total": zero, "cnt": 0})
+            c["total"] += amt
+            c["cnt"] += 1
+            continue
+        out["expense"] += amt
+        out["n_out"] += 1
+        c = cats.setdefault(r.get("category") or "other", {"total": zero, "cnt": 0})
+        c["total"] += amt
+        c["cnt"] += 1
+        p = pays.setdefault(r.get("payment_method") or "cash", {"total": zero, "cnt": 0})
+        p["total"] += amt
+        p["cnt"] += 1
+        if day:
+            out["daily"][day] = out["daily"].get(day, zero) + amt
+        if out["biggest"] is None or amt > out["biggest"][0]:
+            out["biggest"] = (amt, r.get("category") or "other", r.get("note"), day)
+    out["by_category"] = sorted(({"name": k, **v} for k, v in cats.items()), key=lambda x: -x["total"])
+    out["by_payment"] = sorted(({"name": k, **v} for k, v in pays.items()), key=lambda x: -x["total"])
+    out["by_income"] = sorted(({"name": k, **v} for k, v in incs.items()), key=lambda x: -x["total"])
+    return out
+
+
+def _trend_points(daily: dict, start: date, end: date):
+    """[(label, tooltip, amount)] -- one bar per day for spans up to ~2 months, else one per month."""
+    zero = Decimal("0.00")
+    if (end - start).days + 1 <= TREND_MAX_DAYS:
+        pts, d = [], start
+        while d <= end:
+            v = daily.get(d, zero)
+            pts.append((f"{d.day} {d.strftime('%b')}", f"{_d_label(d, False)} - ₹{fmt(v)}", v))
+            d += timedelta(days=1)
+        return pts
+    months = {}
+    for d, v in daily.items():
+        months[(d.year, d.month)] = months.get((d.year, d.month), zero) + v
+    pts, cur = [], date(start.year, start.month, 1)
+    while cur <= end:
+        v = months.get((cur.year, cur.month), zero)
+        label = f"{cur.strftime('%b')} {cur.year}"
+        pts.append((label, f"{label} - ₹{fmt(v)}", v))
+        cur = _next_month(cur)
+    return pts[-24:]
+
+
+_NAV_CHIPS = (("today", "Today"), ("yesterday", "Yesterday"), ("week", "7 days"), ("month", "30 days"),
+              ("thismonth", "This month"), ("lastmonth", "Last month"), ("all", "All"))
+
+
+def _nav_html(view: str, rng: dict) -> str:
+    """The navigator that sits on top of every Stats / History card: view tabs, quick ranges, step arrows and
+    native date / month pickers. Every control is a plain <button data-fl-*>; app.js swaps the card in place."""
+    tok = rng["token"]
+    tabs = "".join(
+        f'<button type="button" class="fl-tab{" fl-on" if v == view else ""}" data-fl-view="{v}" '
+        f'data-fl-range="{_esc(tok)}">{lab}</button>'
+        for v, lab in (("stats", "📊 Stats"), ("history", "📜 History")))
+    chips = "".join(
+        f'<button type="button" class="fl-chip{" fl-on" if t == tok else ""}" data-fl-view="{view}" '
+        f'data-fl-range="{t}">{"Latest" if (t == "all" and view == "history") else lab}</button>'
+        for t, lab in _NAV_CHIPS)
+    steppable = rng["kind"] in ("day", "month")
+    prev_b = next_b = ""
+    if steppable:
+        prev_b = (f'<button type="button" class="fl-chip fl-arrow" aria-label="Previous" data-fl-view="{view}" '
+                  f'data-fl-range="{_esc(rng["prev"])}">‹</button>')
+        next_b = (f'<button type="button" class="fl-chip fl-arrow" aria-label="Next" data-fl-view="{view}" '
+                  f'data-fl-range="{_esc(rng["next"])}">›</button>' if rng["next"] else
+                  '<button type="button" class="fl-chip fl-arrow fl-off" aria-label="Next" disabled>›</button>')
+    today = _today_local()
+    pickers = (
+        f'<span class="fl-pick-wrap" role="button" tabindex="0" title="Pick a date">📅 Date'
+        f'<input type="date" class="fl-pick" data-fl-view="{view}" data-fl-pick="day" max="{today.isoformat()}" '
+        f'aria-label="Pick a date" tabindex="-1"></span>'
+        f'<span class="fl-pick-wrap" role="button" tabindex="0" title="Pick a month">🗓 Month'
+        f'<input type="month" class="fl-pick" data-fl-view="{view}" data-fl-pick="month" '
+        f'max="{today.year:04d}-{today.month:02d}" aria-label="Pick a month" tabindex="-1"></span>')
+    return (f'<div class="fl-nav"><div class="fl-tabs">{tabs}</div><div class="fl-chips">{chips}</div>'
+            f'<div class="fl-step">{prev_b}<span class="fl-cur">{_esc(rng["title"] if rng["kind"] != "all" else "All time")}'
+            f'</span>{next_b}{pickers}</div></div>')
+
+
+def _tile(label, value, cls="") -> str:
+    return f'<div class="fl-tile"><span class="fl-k">{label}</span><span class="fl-v {cls}">{value}</span></div>'
+
+
+def _tiles(income, expense) -> str:
+    net = income - expense
+    return ('<div class="fl-tiles">'
+            + _tile("IN", f"₹{fmt(income)}", "fl-pos") + _tile("OUT", f"₹{fmt(expense)}", "fl-neg")
+            + _tile("NET", f"{'+' if net > 0 else '-' if net < 0 else ''}₹{fmt(abs(net))}",
+                    "fl-pos" if net > 0 else "fl-neg" if net < 0 else "")
+            + '</div>')
+
+
+def _meter_rows(items, total, tone="") -> str:
+    rows = ""
+    for it in items[:8]:
+        pct = int(round((it["total"] / total) * 100)) if total > 0 else 0
+        rows += (f'<div class="fl-mrow"><div class="fl-mtop"><span>{_esc(str(it["name"]).capitalize())} '
+                 f'<i>{pct}% · {it["cnt"]}x</i></span><b class="font-numeral">₹{fmt(it["total"])}</b></div>'
+                 f'<div class="fl-meter"><div class="fl-fill{tone}" style="width:{max(2, pct)}%"></div></div></div>')
+    return rows
 
 
 def format_stats_html(period="month") -> str:
-    s = get_stats(period)
-    tot_exp = s["total_expense"] if s["total_expense"] > 0 else Decimal("1.00")
-    
-    rows_html = ""
-    for idx, cat_item in enumerate(s["by_category"]):
-        c_name = _esc(str(cat_item["category"] or "other").capitalize())
-        c_tot = cat_item["total"]
-        pct = int(round((c_tot / tot_exp) * 100))
-        cells_cnt = max(1, min(10, int(round((pct / 100) * 10))))
-        
-        cells_html = "".join(['<div class="meter-cell bg-[#10B981]"></div>' if i < cells_cnt else '<div class="meter-cell bg-[#374151]"></div>' for i in range(10)])
-        rows_html += f"""
-        <div>
-          <div class="flex justify-between text-[12px] mb-1 font-bold">
-            <span class="text-[#059669]">{c_name} ({pct}%)</span>
-            <span class="font-numeral text-[10px] text-[#064E3B]">₹{fmt(c_tot)}</span>
-          </div>
-          <div class="pixel-hp-bar">
-            {cells_html}
-          </div>
-        </div>
-        """
-    if not rows_html:
-        rows_html = '<p class="text-[12px] text-[#6B7280] italic">No expenses logged for this period yet.</p>'
+    rng = _parse_range(period)
+    rows = _all_transactions(since=rng["since"], until=rng["until"])
+    s = _summarize_rows(rows)
+    head = (f'<div class="fl-head"><div class="fl-title">{_esc(rng["title"])} spend</div>'
+            f'<div class="fl-sub">{_esc(rng["sub"])}</div></div>')
+    wrap = f'<div class="fl-browse" data-fl-view="stats" data-fl-range="{_esc(rng["token"])}">'
+    if not (s["n_in"] or s["n_out"]):
+        return (f'{wrap}{_nav_html("stats", rng)}<div class="fl-body">{head}'
+                '<div class="fl-empty">Nothing logged in this period.</div></div></div>')
 
-    return f"""
-    <div class="space-y-2">
-      <div class="flex justify-between items-center border-b border-[#A6DCB1] pb-1">
-        <span class="font-bold text-[14px] text-[#142B1A]">{period.capitalize()} Spend Breakdown</span>
-        <span class="font-numeral text-[10px] bg-[#142B1A] text-[#FDE047] px-1.5 py-0.5">₹{fmt(s['total_expense'])} TOTAL</span>
-      </div>
-      <div class="pixel-window-jrpg p-2 space-y-2.5">
-        {rows_html}
-      </div>
-      <div class="flex items-center justify-between text-[11px] text-[#2D5A35]">
-        <span>⚔ Net Pouch: <strong>₹{fmt(s['net'])}</strong></span>
-        <span class="font-bold underline cursor-pointer">Stats Complete ➔</span>
-      </div>
-    </div>
-    """
+    today = _today_local()
+    start = rng["start"] or s["first_day"] or today
+    end = rng["end"] or today
+    span = max(1, (end - start).days + 1)
+    facts = [("Transactions", f'{s["n_out"] + s["n_in"]} ({s["n_out"]} out · {s["n_in"]} in)')]
+    if s["expense"] > 0:
+        facts.append(("Average spend", f'₹{fmt(s["expense"] / span)} per day'))
+    if s["biggest"]:
+        amt, cat, note, day = s["biggest"]
+        what = _esc(str(cat).capitalize()) + (f' ({_esc(str(note))})' if note else "")
+        when = f' · {day.day} {day.strftime("%b")}' if day else ""
+        facts.append(("Biggest spend", f"₹{fmt(amt)} {what}{when}"))
+    if len(s["daily"]) > 1:
+        top_day, top_amt = max(s["daily"].items(), key=lambda kv: kv[1])
+        facts.append(("Busiest day", f"{_d_label(top_day, False)} · ₹{fmt(top_amt)}"))
+    facts_html = '<div class="fl-facts">' + "".join(
+        f'<div class="fl-fact"><span>{k}</span><b>{v}</b></div>' for k, v in facts) + "</div>"
+
+    trend_html = ""
+    if s["daily"] and span >= 2:
+        pts = _trend_points(s["daily"], start, end)
+        peak = max((v for _l, _t, v in pts), default=Decimal("0.00"))
+        if peak > 0 and len(pts) >= 2:
+            bars = "".join(
+                f'<div class="fl-col" title="{_esc(tip)}"><div class="fl-bar" '
+                f'style="height:{max(3, int(round(v / peak * 100))) if v > 0 else 0}%"></div></div>'
+                for _l, tip, v in pts)
+            trend_html = (f'<div class="fl-sec"><div class="fl-sec-h">{"Daily" if span <= TREND_MAX_DAYS else "Monthly"}'
+                          f' spending</div><div class="fl-trend">{bars}</div>'
+                          f'<div class="fl-axis"><span>{_esc(pts[0][0])}</span><span>{_esc(pts[-1][0])}</span></div></div>')
+
+    sections = ""
+    if s["by_category"]:
+        sections += (f'<div class="fl-sec"><div class="fl-sec-h">Where it went</div>'
+                     f'{_meter_rows(s["by_category"], s["expense"])}</div>')
+    if s["by_payment"]:
+        sections += (f'<div class="fl-sec"><div class="fl-sec-h">Paid with</div>'
+                     f'{_meter_rows(s["by_payment"], s["expense"], " fl-alt")}</div>')
+    if s["by_income"]:
+        sections += (f'<div class="fl-sec"><div class="fl-sec-h">Money in</div>'
+                     f'{_meter_rows(s["by_income"], s["income"], " fl-inc")}</div>')
+    return (f'{wrap}{_nav_html("stats", rng)}<div class="fl-body">{head}{_tiles(s["income"], s["expense"])}'
+            f'{facts_html}{trend_html}{sections}</div></div>')
+
+
+def _history_row(r) -> str:
+    local = _to_local(r.get("created_at"))
+    today = _today_local()
+    when = ""
+    if local:
+        d = local.date()
+        when = f'{d.day} {d.strftime("%b")}' + (f" {d.year}" if d.year != today.year else "")
+        when += f' · {local.strftime("%I:%M %p")}'
+    kind = r.get("type")
+    note = r.get("note")
+    meta = [when] if when else []
+    if kind == "transfer":
+        icon, label, amt_cls, sign = _CAT_ICONS["transfer"], "Transfer", "fl-neu", ""
+        meta.append(f'{_bucket_label(r.get("from_bucket"))} → {_bucket_label(r.get("to_bucket"))}')
+    else:
+        cat = str(r.get("category") or "other")
+        icon, label = _CAT_ICONS.get(cat, "•"), cat.capitalize()
+        amt_cls, sign = ("fl-pos", "+") if kind == "income" else ("fl-neg", "-")
+        if r.get("payment_method"):
+            meta.append(str(r["payment_method"]).upper())
+    meta.append(f'#{r["id"]}')
+    note_html = f'<span class="fl-note"> · {_esc(str(note))}</span>' if note else ""
+    return (f'<div class="fl-row"><div class="fl-ic">{icon}</div><div class="fl-main">'
+            f'<div class="fl-l1"><span class="fl-cat">{_esc(label)}</span>{note_html}</div>'
+            f'<div class="fl-l2">{_esc(" · ".join(meta))}</div></div>'
+            f'<div class="fl-amt font-numeral {amt_cls}">{sign}₹{fmt(r["amount"])}</div></div>')
+
+
+def format_history_html(limit=12, period="all") -> str:
+    limit = max(1, min(int(limit), MAX_VIEW_ROWS))
+    rng = _parse_range(period)
+    newest_first = lambda rs: sorted(rs, key=lambda r: (str(r.get("created_at") or ""), r["id"]), reverse=True)  # noqa: E731
+    if rng["kind"] == "all":  # newest first; fetch one extra row to know whether "Show more" is needed
+        fetched = newest_first(_all_transactions(limit=limit + 1))
+        rows, has_more, total, day_sums, summary = fetched[:limit], len(fetched) > limit, None, None, None
+    else:
+        everything = newest_first(_all_transactions(since=rng["since"], until=rng["until"]))
+        rows, total = everything[:limit], len(everything)
+        has_more = total > limit
+        summary = _summarize_rows(everything)
+        day_sums = {}
+        for r in everything:
+            if r.get("type") in ("income", "expense"):
+                loc = _to_local(r.get("created_at"))
+                if loc:
+                    cell = day_sums.setdefault(loc.date(), [Decimal("0.00"), Decimal("0.00")])  # [out, in]
+                    cell[1 if r["type"] == "income" else 0] += Decimal(str(r["amount"]))
+
+    title = "Latest transactions" if rng["kind"] == "all" else f'{rng["title"]} · transactions'
+    head = (f'<div class="fl-head"><div class="fl-title">{_esc(title)}</div>'
+            f'<div class="fl-sub">{_esc(rng["sub"])}</div></div>')
+    wrap = f'<div class="fl-browse" data-fl-view="history" data-fl-range="{_esc(rng["token"])}">'
+    if not rows:
+        return (f'{wrap}{_nav_html("history", rng)}<div class="fl-body">{head}'
+                '<div class="fl-empty">No transactions here yet.</div></div></div>')
+
+    today = _today_local()
+    body, last_day = "", object()
+    for r in rows:
+        local = _to_local(r.get("created_at"))
+        day = local.date() if local else None
+        if day != last_day:
+            last_day = day
+            if day is None:
+                label, sums = "Unknown date", ""
+            else:
+                prefix = {today: "Today · ", today - timedelta(days=1): "Yesterday · "}.get(day, "")
+                label = prefix + _d_label(day, day.year != today.year)
+                cell = day_sums.get(day) if day_sums is not None else None
+                sums = (f'<span class="fl-day-sum">out ₹{fmt(cell[0])} · in ₹{fmt(cell[1])}</span>'
+                        if cell else "")
+            body += f'<div class="fl-day"><span>{_esc(label)}</span>{sums}</div>'
+        body += _history_row(r)
+
+    if total is not None:
+        foot = f'Showing {len(rows)} of {total}'
+    else:
+        foot = f'Showing the latest {len(rows)}'
+    more = ""
+    if has_more and limit < MAX_VIEW_ROWS:
+        nxt = min(MAX_VIEW_ROWS, limit + PAGE_STEP)
+        left = f' · {total - len(rows)} left' if total is not None else ""
+        more = (f'<button type="button" class="fl-more" data-fl-view="history" data-fl-range="{_esc(rng["token"])}" '
+                f'data-fl-limit="{nxt}">Show {nxt - limit} more{left}</button>')
+    tiles = _tiles(summary["income"], summary["expense"]) if summary else ""
+    return (f'{wrap}{_nav_html("history", rng)}<div class="fl-body">{head}{tiles}<div class="fl-list">{body}</div>'
+            f'<div class="fl-foot"><span>{foot}</span>{more}</div></div></div>')
+
+
+# --------------------------------------------------------------------- HTML / Web Formatters
 
 
 def format_balance_html() -> str:
@@ -2187,51 +2641,6 @@ def format_history_text(limit=5) -> str:
     return "\n".join(lines)
 
 
-def format_history_html(limit=5) -> str:
-    rows = get_history(limit=limit)
-    if not rows:
-        return "<p class='text-[12px] text-[#6B7280]'>No history items logged yet.</p>"
-
-    lines = []
-    for r in rows:
-        date_str = _fmt_dt(r.get("created_at"))
-        if r["type"] == "transfer":
-            frm = r.get("from_bucket") or "?"
-            to = r.get("to_bucket") or "?"
-            lines.append(f"""
-            <div class='py-1 border-b border-[#E5DFC9]'>
-              <div class='flex justify-between'>
-                <span>#{r['id']} transfer {_esc(str(frm))} → {_esc(str(to))}</span>
-                <span class='font-numeral font-bold text-[#6B7280]'>₹{fmt(r['amount'])}</span>
-              </div>
-              <div class='text-[9px] text-[#8A8578]'>{date_str}</div>
-            </div>
-            """)
-            continue
-        sign = "+" if r["type"] == "income" else "-"
-        color = "text-[#059669]" if r["type"] == "income" else "text-[#E15554]"
-        note = f" ({_esc(r['note'])})" if r.get("note") else ""
-        pay = f" [{_esc(r['payment_method'])}]" if r.get("payment_method") else ""
-        lines.append(f"""
-        <div class='py-1 border-b border-[#E5DFC9]'>
-          <div class='flex justify-between'>
-            <span>#{r['id']} {_esc(str(r['category'] or 'other'))}{note}{pay}</span>
-            <span class='font-numeral font-bold {color}'>{sign}₹{fmt(r['amount'])}</span>
-          </div>
-          <div class='text-[9px] text-[#8A8578]'>{date_str}</div>
-        </div>
-        """)
-
-    return f"""
-    <div class="space-y-1">
-      <div class="font-bold text-[13px] text-[#142B1A]">Last {len(rows)} Logged Items</div>
-      <div class="pixel-window-jrpg p-2 text-[11px] space-y-0.5">
-        {"".join(lines)}
-      </div>
-    </div>
-    """
-
-
 def format_debts_html() -> str:
     debts = get_debt_balances()
     rows_html = ""
@@ -2276,7 +2685,8 @@ def _totals(extra=None) -> dict:
 
 
 def _balance_pair() -> dict:
-    return {"balance": float(get_balance()), "today_spent": float(get_today_expense())}
+    income, expense = get_today_flows()
+    return {"balance": float(get_balance()), "today_spent": float(expense), "today_income": float(income)}
 
 
 def _unwrap(res):
@@ -2854,13 +3264,14 @@ def static_files(filename):
 @app.route("/api/state", methods=["GET"])
 def api_state():
     balance = get_balance()
-    today_spent = get_today_expense()
+    today_income, today_spent = get_today_flows()
     stats = get_stats("month")
     history = get_history(5)
     return jsonify({
         "ok": True,
         "balance": float(balance),
         "today_spent": float(today_spent),
+        "today_income": float(today_income),
         "stats": {
             "total_income": float(stats["total_income"]),
             "total_expense": float(stats["total_expense"]),
@@ -2913,10 +3324,12 @@ def _process_text_core(text: str, allow_commands: bool = True):
         args = parts[1:]
 
         if cmd == "/stats":
-            period = args[0].lower() if args else "month"
-            if period not in ("today", "week", "month", "all"):
-                return ({"ok": False, "text": "Usage: /stats [today|week|month|all]"}, 400)
-            html = format_stats_html(period)
+            period = " ".join(args).lower() or "month"
+            try:
+                html = format_stats_html(period)
+            except RangeError as e:
+                return ({"ok": False, "text": f"Usage: /stats [today|yesterday|week|month|thismonth|lastmonth|all|"
+                                              f"YYYY-MM|YYYY-MM-DD]. {e}"}, 400)
             reply_text = f"Stats for {period} period."
             log_chat_message("assistant", html)
             return {"ok": True, "html": html, "text": reply_text, **_balance_pair()}
@@ -3001,8 +3414,18 @@ def _process_text_core(text: str, allow_commands: bool = True):
                 **_balance_pair(),
             }
         elif cmd == "/history":
-            limit = max(1, min(int(args[0]), 50)) if args and re.fullmatch(r"[0-9]{1,6}", args[0]) else 5
-            html = format_history_html(limit)
+            toks = [a.lower() for a in args]
+            limit, period = PAGE_STEP, "all"
+            # a leading number is a row count, unless it is a day of the month ("/history 14 nov")
+            if toks and re.fullmatch(r"[0-9]{1,3}", toks[0]) and not (len(toks) > 1 and toks[1].rstrip(".") in _MONTH_LOOKUP):
+                limit = max(1, min(int(toks.pop(0)), 200))
+            if toks:
+                period = " ".join(toks)
+            try:
+                html = format_history_html(limit, period)
+            except RangeError as e:
+                return ({"ok": False, "text": f"Usage: /history [count] [today|yesterday|week|month|thismonth|"
+                                              f"lastmonth|all|YYYY-MM|YYYY-MM-DD]. {e}"}, 400)
             log_chat_message("assistant", html)
             return {"ok": True, "text": f"Last {limit} transactions shown.", "html": html, **_balance_pair()}
 
@@ -3304,9 +3727,11 @@ def api_message():
     log_chat_message("user", text)
 
     res = _process_text(text)
+    cid = getattr(g, "last_chat_id", None)  # newest chat_log row of this exchange (the page syncs from here)
     if isinstance(res, tuple):
-        return jsonify(res[0]), res[1]
-    return jsonify(res)
+        body = dict(res[0], chat_id=cid) if cid else res[0]
+        return jsonify(body), res[1]
+    return jsonify(dict(res, chat_id=cid) if cid else res)
 
 
 @app.route("/api/action", methods=["POST"])
@@ -3404,6 +3829,8 @@ def api_voice():
     payload, status = _unwrap(res)
     payload = dict(payload)
     payload["transcribed"] = transcribed
+    if getattr(g, "last_chat_id", None):
+        payload["chat_id"] = g.last_chat_id
     body_html = payload.get("html") or f"<p>{_esc(payload.get('text', ''))}</p>"
     payload["message_html"] = f"<p class='text-[11px]'>🎙 <em>{_esc(transcribed)}</em></p>{body_html}"
     return jsonify(payload), status
@@ -3505,11 +3932,28 @@ def api_aliases_list():
     return jsonify(result)
 
 
+@app.route("/api/browse", methods=["GET"])
+def api_browse():
+    """The Stats / History card for any day, month or period, rendered by the same code as /stats and /history.
+    The in-chat navigator calls this to swap a card in place without adding messages to the chat."""
+    view = request.args.get("view", "stats")
+    if view not in ("stats", "history"):
+        return jsonify({"ok": False, "text": "view must be stats or history."}), 400
+    period = request.args.get("range") or ("month" if view == "stats" else "all")
+    limit = max(1, min(request.args.get("limit", default=PAGE_STEP, type=int), MAX_VIEW_ROWS))
+    try:
+        html = format_stats_html(period) if view == "stats" else format_history_html(limit, period)
+    except RangeError as e:
+        return jsonify({"ok": False, "text": str(e)}), 400
+    return jsonify({"ok": True, "html": html})
+
+
 @app.route("/api/history", methods=["GET"])
 def api_history():
     """Return persisted chat history (user + assistant turns) oldest-first."""
     limit = max(1, min(request.args.get("limit", default=50, type=int), 500))
-    return jsonify(get_chat_history(limit=limit))
+    return jsonify(get_chat_history(limit=limit, before=request.args.get("before", type=int),
+                                    after=request.args.get("after", type=int)))
 
 
 if DEV_MODE and not _dev_auth():

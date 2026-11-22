@@ -180,7 +180,9 @@ class TestXSS(Base):
             r = u.msg(cmd)
             blob = (r.json.get("html") or "") + (r.json.get("text") or "")
             self.assertNotRegex(blob, r"<(?:script|img|svg|iframe)\b", cmd)
-            self.assertNotRegex(blob, r"\son\w+\s*=", cmd)
+            # a real injected attribute lives inside a tag; hostile text shown as escaped, inert text
+            # (the history card now lists enough rows to show it) legitimately contains "onerror=".
+            self.assertNotRegex(blob, r"<[^>]*\son\w+\s*=", cmd)
 
     def test_csv_export_neutralises_formulas(self):
         u = User()
